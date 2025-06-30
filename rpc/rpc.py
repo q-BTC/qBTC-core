@@ -620,7 +620,7 @@ async def submit_block(request: Request, data: dict) -> dict:
                 for output_ in outputs:
                     output_receiver = output_["receiver"]
                     output_amount = output_["amount"]
-                    if output_receiver in (to_, ADMIN_ADDRESS):
+                    if output_receiver in (from_, to_, ADMIN_ADDRESS):
                         total_required += Decimal(output_amount)
                     else:
                         logger.warning(f"Invalid output receiver in transaction: {output_receiver}")
@@ -733,7 +733,7 @@ async def submit_block(request: Request, data: dict) -> dict:
             "outputs": [{
                 "utxo_index": idx,
                 "receiver": coinbase_miner_address,
-                "amount": str(out["amount"]),  # Ensure string format
+                "amount": str(out["value"]),  # Changed from "amount" to "value"
                 "script_pubkey": out.get("script_pubkey", "")
             } for idx, out in enumerate(coinbase_tx["outputs"])],
             "locktime": coinbase_tx.get("locktime", 0)
@@ -753,13 +753,13 @@ async def submit_block(request: Request, data: dict) -> dict:
         batch.put(b"block:" + block.hash().encode(), json.dumps(block_data).encode())
         db.write(batch)
 
-        # Remove all non-coinbase transactions from pending pool
+        # Remove all non-coinbase transactions from mempool
         for tid in txids[1:]:
-            if tid in pending_transactions:
-                logger.info(f"Removing transaction {tid} from pending pool")
-                pending_transactions.pop(tid, None)
+            if mempool_manager.get_transaction(tid):
+                logger.info(f"Removing transaction {tid} from mempool")
+                mempool_manager.remove_transaction(tid)
             else:
-                logger.debug(f"Transaction {tid} not in pending pool (might be duplicate)")
+                logger.debug(f"Transaction {tid} not in mempool (might be duplicate)")
 
         async with state_lock:
             blockchain.append(block.hash())
