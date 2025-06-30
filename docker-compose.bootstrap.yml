@@ -1,163 +1,178 @@
-version: '3.8'
+  version: '3.8'
 
-services:
-  # Production Bootstrap node
-  bootstrap:
-    build: .
-    container_name: qbtc-bootstrap-prod
-    environment:
-      WALLET_PASSWORD: ${BOOTSTRAP_WALLET_PASSWORD}
-      WALLET_FILE: "bootstrap.json"
-      DISABLE_NAT_TRAVERSAL: "false"
-      ROCKSDB_PATH: "/app/db"
-      # Production security configuration
-      RATE_LIMIT_ENABLED: "true"
-      DDOS_PROTECTION_ENABLED: "true"
-      ADMIN_ADDRESS: ${ADMIN_ADDRESS}
-      ATTACK_PATTERN_DETECTION: "true"
-      BOT_DETECTION_ENABLED: "true"
-      PEER_REPUTATION_ENABLED: "true"
-      SECURITY_LOGGING_ENABLED: "true"
-      # Redis configuration
-      USE_REDIS: "true"
-      REDIS_URL: "redis://redis:6379/0"
-      # Rate limits (requests per minute)
-      RATE_LIMIT_WORKER: "10"
-      RATE_LIMIT_BALANCE: "100"
-      RATE_LIMIT_TRANSACTIONS: "50"
-      RATE_LIMIT_DEFAULT: "60"
-    command: ["8001", "8002", "--wallet", "bootstrap.json"]
-    ports:
-      - "8080:8080"     # Web API
-      - "8332:8332"     # RPC
-      - "8001:8001/udp" # DHT UDP
-      - "8002:8002"     # Gossip TCP
-    volumes:
-      - bootstrap-data:/app/db
-      - ./logs:/var/log/qbtc
-    depends_on:
-      - redis
-    networks:
-      - qbtc-network
-    restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
-    deploy:
-      resources:
-        limits:
-          cpus: '2.0'
-          memory: 2G
-        reservations:
-          cpus: '0.5'
-          memory: 512M
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+  services:
+    # Production Bootstrap node
+    bootstrap:
+      build: .
+      container_name: qbtc-bootstrap-prod
+      environment:
+        WALLET_PASSWORD: ${BOOTSTRAP_WALLET_PASSWORD}
+        WALLET_FILE: "bootstrap.json"
+        DISABLE_NAT_TRAVERSAL: "false"
+        ROCKSDB_PATH: "/app/db"
+        # Production security configuration
+        RATE_LIMIT_ENABLED: "false"
+        DDOS_PROTECTION_ENABLED: "true"
+        ADMIN_ADDRESS: ${ADMIN_ADDRESS}
+        ATTACK_PATTERN_DETECTION: "true"
+        BOT_DETECTION_ENABLED: "true"
+        PEER_REPUTATION_ENABLED: "true"
+        SECURITY_LOGGING_ENABLED: "true"
+        # Redis configuration
+        USE_REDIS: "true"
+        REDIS_URL: "redis://redis:6379/0"
+        # Rate limits (requests per minute)
+        RATE_LIMIT_WORKER: "10"
+        RATE_LIMIT_BALANCE: "100"
+        RATE_LIMIT_TRANSACTIONS: "50"
+        RATE_LIMIT_DEFAULT: "60"
+      command: ["--bootstrap", "--dht-port", "8001", "--gossip-port", "8002"]
+      ports:
+        # Remove 8080 from here since nginx will handle it
+        - "8332:8332"     # RPC
+        - "8001:8001/udp" # DHT UDP
+        - "8002:8002"     # Gossip TCP
+      volumes:
+        - bootstrap-data:/app/db
+        - ./logs:/var/log/qbtc
+      depends_on:
+        - redis
+      networks:
+        - qbtc-network
+      restart: unless-stopped
+      security_opt:
+        - no-new-privileges:true
+      deploy:
+        resources:
+          limits:
+            cpus: '2.0'
+            memory: 2G
+          reservations:
+            cpus: '0.5'
+            memory: 512M
+      healthcheck:
+        test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+        interval: 30s
+        timeout: 10s
+        retries: 3
 
-  # Redis for rate limiting and caching
-  redis:
-    image: redis:7-alpine
-    container_name: qbtc-redis-prod
-    volumes:
-      - redis-data:/data
-      - ./config/redis.conf:/usr/local/etc/redis/redis.conf:ro
-    command: redis-server /usr/local/etc/redis/redis.conf
-    networks:
-      - qbtc-network
-    restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
-    read_only: true
-    tmpfs:
-      - /tmp:noexec,nosuid,size=50m
+    # Redis for rate limiting and caching
+    redis:
+      image: redis:7-alpine
+      container_name: qbtc-redis-prod
+      volumes:
+        - redis-data:/data
+        - ./config/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      command: redis-server /usr/local/etc/redis/redis.conf
+      networks:
+        - qbtc-network
+      restart: unless-stopped
+      security_opt:
+        - no-new-privileges:true
+      read_only: true
+      tmpfs:
+        - /tmp:noexec,nosuid,size=50m
 
-  # Prometheus for metrics collection
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: qbtc-prometheus-prod
-    volumes:
-      - ./monitoring/prometheus-bootstrap.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus-data:/prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--storage.tsdb.retention.time=720h'  # 30 days retention
-      - '--web.enable-lifecycle'
-      - '--web.listen-address=:9090'
-    networks:
-      - qbtc-network
-    restart: unless-stopped
-    depends_on:
-      - bootstrap
+    # Prometheus for metrics collection
+    prometheus:
+      image: prom/prometheus:latest
+      container_name: qbtc-prometheus-prod
+      volumes:
+        - ./monitoring/prometheus-bootstrap.yml:/etc/prometheus/prometheus.yml:ro
+        - prometheus-data:/prometheus
+      command:
+        - '--config.file=/etc/prometheus/prometheus.yml'
+        - '--storage.tsdb.path=/prometheus'
+        - '--storage.tsdb.retention.time=720h'  # 30 days retention
+        - '--web.enable-lifecycle'
+        - '--web.listen-address=:9090'
+      networks:
+        - qbtc-network
+      restart: unless-stopped
+      depends_on:
+        - bootstrap
 
-  # Grafana for visualization (secured)
-  grafana:
-    image: grafana/grafana:latest
-    container_name: qbtc-grafana-prod
-    environment:
-      # Security settings
-      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER}
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
-      - GF_USERS_ALLOW_SIGN_UP=false
-      - GF_USERS_ALLOW_ORG_CREATE=false
-      - GF_AUTH_DISABLE_LOGIN_FORM=false
-      - GF_AUTH_ANONYMOUS_ENABLED=false
-      - GF_SECURITY_DISABLE_GRAVATAR=true
-      - GF_SECURITY_COOKIE_SECURE=true
-      - GF_SECURITY_STRICT_TRANSPORT_SECURITY=true
-      - GF_SECURITY_STRICT_TRANSPORT_SECURITY_MAX_AGE_SECONDS=86400
-      - GF_SECURITY_STRICT_TRANSPORT_SECURITY_PRELOAD=true
-      - GF_SECURITY_STRICT_TRANSPORT_SECURITY_SUBDOMAINS=true
-      - GF_SECURITY_X_CONTENT_TYPE_OPTIONS=true
-      - GF_SECURITY_X_XSS_PROTECTION=true
-      - GF_SECURITY_CONTENT_SECURITY_POLICY=true
-      # Server settings
-      - GF_SERVER_ROOT_URL=https://${GRAFANA_DOMAIN}/
-      - GF_SERVER_ENABLE_GZIP=true
-      # Dashboard settings
-      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/qbtc-overview.json
-      # Disable editing
-      - GF_USERS_DEFAULT_PERMISSIONS=Viewer
-    volumes:
-      - grafana-data:/var/lib/grafana
-      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
-    networks:
-      - qbtc-network
-    restart: unless-stopped
-    depends_on:
-      - prometheus
+    # Grafana for visualization - PUBLIC ACCESS
+    grafana:
+      image: grafana/grafana:latest
+      container_name: qbtc-grafana-prod
+      environment:
+        # Admin settings (for backend access only)
+        - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER}
+        - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
 
-  # Nginx reverse proxy for secure Grafana access
-  nginx:
-    image: nginx:alpine
-    container_name: qbtc-nginx-prod
-    ports:
-      - "443:443"
-      - "80:80"
-    volumes:
-      - ./monitoring/nginx/nginx-prod.conf:/etc/nginx/nginx.conf:ro
-      - ./monitoring/nginx/ssl:/etc/nginx/ssl:ro
-      - ./monitoring/nginx/.htpasswd:/etc/nginx/.htpasswd:ro
-    networks:
-      - qbtc-network
-    restart: unless-stopped
-    depends_on:
-      - grafana
-    security_opt:
-      - no-new-privileges:true
+        # Enable anonymous access - FIXED ORG NAME
+        - GF_AUTH_ANONYMOUS_ENABLED=true
+        - GF_AUTH_ANONYMOUS_ORG_NAME=Main Org.
+        - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
 
-volumes:
-  bootstrap-data:
-  redis-data:
-  prometheus-data:
-  grafana-data:
+        # Disable sign ups but keep login form for admin
+        - GF_USERS_ALLOW_SIGN_UP=false
+        - GF_USERS_ALLOW_ORG_CREATE=false
+        - GF_AUTH_DISABLE_LOGIN_FORM=false
+        - GF_AUTH_DISABLE_SIGNOUT_MENU=true
 
-networks:
-  qbtc-network:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 172.21.0.0/16
+        # Security settings
+        - GF_SECURITY_DISABLE_GRAVATAR=true
+        - GF_SECURITY_COOKIE_SECURE=true
+        - GF_SECURITY_STRICT_TRANSPORT_SECURITY=true
+        - GF_SECURITY_STRICT_TRANSPORT_SECURITY_MAX_AGE_SECONDS=86400
+        - GF_SECURITY_STRICT_TRANSPORT_SECURITY_PRELOAD=true
+        - GF_SECURITY_STRICT_TRANSPORT_SECURITY_SUBDOMAINS=true
+        - GF_SECURITY_X_CONTENT_TYPE_OPTIONS=true
+        - GF_SECURITY_X_XSS_PROTECTION=true
+        - GF_SECURITY_CONTENT_SECURITY_POLICY=true
+
+        # Server settings
+        - GF_SERVER_ROOT_URL=https://${GRAFANA_DOMAIN}/
+        - GF_SERVER_ENABLE_GZIP=true
+
+        # Dashboard settings
+        - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/qbtc-overview.json
+
+        # Disable editing for viewers
+        - GF_USERS_DEFAULT_PERMISSIONS=Viewer
+        - GF_USERS_VIEWERS_CAN_EDIT=false
+        - GF_EXPLORE_ENABLED=false
+      volumes:
+        - grafana-data:/var/lib/grafana
+        - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+        - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      networks:
+        - qbtc-network
+      restart: unless-stopped
+      depends_on:
+        - prometheus
+
+    # Nginx reverse proxy - Serves API on 8080 and Grafana on 443
+    nginx:
+      image: nginx:alpine
+      container_name: qbtc-nginx-prod
+      ports:
+        - "443:443"      # Grafana (public dashboard)
+        - "80:80"        # HTTP redirect to HTTPS
+        - "8080:8080"    # API/WebSocket with SSL
+      volumes:
+        - ./monitoring/nginx/nginx-prod-split.conf:/etc/nginx/nginx.conf:ro
+        - ./monitoring/nginx/ssl:/etc/nginx/ssl:ro
+      networks:
+        - qbtc-network
+      restart: unless-stopped
+      depends_on:
+        - grafana
+        - bootstrap
+      security_opt:
+        - no-new-privileges:true
+
+  volumes:
+    bootstrap-data:
+    redis-data:
+    prometheus-data:
+    grafana-data:
+
+  networks:
+    qbtc-network:
+      driver: bridge
+      ipam:
+        config:
+          - subnet: 172.21.0.0/16

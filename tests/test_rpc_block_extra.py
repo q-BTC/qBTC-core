@@ -49,7 +49,12 @@ def test_rpc_unknown_method():
 def test_getblocktemplate_empty(monkeypatch, _stub_database):
     from state import state as state_mod
 
-    state_mod.pending_transactions.clear()
+    # Clear mempool manager
+    state_mod.mempool_manager.transactions.clear()
+    state_mod.mempool_manager.in_use_utxos.clear()
+    state_mod.mempool_manager.tx_fees.clear()
+    state_mod.mempool_manager.tx_sizes.clear()
+    state_mod.mempool_manager.current_memory_usage = 0
     monkeypatch.setattr("rpc.rpc.get_current_height",
                         lambda db: (10, "0"*64), raising=True)
 

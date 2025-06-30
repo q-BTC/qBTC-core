@@ -47,8 +47,8 @@ def test_legacy_transaction_rejected():
             }]
         }
         
-        # Should raise error about missing chain ID
-        with pytest.raises(ValueError, match="missing chain ID"):
+        # Should raise error about invalid format (missing chain ID)
+        with pytest.raises(ValueError, match="invalid format"):
             _process_block_in_chain(block)
 
 

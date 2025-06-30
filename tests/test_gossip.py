@@ -20,14 +20,22 @@ async def test_handle_valid_transaction(node, dummy_writer):
         "body": {"msg_str": "hello", "signature": "sig", "pubkey": "pk"},
     }
 
-    # clear global dict before running
+    # clear global mempool before running
     import state.state as state_mod
-    state_mod.pending_transactions.clear()
+    state_mod.mempool_manager.transactions.clear()
+    state_mod.mempool_manager.in_use_utxos.clear()
+    state_mod.mempool_manager.tx_fees.clear()
+    state_mod.mempool_manager.tx_sizes.clear()
+    state_mod.mempool_manager.current_memory_usage = 0
 
     await node.handle_gossip_message(tx_msg, ("somepeer", 1234), dummy_writer)
 
-    assert "tx-abc" in state_mod.pending_transactions
-    assert "tx-abc" in node.seen_tx
+    # The gossip code calculates its own txid from the message content
+    # We need to check that SOME transaction was added (not the specific txid)
+    assert state_mod.mempool_manager.size() == 1
+    # Get the actual txid that was used
+    actual_txid = list(state_mod.mempool_manager.get_all_transactions().keys())[0]
+    assert actual_txid in node.seen_tx
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -41,8 +49,8 @@ async def test_stale_message(node, dummy_writer):
 
     await node.handle_gossip_message(msg, ("peer", 1), dummy_writer)
 
-    from state.state import pending_transactions
-    assert "old" not in pending_transactions
+    from state.state import mempool_manager
+    assert mempool_manager.get_transaction("old") is None
     assert "old" not in node.seen_tx
 
 

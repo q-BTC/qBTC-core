@@ -7,13 +7,13 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Dict, Set, Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from database.database import get_db, get_current_height
 from wallet.wallet import verify_transaction
 from pydantic import BaseModel
 from blockchain.blockchain import sha256d, serialize_transaction
-from state.state import pending_transactions
+from state.state import mempool_manager
 from config.config import CHAIN_ID
 
 # Import security components
@@ -34,7 +34,18 @@ from web.websocket_handlers import WebSocketEventHandlers
 
 logger = logging.getLogger(__name__)
 
+# Global reference to gossip node (set by startup)
+_gossip_node = None
 
+def set_gossip_node(node):
+    """Set the global gossip node reference"""
+    global _gossip_node
+    _gossip_node = node
+    logger.info(f"Gossip node reference set: {node}")
+
+def get_gossip_node():
+    """Get the global gossip node reference"""
+    return _gossip_node
 
 app = FastAPI(title="qBTC Core API", version="1.0.0")
 
@@ -100,6 +111,33 @@ class WorkerResponse(BaseModel):
     tx_id: Optional[str] = None
     address: Optional[str] = None
     secret: Optional[str] = None
+
+async def require_localhost(request: Request):
+    """Dependency to ensure request is from localhost"""
+    client_host = request.client.host
+    allowed_hosts = ["127.0.0.1", "localhost", "::1"]  # IPv4 and IPv6 localhost
+    
+    # Also allow Docker host IPs and private network ranges for development
+    # In production, remove these or make them configurable
+    docker_hosts = ["192.168.65.1", "172.17.0.1", "host.docker.internal"]
+    private_prefixes = ["192.168.", "10.", "172."]
+    
+    if client_host in allowed_hosts:
+        return True
+    
+    if client_host in docker_hosts:
+        return True
+        
+    # Check if it's a private network IP (for Docker)
+    for prefix in private_prefixes:
+        if client_host.startswith(prefix):
+            logger.debug(f"Allowing debug access from private network IP: {client_host}")
+            return True
+    
+    logger.warning(f"Attempted access to debug endpoint from non-localhost IP: {client_host}")
+    raise HTTPException(status_code=403, detail="Debug endpoints are only accessible from localhost or private networks")
+    
+    return True
 
 class WebSocketManager:
     def __init__(self):
@@ -304,10 +342,11 @@ def get_transactions(wallet_address: str, limit: int = 50):
     
     # Add pending transactions from mempool
     logging.info(f"Checking mempool for pending transactions...")
-    logging.info(f"Current mempool size: {len(pending_transactions)}")
-    logging.info(f"Mempool transactions: {list(pending_transactions.keys())}")
+    all_mempool_txs = mempool_manager.get_all_transactions()
+    logging.info(f"Current mempool size: {len(all_mempool_txs)}")
+    logging.info(f"Mempool transactions: {list(all_mempool_txs.keys())}")
     mempool_count = 0
-    for txid, tx in pending_transactions.items():
+    for txid, tx in all_mempool_txs.items():
         # Check if this transaction involves our wallet
         involves_wallet = False
         
@@ -583,8 +622,43 @@ async def get_transactions_endpoint(wallet_address: str, limit: int = 50):
         logger.error(f"Error getting transactions for {wallet_address}: {str(e)}")
         raise HTTPException(status_code=500, detail="Error retrieving transactions")
 
+@app.get("/utxos/{wallet_address}")
+async def get_utxos_endpoint(wallet_address: str):
+    """Get unspent transaction outputs (UTXOs) for a wallet address"""
+    # Validate address format
+    if not wallet_address.startswith('bqs') or len(wallet_address) < 20:
+        raise ValidationError("Invalid wallet address format")
+    
+    try:
+        db = get_db()
+        utxos = []
+        
+        for key, value in db.items():
+            if key.startswith(b"utxo:"):
+                utxo_data = json.loads(value.decode())
+                # Only include unspent UTXOs that belong to this address
+                if utxo_data["receiver"] == wallet_address and not utxo_data.get("spent", False):
+                    utxos.append({
+                        "txid": utxo_data.get("txid"),
+                        "vout": utxo_data.get("utxo_index", 0),  # output index
+                        "amount": utxo_data.get("amount"),
+                        "address": wallet_address,
+                        "confirmations": 1,  # Since we don't track confirmations in qBTC, assume confirmed
+                        "spendable": True,
+                        "solvable": True
+                    })
+        
+        return {
+            "wallet_address": wallet_address,
+            "utxos": utxos,
+            "count": len(utxos)
+        }
+    except Exception as e:
+        logger.error(f"Error getting UTXOs for {wallet_address}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error retrieving UTXOs")
+
 @app.get("/debug/utxos")
-async def debug_utxos():
+async def debug_utxos(localhost_only: bool = Depends(require_localhost)):
     """Debug endpoint to show all UTXOs in the database"""
     try:
         db = get_db()
@@ -613,7 +687,7 @@ async def debug_utxos():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/debug/genesis")
-async def debug_genesis():
+async def debug_genesis(localhost_only: bool = Depends(require_localhost)):
     """Debug endpoint to find genesis transactions"""
     try:
         db = get_db()
@@ -658,7 +732,23 @@ async def debug_genesis():
 async def health_check(request: Request):
     """Prometheus metrics endpoint"""
     try:
-        gossip_client = getattr(request.app.state, 'gossip_client', None)
+        # Get gossip node from global reference
+        gossip_client = get_gossip_node()
+        
+        # If not found there, try sys.modules as fallback
+        if not gossip_client:
+            import sys
+            gossip_client = getattr(sys.modules.get('__main__', None), 'gossip_node', None)
+        
+        # If not found there, try app.state as final fallback
+        if not gossip_client:
+            gossip_client = getattr(request.app.state, 'gossip_client', None)
+        
+        # Log for debugging
+        if gossip_client:
+            logger.debug(f"Found gossip_client: {type(gossip_client)}, has dht_peers: {hasattr(gossip_client, 'dht_peers')}")
+        else:
+            logger.warning("No gossip_client found for health check")
         
         # Run health checks to update metrics
         await health_monitor.run_health_checks(gossip_client)
@@ -685,23 +775,121 @@ async def health_check(request: Request):
         )
 
 @app.get("/debug/mempool")
-async def debug_mempool():
+async def debug_mempool(localhost_only: bool = Depends(require_localhost)):
     """Debug endpoint to check mempool status"""
     try:
+        stats = mempool_manager.get_stats()
+        all_txs = mempool_manager.get_all_transactions()
         return {
-            "mempool_size": len(pending_transactions),
-            "transactions": list(pending_transactions.keys()),
-            "timestamp": datetime.utcnow().isoformat()
+            "mempool_size": len(all_txs),
+            "transactions": list(all_txs.keys()),
+            "timestamp": datetime.utcnow().isoformat(),
+            "stats": stats
         }
     except Exception as e:
         logger.error(f"Error getting mempool status: {str(e)}")
         raise HTTPException(status_code=500, detail="Error retrieving mempool")
 
+@app.get("/debug/network")
+async def debug_network(localhost_only: bool = Depends(require_localhost)):
+    """Debug endpoint to check network status"""
+    import sys
+    from config.config import VALIDATOR_ID
+    try:
+        status = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "validator_id": VALIDATOR_ID
+        }
+        
+        # Check gossip node
+        if hasattr(sys.modules.get('__main__'), 'gossip_node'):
+            gossip_node = sys.modules['__main__'].gossip_node
+            status["gossip"] = {
+                "running": True,
+                "node_id": gossip_node.node_id,
+                "port": gossip_node.gossip_port,
+                "is_bootstrap": gossip_node.is_bootstrap,
+                "dht_peers": len(gossip_node.dht_peers),
+                "client_peers": len(gossip_node.client_peers),
+                "total_peers": len(gossip_node.dht_peers) + len(gossip_node.client_peers),
+                "dht_peer_list": [list(peer) if isinstance(peer, tuple) else peer for peer in gossip_node.dht_peers],
+                "client_peer_list": [list(peer) if isinstance(peer, tuple) else peer for peer in gossip_node.client_peers],
+                "synced_peers": len(gossip_node.synced_peers),
+                "failed_peers": {str(k): v for k, v in gossip_node.failed_peers.items()}
+            }
+        else:
+            status["gossip"] = {"running": False}
+            
+        # Check DHT
+        if hasattr(sys.modules.get('__main__'), 'dht_task'):
+            dht_task = sys.modules['__main__'].dht_task
+            status["dht"] = {
+                "running": not dht_task.done(),
+                "task_state": "done" if dht_task.done() else "running"
+            }
+            if dht_task.done() and dht_task.exception():
+                status["dht"]["error"] = str(dht_task.exception())
+        else:
+            status["dht"] = {"running": False}
+            
+        return status
+    except Exception as e:
+        logger.error(f"Error getting network status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/debug/peers")
+async def debug_peers(localhost_only: bool = Depends(require_localhost)):
+    """Debug endpoint to see detailed peer information"""
+    import sys
+    try:
+        # Get gossip node
+        gossip_node = get_gossip_node()
+        if not gossip_node:
+            gossip_node = getattr(sys.modules.get('__main__', None), 'gossip_node', None)
+        
+        if not gossip_node:
+            return {"error": "Gossip node not available"}
+        
+        return {
+            "node_id": gossip_node.node_id,
+            "is_bootstrap": gossip_node.is_bootstrap,
+            "dht_peers": {
+                "count": len(gossip_node.dht_peers),
+                "peers": [{"host": p[0], "port": p[1]} for p in gossip_node.dht_peers]
+            },
+            "client_peers": {
+                "count": len(gossip_node.client_peers),
+                "peers": [{"host": p[0], "port": p[1]} for p in gossip_node.client_peers]
+            },
+            "synced_peers": {
+                "count": len(gossip_node.synced_peers),
+                "peers": list(gossip_node.synced_peers)
+            },
+            "failed_peers": dict(gossip_node.failed_peers),
+            "total_active_peers": len(gossip_node.dht_peers) + len(gossip_node.client_peers),
+            "peer_info": {str(k): v for k, v in gossip_node.peer_info.items()},
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error in debug_peers: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/worker")
 async def worker_endpoint(request: Request):
     """Process transaction broadcast requests with validation"""
     db = get_db()
-    gossip_client = request.app.state.gossip_client  
+    
+    # Get gossip node from global reference
+    gossip_client = get_gossip_node()
+    
+    # If not found there, try sys.modules as fallback
+    if not gossip_client:
+        import sys
+        gossip_client = getattr(sys.modules.get('__main__', None), 'gossip_node', None)
+    
+    # If still not found, try app.state as final fallback
+    if not gossip_client:
+        gossip_client = getattr(request.app.state, 'gossip_client', None)  
 
     try:
         payload = await request.json()
@@ -815,10 +1003,13 @@ async def worker_endpoint(request: Request):
         raw_tx = serialize_transaction(transaction)
         txid = sha256d(bytes.fromhex(raw_tx))[::-1].hex() 
         transaction["txid"] = txid
-        for output in transaction["outputs"]:
-            output["txid"] = txid
-        pending_transactions[txid] = transaction
-        logger.info(f"[MEMPOOL] Added transaction {txid} to mempool. Current size: {len(pending_transactions)}")
+        # Don't add txid to outputs - this contaminates the transaction structure
+        success, error = mempool_manager.add_transaction(transaction)
+        if not success:
+            # This means the transaction conflicts with existing mempool transactions
+            logger.warning(f"[MEMPOOL] Rejected transaction {txid}: {error}")
+            raise ValidationError(f"Transaction rejected: {error}")
+        logger.info(f"[MEMPOOL] Added transaction {txid} to mempool. Current size: {mempool_manager.size()}")
         #db.put(b"tx:" + txid.encode(), json.dumps(transaction).encode())
 
         # Emit mempool transaction event
@@ -831,7 +1022,12 @@ async def worker_endpoint(request: Request):
         }, source='web')
         logger.info(f"[EVENT] Emitted TRANSACTION_PENDING event for {txid}")
 
-        await gossip_client.randomized_broadcast(transaction)
+        # Broadcast to network if gossip client is available
+        if gossip_client:
+            await gossip_client.randomized_broadcast(transaction)
+            logger.info(f"Transaction {txid} broadcast to network")
+        else:
+            logger.warning(f"No gossip client available - transaction {txid} added to mempool but not broadcast")
 
         return {"status": "success", "message": "Transaction broadcast successfully", "txid": txid}
     

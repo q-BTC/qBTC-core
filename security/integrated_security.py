@@ -91,6 +91,33 @@ class IntegratedSecurityMiddleware:
                 '; ls', '| ls', '&& ls', '`ls'
             ]
         }
+        
+        # Mining-related whitelisted user agents
+        self.mining_user_agents = [
+            'cpuminer',
+            'cgminer',
+            'bfgminer',
+            'sgminer',
+            'ccminer',
+            'xmrig',
+            'mining'
+        ]
+        
+        # Mining-related whitelisted endpoints
+        self.mining_endpoints = [
+            '/',  # RPC endpoint
+            '/rpc',
+            '/api/rpc'
+        ]
+        
+        # Wallet-related whitelisted endpoints (should have relaxed rate limiting)
+        self.wallet_endpoints = [
+            '/balance/',
+            '/transactions/',
+            '/utxos/',
+            '/health',  # Also whitelist health endpoint
+            '/ws'  # WebSocket endpoint
+        ]
     
     def _get_client_info(self, request: Request) -> Dict[str, str]:
         """Extract client information from request"""
@@ -132,6 +159,40 @@ class IntegratedSecurityMiddleware:
                 return f"suspicious_tool: {agent}"
         
         return None
+    
+    def _is_mining_request(self, request: Request) -> bool:
+        """Check if request is from a mining client"""
+        user_agent = request.headers.get('user-agent', '').lower()
+        path = request.url.path
+        
+        # Check if it's a mining user agent
+        for mining_agent in self.mining_user_agents:
+            if mining_agent in user_agent:
+                return True
+        
+        # Check if it's a mining endpoint with mining-related RPC methods
+        if path in self.mining_endpoints:
+            # For POST requests, check the method
+            return True  # We'll check the actual method in the main handler
+        
+        return False
+    
+    def _is_wallet_request(self, request: Request) -> bool:
+        """Check if request is for wallet-related endpoints that should have relaxed rate limiting"""
+        path = request.url.path
+        
+        # Check if path starts with any whitelisted wallet endpoint
+        for endpoint in self.wallet_endpoints:
+            if path.startswith(endpoint):
+                return True
+        
+        # Also check for specific patterns (e.g., /balance/{address})
+        wallet_patterns = ['/balance/', '/transactions/', '/utxos/']
+        for pattern in wallet_patterns:
+            if pattern in path:
+                return True
+                
+        return False
     
     def _is_automated_request(self, request: Request) -> bool:
         """Detect if request is from automated tool/bot"""
@@ -183,7 +244,51 @@ class IntegratedSecurityMiddleware:
         }
         
         try:
-            # 1. Attack pattern detection
+            # Check if this is a mining request
+            is_mining = self._is_mining_request(request)
+            
+            if is_mining:
+                logger.debug(f"Mining request detected from {client_ip}")
+                # For mining requests, skip most security checks but still apply basic rate limiting
+                # This allows miners to make frequent requests without being blocked
+                
+                # Only check basic rate limit for mining (much higher threshold)
+                # Skip attack pattern detection, bot detection, and strict rate limiting
+                response = await call_next(request)
+                process_time = time.time() - start_time
+                
+                # Add security headers
+                for header, value in security_headers.items():
+                    response.headers[header] = value
+                
+                response.headers["X-Process-Time"] = str(process_time)
+                security_metrics.record_request(client_ip, request.url.path, "allowed")
+                
+                return response
+            
+            # Check if this is a wallet-related request
+            is_wallet = self._is_wallet_request(request)
+            
+            if is_wallet:
+                logger.debug(f"Wallet request detected from {client_ip} to {request.url.path}")
+                # For wallet requests, skip aggressive security checks
+                # These are legitimate API endpoints that wallets need to access
+                
+                # Skip attack pattern detection and bot detection for wallet endpoints
+                # Still apply basic DDoS protection but with more lenient limits
+                response = await call_next(request)
+                process_time = time.time() - start_time
+                
+                # Add security headers
+                for header, value in security_headers.items():
+                    response.headers[header] = value
+                
+                response.headers["X-Process-Time"] = str(process_time)
+                security_metrics.record_request(client_ip, request.url.path, "allowed")
+                
+                return response
+            
+            # 1. Attack pattern detection (non-mining requests)
             attack_pattern = self._detect_attack_patterns(request)
             if attack_pattern:
                 logger.error(f"Attack pattern detected from {client_ip}: {attack_pattern}")

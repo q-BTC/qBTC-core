@@ -44,7 +44,7 @@ platformdirs==4.3.8
 pluggy==1.6.0
 prometheus_client==0.22.1
 propcache==0.3.1
-protobuf==6.30.2
+protobuf==6.31.1
 py-sr25519-bindings==0.2.2
 pycparser==2.22
 pycryptodome==3.23.0
@@ -58,7 +58,7 @@ pytest-asyncio==1.0.0
 pytest-cov==6.2.1
 pytest-mock==3.14.1
 python-dateutil==2.9.0.post0
-requests==2.32.3
+requests==2.32.4
 rocksdict==0.3.26
 rpcudp==5.0.1
 ruff==0.11.13
@@ -69,7 +69,7 @@ tomlkit==0.13.3
 typing-inspection==0.4.0
 typing_extensions==4.13.2
 u-msgpack-python==2.8.0
-urllib3==2.4.0
+urllib3==2.5.0
 uvicorn==0.34.2
 wsproto==1.2.0
 yarl==1.20.0

@@ -6,7 +6,7 @@ Q‑Safe node (the FastAPI server with the `/worker` endpoint).
 
 ▪Loads an existing wallet (or creates one on first run) **using the same
   `wallet.py` ML‑DSA‑87 logic** your node expects.
-▪Builds the canonical message `sender:receiver:amount:nonce`.
+▪Builds the canonical message `sender:receiver:amount:timestamp:chain_id`.
 ▪Signs it with `wallet.sign_transaction()`.
 ▪Base‑64–encodes the _message_, _signature_, and _compressed public key_.
 ▪POSTs the JSON payload to your node and prints the JSON response.
@@ -40,12 +40,12 @@ def b64(data: bytes) -> str:
     return base64.b64encode(data).decode()
 
 
-def build_and_sign_message(sender: str, receiver: str, amount: Decimal, nonce: str, privkey_hex: str) -> tuple[str, str]:
+def build_and_sign_message(sender: str, receiver: str, amount: Decimal, timestamp: str, chain_id: str, privkey_hex: str) -> tuple[str, str]:
     """Return `(message_str, signature_hex)`.
 
-    `message` format: `sender:receiver:amount:nonce` (all plain text).
+    `message` format: `sender:receiver:amount:timestamp:chain_id` (all plain text).
     """
-    message_str = f"{sender}:{receiver}:{amount.normalize()}:{nonce}"
+    message_str = f"{sender}:{receiver}:{amount.normalize()}:{timestamp}:{chain_id}"
     signature_hex = sign_transaction(message_str, privkey_hex)
     return message_str, signature_hex
 
@@ -58,7 +58,8 @@ def main() -> None:
     parser.add_argument("--node", default="http://127.0.0.1:8000", help="Base URL of the FastAPI node")
     parser.add_argument("--receiver", required=True, help="Destination BQS address")
     parser.add_argument("--amount", required=True, type=Decimal, help="Amount to send (in whole coins, decimals allowed)")
-    parser.add_argument("--nonce", help="Optional nonce; defaults to unix‑ms timestamp")
+    parser.add_argument("--timestamp", help="Optional timestamp; defaults to unix‑ms timestamp")
+    parser.add_argument("--chain_id", default="1", help="Chain ID for the network (default: 1)")
     parser.add_argument("--wallet", default="wallet.json", help="Wallet JSON file")
     parser.add_argument("--password", help="Wallet passphrase (if omitted you'll be prompted)")
     args = parser.parse_args()
@@ -71,13 +72,14 @@ def main() -> None:
     priv_hex: str = w["privateKey"]
     pub_hex: str = w["publicKey"]
 
-    nonce: str = args.nonce or str(int(time.time() * 1000))
+    timestamp: str = args.timestamp or str(int(time.time() * 1000))
+    chain_id: str = args.chain_id
 
     # -----------------------------------------------------------------------
     # Build & sign message
     # -----------------------------------------------------------------------
     message_str, signature_hex = build_and_sign_message(
-        sender_addr, args.receiver, args.amount, nonce, priv_hex
+        sender_addr, args.receiver, args.amount, timestamp, chain_id, priv_hex
     )
 
     # -----------------------------------------------------------------------

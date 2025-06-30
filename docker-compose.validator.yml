@@ -26,7 +26,7 @@ services:
       RATE_LIMIT_BALANCE: "100"
       RATE_LIMIT_TRANSACTIONS: "50"
       RATE_LIMIT_DEFAULT: "60"
-    command: ["8001", "8002", "--wallet", "${VALIDATOR_WALLET_FILE:-validator.json}", "--Bootstrap_ip", "api.bitcoinqs.org", "--Bootstrap_port", "8001"]
+    command: ["--bootstrap_server", "api.bitcoinqs.org", "--bootstrap_port", "8001", "--dht-port", "8001", "--gossip-port", "8002"]
     ports:
       - "8080:8080"     # Web API
       - "8332:8332"     # RPC

@@ -69,11 +69,14 @@ def test_b64_roundtrip(mod, raw):
 
 
 def test_build_and_sign_message(mod):
+    # Use the exact private key expected by the stub
+    test_privkey = "deadbeef"
     msg, sig = mod.build_and_sign_message(
-        "bqs1sender", "bqs1dest", Decimal("42.5"), "123", "deadbeef"
+        "bqs1sender", "bqs1dest", Decimal("42.5"), "123", "1", test_privkey
     )
-    assert msg == "bqs1sender:bqs1dest:42.5:123"
-    assert sig == msg.encode().hex()   # stub returns hex-encoded msg
+    assert msg == "bqs1sender:bqs1dest:42.5:123:1"
+    # With the stub, signature should be hex-encoded message
+    assert sig == msg.encode().hex()
 
 
 # ───────────────────────── main() end-to-end ──────────────────────────
@@ -101,7 +104,8 @@ async def test_main_sends_correct_payload(mod):
 
     expected_amount = Decimal("10").normalize()      # '1E+1'
     expected_nonce  = "1700000000000"                # fixed by monkey-patch
-    expected_msg    = f"bqs1sender:bqs1dest:{expected_amount}:{expected_nonce}"
+    expected_chain_id = "1"                          # default chain ID
+    expected_msg    = f"bqs1sender:bqs1dest:{expected_amount}:{expected_nonce}:{expected_chain_id}"
 
     assert decoded_msg == expected_msg
     assert decoded_sig == expected_msg              # signer echoes msg in hex

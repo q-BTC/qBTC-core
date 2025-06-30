@@ -82,10 +82,12 @@ class TestCoinbaseValidation:
             "bits": 0x1f00ffff,
             "full_transactions": [
                 {
-                    # Coinbase transaction claiming 50 qBTC
+                    # Coinbase transaction claiming way too much (60 billion satoshis = 600 BTC)
+                    # At height 100, subsidy is 50 BTC = 5 billion satoshis, fees are 10
+                    # So max allowed is 5,000,000,010 but we claim 6,000,000,000
                     "version": 1,
                     "inputs": [{"coinbase": "00"*32}],
-                    "outputs": [{"value": "50", "receiver": "miner_addr"}]
+                    "outputs": [{"value": "6000000000", "receiver": "miner_addr"}]
                 },
                 {
                     # Regular transaction paying fee

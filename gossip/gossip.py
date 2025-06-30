@@ -1,16 +1,18 @@
 import asyncio
 import json
 import time
-import logging
 import random
 from asyncio import StreamReader, StreamWriter
 from config.config import DEFAULT_GOSSIP_PORT
-from state.state import pending_transactions
+from state.state import mempool_manager
 from wallet.wallet import verify_transaction
 from database.database import get_db, get_current_height
 from dht.dht import push_blocks
 from sync.sync import process_blocks_from_peer
 from network.peer_reputation import peer_reputation_manager
+from log_utils import get_logger
+
+logger = get_logger(__name__)
 
 # Import NAT traversal
 try:
@@ -58,17 +60,17 @@ class GossipNode:
         self.server_task = asyncio.create_task(self.server.serve_forever())
         # Enable partition check to recover failed peers
         self.partition_task = asyncio.create_task(self.check_partition())
-        logging.info(f"Gossip server started on {host}:{port}")
+        logger.info(f"Gossip server started on {host}:{port}")
 
     async def handle_client(self, reader: StreamReader, writer: StreamWriter):
         peer_info = writer.get_extra_info('peername')
         peer_ip, peer_port = peer_info[0], peer_info[1]
         
-        logging.info(f"New peer connection: {peer_ip}:{peer_port}")
+        logger.info(f"New peer connection: {peer_ip}:{peer_port}")
         
         # Check peer reputation before accepting connection
         if not peer_reputation_manager.should_connect_to_peer(peer_ip, peer_port):
-            logging.warning(f"Rejecting connection from banned/malicious peer {peer_ip}:{peer_port}")
+            logger.warning(f"Rejecting connection from banned/malicious peer {peer_ip}:{peer_port}")
             writer.close()
             await writer.wait_closed()
             return
@@ -78,7 +80,7 @@ class GossipNode:
         
         if peer_info not in self.client_peers and peer_info not in self.dht_peers:
             self.client_peers.add(peer_info)
-            logging.info(f"Added temporary client peer {peer_info}")
+            logger.info(f"Added temporary client peer {peer_info}")
         
         start_time = time.time()
         try:
@@ -97,21 +99,21 @@ class GossipNode:
                     )
                     
                 except json.JSONDecodeError as e:
-                    logging.warning(f"Invalid JSON from {peer_info}: {e}")
+                    logger.warning(f"Invalid JSON from {peer_info}: {e}")
                     peer_reputation_manager.record_invalid_message(
                         peer_ip, peer_port, "invalid_json"
                     )
                 except Exception as e:
-                    logging.error(f"Error processing message from {peer_info}: {e}")
+                    logger.error(f"Error processing message from {peer_info}: {e}")
                     peer_reputation_manager.record_invalid_message(
                         peer_ip, peer_port, str(e)
                     )
                     
         except asyncio.TimeoutError:
-            logging.warning(f"Timeout handling client {peer_info}")
+            logger.warning(f"Timeout handling client {peer_info}")
             peer_reputation_manager.record_timeout(peer_ip, peer_port)
         except Exception as e:
-            logging.error(f"Error handling client {peer_info}: {e}")
+            logger.error(f"Error handling client {peer_info}: {e}")
             peer_reputation_manager.record_connection_failure(
                 peer_ip, peer_port, str(e)
             )
@@ -125,7 +127,7 @@ class GossipNode:
             
             if peer_info in self.client_peers:
                 self.client_peers.remove(peer_info)
-                logging.info(f"Removed temporary client peer {peer_info}")
+                logger.info(f"Removed temporary client peer {peer_info}")
             
             writer.close()
             await writer.wait_closed()
@@ -163,12 +165,27 @@ class GossipNode:
         if msg_type == "transaction":
             self.tx_stats['received'] += 1
             
-            # Check for duplicates BEFORE logging
+            # Recalculate txid to ensure consistency
+            from blockchain.blockchain import serialize_transaction, sha256d
+            msg_copy = msg.copy()
+            if "txid" in msg_copy:
+                del msg_copy["txid"]
+            raw_tx = serialize_transaction(msg_copy)
+            calculated_txid = sha256d(bytes.fromhex(raw_tx))[::-1].hex()
+            
+            # Verify txid matches
+            if txid and txid != calculated_txid:
+                logger.warning(f"[TX MISMATCH] Received txid {txid} but calculated {calculated_txid}")
+                txid = calculated_txid  # Use the calculated one for consistency
+            else:
+                txid = calculated_txid
+            
+            # Check for duplicates BEFORE logger
             if txid in self.seen_tx:
                 # Transaction was already seen and processed
                 self.tx_stats['duplicates'] += 1
                 return
-            if txid in pending_transactions:
+            if mempool_manager.get_transaction(txid) is not None:
                 # Transaction is already in mempool
                 self.tx_stats['duplicates'] += 1
                 return
@@ -196,14 +213,22 @@ class GossipNode:
             tx_lock = asyncio.Lock()
             
             async with tx_lock:
-                if txid in pending_transactions:
+                if mempool_manager.get_transaction(txid) is not None:
                     return
                 
-                # Ensure the message has txid
+                # Use the calculated txid for consistency
                 msg["txid"] = txid
                 
-                pending_transactions[txid] = msg
-                logging.info(f"[MEMPOOL] Added gossiped transaction {txid} to mempool. Current size: {len(pending_transactions)}")
+                # Store just the transaction data, not the entire gossip message
+                # This ensures consistency with how transactions are stored from web API
+                success, error = mempool_manager.add_transaction(msg)
+                if not success:
+                    # This means the transaction conflicts with existing mempool transactions
+                    logger.warning(f"[MEMPOOL] Rejected transaction {txid}: {error}")
+                    return
+                    
+                logger.info(f"[MEMPOOL] Added gossiped transaction {txid} to mempool. Current size: {mempool_manager.size()}")
+                    
                 # Add to seen_tx BEFORE broadcasting to prevent loops
                 self.seen_tx.add(txid)
                 self.seen_tx_timestamps[txid] = int(time.time())
@@ -224,21 +249,21 @@ class GossipNode:
             await self.randomized_broadcast(msg)
 
         elif msg_type == "blocks_response":
-            logging.info(f"Received blocks_response from {from_peer}")
+            logger.info(f"Received blocks_response from {from_peer}")
             blocks = msg.get("blocks", [])
             if blocks:
-                logging.info(f"Processing {len(blocks)} blocks from peer")
+                logger.info(f"Processing {len(blocks)} blocks from peer")
                 # Log first block structure for debugging
                 if blocks and len(blocks) > 0:
-                    logging.info(f"First block keys: {list(blocks[0].keys())}")
+                    logger.info(f"First block keys: {list(blocks[0].keys())}")
                 process_blocks_from_peer(blocks)
             else:
-                logging.warning("Received empty blocks_response")
+                logger.warning("Received empty blocks_response")
                 
         elif msg_type == "blocks_response_chunked":
             # This would be handled by the client side, not here
             # The gossip handler only sends chunked responses, doesn't receive them
-            logging.warning(f"Received unexpected blocks_response_chunked from {from_peer}")
+            logger.warning(f"Received unexpected blocks_response_chunked from {from_peer}")
    
 
         elif msg_type == "get_height":
@@ -274,7 +299,7 @@ class GossipNode:
                                         tx_data = json.loads(db[tx_key].decode())
                                         expanded_txs.append(tx_data)
                                     else:
-                                        logging.warning(f"Transaction {txid} not found in DB for block at height {h}")
+                                        logger.warning(f"Transaction {txid} not found in DB for block at height {h}")
 
                                 cb_key = f"tx:coinbase_{h}".encode()
                                 if cb_key in db:
@@ -282,7 +307,7 @@ class GossipNode:
 
                                 block["full_transactions"] = expanded_txs
                             else:
-                                logging.info(f"Block at height {h} already has {len(block['full_transactions'])} full transactions")
+                                logger.info(f"Block at height {h} already has {len(block['full_transactions'])} full transactions")
                             
                             found_block = block
                             break
@@ -322,7 +347,7 @@ class GossipNode:
                     writer.write((json.dumps(chunk_data) + "\n").encode('utf-8'))
                     await writer.drain()
                     
-                logging.info(f"Sent {len(blocks)} blocks in {total_chunks} chunks")
+                logger.info(f"Sent {len(blocks)} blocks in {total_chunks} chunks")
             else:
                 # Send as single response
                 writer.write((response_json + "\n").encode('utf-8'))
@@ -332,15 +357,34 @@ class GossipNode:
 
     async def randomized_broadcast(self, msg_dict):
         peers = self.dht_peers | self.client_peers 
+        
+        # For critical messages like transactions, try to discover new peers first
+        msg_type = msg_dict.get("type", "unknown")
+        if msg_type == "transaction" and len(peers) < 3:
+            logger.info(f"Only {len(peers)} peers known for transaction broadcast, checking for new peers...")
+            # Import here to avoid circular dependency
+            from dht.dht import discover_peers_once
+            try:
+                await discover_peers_once(self)
+                peers = self.dht_peers | self.client_peers
+                logger.info(f"After discovery, have {len(peers)} peers")
+            except Exception as e:
+                logger.warning(f"Failed to discover new peers: {e}")
+        
         if not peers:
-            logging.warning("No peers available for broadcast")
+            logger.warning("No peers available for broadcast")
             return
-        num_peers = max(2, int(len(peers) ** 0.5))
-        peers_to_send = random.sample(list(peers), min(len(peers), num_peers))
+            
+        # For transactions, broadcast to ALL peers, not just a subset
+        if msg_type == "transaction":
+            peers_to_send = list(peers)
+            logger.info(f"Broadcasting transaction to ALL {len(peers_to_send)} peers")
+        else:
+            num_peers = max(2, int(len(peers) ** 0.5))
+            peers_to_send = random.sample(list(peers), min(len(peers), num_peers))
         
         # Log broadcast details
-        msg_type = msg_dict.get("type", "unknown")
-        logging.info(f"Broadcasting {msg_type} to {len(peers_to_send)} peers: {peers_to_send}")
+        logger.info(f"Broadcasting {msg_type} to {len(peers_to_send)} peers: {peers_to_send}")
         
         payload = (json.dumps(msg_dict) + "\n").encode('utf-8')
         results = await asyncio.gather(
@@ -349,9 +393,9 @@ class GossipNode:
         )
         for peer, result in zip(peers_to_send, results):
             if isinstance(result, Exception):
-                logging.warning(f"broadcast {peer} failed: {result}")
+                logger.warning(f"broadcast {peer} failed: {result}")
             else:
-                logging.info(f"Successfully broadcast {msg_type} to {peer}")
+                logger.info(f"Successfully broadcast {msg_type} to {peer}")
 
     async def _send_message(self, peer, payload):
         # Try direct connection with more retries and exponential backoff
@@ -368,7 +412,7 @@ class GossipNode:
                 self.failed_peers[peer] = 0
                 return
             except Exception as e:
-                logging.debug(f"Direct connection attempt {attempt + 1} to {peer} failed: {e}")
+                logger.debug(f"Direct connection attempt {attempt + 1} to {peer} failed: {e}")
                 # Exponential backoff: 1s, 2s, 4s, 8s
                 await asyncio.sleep(min(2 ** attempt, 8))
         
@@ -376,7 +420,7 @@ class GossipNode:
         if NAT_TRAVERSAL_AVAILABLE and peer in self.peer_info:
             peer_info = self.peer_info[peer]
             if peer_info.get('supports_nat_traversal') and peer_info.get('nat_type') != 'direct':
-                logging.info(f"Attempting NAT traversal for peer {peer}")
+                logger.info(f"Attempting NAT traversal for peer {peer}")
                 
                 # Try local network connection if on same network
                 if peer_info.get('local_ip') and self._is_same_network(peer_info['local_ip']):
@@ -391,7 +435,7 @@ class GossipNode:
                         writer.close()
                         await writer.wait_closed()
                         self.failed_peers[peer] = 0
-                        logging.info(f"Local network connection successful to {local_peer}")
+                        logger.info(f"Local network connection successful to {local_peer}")
                         return
                     except Exception:
                         pass
@@ -400,7 +444,7 @@ class GossipNode:
         self.failed_peers[peer] = self.failed_peers.get(peer, 0) + 1
         if peer in self.dht_peers and self.failed_peers[peer] > 10:  # Increased from 3 to 10
             # Don't remove peer, just mark it as temporarily unreachable
-            logging.warning(f"Peer {peer} has failed {self.failed_peers[peer]} times, marking as unreachable")
+            logger.warning(f"Peer {peer} has failed {self.failed_peers[peer]} times, marking as unreachable")
             # The partition check will attempt to recover this peer
     
     def _is_same_network(self, peer_local_ip: str) -> bool:
@@ -454,7 +498,7 @@ class GossipNode:
                         if response:
                             # Peer is back online, reset failure count
                             self.failed_peers[peer] = 0
-                            logging.info(f"Peer {peer} is back online, resetting failure count")
+                            logger.info(f"Peer {peer} is back online, resetting failure count")
                             
                             # If peer was in synced_peers, trigger sync
                             if peer in self.synced_peers:
@@ -463,14 +507,14 @@ class GossipNode:
                         writer.close()
                         await writer.wait_closed()
                     except Exception as e:
-                        logging.debug(f"Peer {peer} still unreachable: {e}")
+                        logger.debug(f"Peer {peer} still unreachable: {e}")
                         # Only remove peer after many failures and extended downtime
                         if self.failed_peers.get(peer, 0) > 20:
                             self.dht_peers.discard(peer)
                             self.peer_info.pop(peer, None)
                             self.synced_peers.discard(peer)
                             del self.failed_peers[peer]
-                            logging.info(f"Permanently removed peer {peer} after extended downtime")
+                            logger.info(f"Permanently removed peer {peer} after extended downtime")
             
             await asyncio.sleep(30)
 
@@ -479,7 +523,7 @@ class GossipNode:
         
         # Reset failure count if peer is being re-added
         if peer in self.failed_peers:
-            logging.info(f"Resetting failure count for peer {peer} (was {self.failed_peers[peer]})")
+            logger.info(f"Resetting failure count for peer {peer} (was {self.failed_peers[peer]})")
             self.failed_peers[peer] = 0
         
         # Always update peer info if provided
@@ -488,13 +532,13 @@ class GossipNode:
         
         if peer not in self.dht_peers:
             self.dht_peers.add(peer)
-            logging.info(f"Added DHT peer {peer} to validator list")
+            logger.info(f"Added DHT peer {peer} to validator list")
             if peer not in self.synced_peers:
                 self.synced_peers.add(peer)
                 asyncio.create_task(push_blocks(ip, port))
         else:
             # Peer already exists, but might have been marked as failed
-            logging.info(f"Peer {peer} already in list, ensuring it's active")
+            logger.info(f"Peer {peer} already in list, ensuring it's active")
             # Trigger sync if needed
             if peer not in self.synced_peers:
                 self.synced_peers.add(peer)
@@ -505,7 +549,7 @@ class GossipNode:
         if peer in self.dht_peers:
             self.dht_peers.remove(peer)
             self.failed_peers.pop(peer, None)
-            logging.info(f"Removed DHT peer {peer} from validator list")
+            logger.info(f"Removed DHT peer {peer} from validator list")
 
     async def stop(self):
         if self.server_task:

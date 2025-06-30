@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import asyncio
+import argparse
 import uvicorn
 from web.web import app
 from rpc.rpc import rpc_app
@@ -15,11 +16,14 @@ logger = setup_logging(
     enable_structured=True
 )
 
-async def main():
+async def main(args):
     logger.info("Starting qBTC-core node")
+    logger.info(f"Mode: {'bootstrap' if args.bootstrap else 'peer'}")
+    logger.info(f"Args: bootstrap={args.bootstrap}, dht_port={args.dht_port}, gossip_port={args.gossip_port}")
+    logger.info(f"Bootstrap server: {args.bootstrap_server}:{args.bootstrap_port}")
     
     try:
-        await startup()
+        await startup(args)
         logger.info("Node startup completed successfully")
     except Exception as e:
         logger.error(f"Failed to start node: {str(e)}")
@@ -59,8 +63,24 @@ async def main():
         logger.info("Shutdown completed")
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='qBTC Node')
+    parser.add_argument('--bootstrap', action='store_true', 
+                        help='Run as bootstrap server')
+    parser.add_argument('--bootstrap_server', type=str, default='api.bitcoinqs.org',
+                        help='Bootstrap server host (default: api.bitcoinqs.org)')
+    parser.add_argument('--bootstrap_port', type=int, default=8001,
+                        help='Bootstrap server port (default: 8001)')
+    parser.add_argument('--dht-port', type=int, default=8001,
+                        help='DHT port (default: 8001)')
+    parser.add_argument('--gossip-port', type=int, default=8002,
+                        help='Gossip port (default: 8002)')
+    parser.add_argument('--external-ip', type=str, default=None,
+                        help='External IP address for NAT traversal')
+    
+    args = parser.parse_args()
+    
     try:
-        asyncio.run(main())
+        asyncio.run(main(args))
     except KeyboardInterrupt:
         logger.info("Received interrupt signal, shutting down")
     except Exception as e:

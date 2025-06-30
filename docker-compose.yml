@@ -21,7 +21,7 @@ services:
       # Redis configuration
       USE_REDIS: "true"
       REDIS_URL: "redis://redis:6379/0"
-    command: ["8001", "8002", "--wallet", "bootstrap.json"]
+    command: ["--bootstrap", "--dht-port", "8001", "--gossip-port", "8002"]
     ports:
       - "8080:8080"     # Web API
       - "8332:8332"     # RPC
@@ -61,7 +61,7 @@ services:
       # Redis configuration
       USE_REDIS: "true"
       REDIS_URL: "redis://redis:6379/1"
-    command: ["8003", "8004", "--wallet", "validator1.json", "--Bootstrap_ip", "bootstrap", "--Bootstrap_port", "8001"]
+    command: ["--bootstrap_server", "bootstrap", "--bootstrap_port", "8001", "--dht-port", "8003", "--gossip-port", "8004"]
     ports:
       - "8081:8080"
       - "8333:8332"
@@ -102,7 +102,7 @@ services:
       # Redis configuration
       USE_REDIS: "true"
       REDIS_URL: "redis://redis:6379/2"
-    command: ["8005", "8006", "--wallet", "validator2.json", "--Bootstrap_ip", "bootstrap", "--Bootstrap_port", "8001"]
+    command: ["--bootstrap_server", "bootstrap", "--bootstrap_port", "8001", "--dht-port", "8005", "--gossip-port", "8006"]
     ports:
       - "8082:8080"
       - "8334:8332"
@@ -189,4 +189,4 @@ networks:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.20.0.0/16
+        - subnet: 172.21.0.0/16

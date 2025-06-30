@@ -12,7 +12,7 @@ from config.config import ADMIN_ADDRESS
 from wallet.wallet import verify_transaction
 from blockchain.blockchain import derive_qsafe_address,Block, bits_to_target, serialize_transaction,scriptpubkey_to_address, read_varint, parse_tx, validate_pow, sha256d, calculate_merkle_root
 from blockchain.difficulty import get_next_bits
-from state.state import blockchain, state_lock, pending_transactions
+from state.state import blockchain, state_lock, mempool_manager
 from rocksdict import WriteBatch
 from sync.sync import get_blockchain_info
 
@@ -139,7 +139,7 @@ async def get_mining_info(data):
         network_hashps = int(current_difficulty * 7000000)  # Rough estimate
         
         # Count pending transactions
-        pooled_tx_count = len(pending_transactions)
+        pooled_tx_count = mempool_manager.size()
         
         result = {
             "blocks": height if height is not None else 0,
@@ -312,23 +312,28 @@ async def get_block_template(data):
     seen_txids = set()  # Track which txids we've already added
 
     # Include pending transactions in the block template
-    for tx_key, orig_tx in pending_transactions.items():
-        # tx_key should be the txid
+    # Use mempool manager to get transactions sorted by fee and without conflicts
+    
+    # Get transactions for block, already sorted by fee rate and conflict-free
+    mempool_txs = mempool_manager.get_transactions_for_block(max_count=1000)
+    
+    # Also need to check against confirmed UTXOs in database
+    for orig_tx in mempool_txs:
         tx = copy.deepcopy(orig_tx)
         stored_txid = tx.get("txid")  # Get the txid if it exists
         
-        # Check if inputs are still unspent
+        # Check if inputs are still unspent in the database
         valid_tx = True
         for input_ in tx.get("inputs", []):
             utxo_key = f"utxo:{input_['txid']}:{input_.get('utxo_index', 0)}".encode()
             if utxo_key in db:
                 utxo_data = json.loads(db[utxo_key].decode())
                 if utxo_data.get("spent", False):
-                    logger.info(f"Skipping transaction {tx_key} - input {utxo_key.decode()} already spent")
+                    logger.info(f"Skipping transaction {stored_txid} - input {utxo_key.decode()} already spent in DB")
                     valid_tx = False
                     break
             else:
-                logger.warning(f"Skipping transaction {tx_key} - input {utxo_key.decode()} not found")
+                logger.warning(f"Skipping transaction {stored_txid} - input {utxo_key.decode()} not found in DB")
                 valid_tx = False
                 break
         
@@ -412,8 +417,26 @@ async def submit_block(request: Request, data: dict) -> dict:
     logger.info(f"Block submission request: {data}")
     
     try:
-        gossip_client = getattr(request.app.state, 'gossip_client', None)
-        logger.info(f"Retrieved gossip_client from app state: {gossip_client}")
+        # Get gossip node - try multiple sources
+        gossip_client = None
+        
+        # Try web module first
+        try:
+            from web.web import get_gossip_node
+            gossip_client = get_gossip_node()
+        except ImportError:
+            pass
+        
+        # If not found, try sys.modules
+        if not gossip_client:
+            import sys
+            gossip_client = getattr(sys.modules.get('__main__', None), 'gossip_node', None)
+        
+        # If still not found, try app.state as fallback
+        if not gossip_client:
+            gossip_client = getattr(request.app.state, 'gossip_client', None)
+            
+        logger.info(f"Retrieved gossip_client: {gossip_client}")
         
         # Validate block submission parameters
         if "params" not in data or not isinstance(data["params"], list) or len(data["params"]) == 0:
@@ -597,7 +620,7 @@ async def submit_block(request: Request, data: dict) -> dict:
                 for output_ in outputs:
                     output_receiver = output_["receiver"]
                     output_amount = output_["amount"]
-                    if output_receiver in (to_, ADMIN_ADDRESS):
+                    if output_receiver in (from_, to_, ADMIN_ADDRESS):
                         total_required += Decimal(output_amount)
                     else:
                         logger.warning(f"Invalid output receiver in transaction: {output_receiver}")
@@ -702,11 +725,17 @@ async def submit_block(request: Request, data: dict) -> dict:
         # Store transactions first
         full_transactions = []
         
-        # Store coinbase transaction
+        # Store coinbase transaction with proper format and txid
         coinbase_tx_data = {
+            "txid": coinbase_txid,  # Add the txid we calculated
             "version": coinbase_tx["version"],
             "inputs": coinbase_tx["inputs"],
-            "outputs": coinbase_tx["outputs"],
+            "outputs": [{
+                "utxo_index": idx,
+                "receiver": coinbase_miner_address,
+                "amount": str(out["value"]),  # Changed from "amount" to "value"
+                "script_pubkey": out.get("script_pubkey", "")
+            } for idx, out in enumerate(coinbase_tx["outputs"])],
             "locktime": coinbase_tx.get("locktime", 0)
         }
         batch.put(f"tx:{coinbase_txid}".encode(), json.dumps(coinbase_tx_data).encode())
@@ -724,13 +753,13 @@ async def submit_block(request: Request, data: dict) -> dict:
         batch.put(b"block:" + block.hash().encode(), json.dumps(block_data).encode())
         db.write(batch)
 
-        # Remove all non-coinbase transactions from pending pool
+        # Remove all non-coinbase transactions from mempool
         for tid in txids[1:]:
-            if tid in pending_transactions:
-                logger.info(f"Removing transaction {tid} from pending pool")
-                pending_transactions.pop(tid, None)
+            if mempool_manager.get_transaction(tid):
+                logger.info(f"Removing transaction {tid} from mempool")
+                mempool_manager.remove_transaction(tid)
             else:
-                logger.debug(f"Transaction {tid} not in pending pool (might be duplicate)")
+                logger.debug(f"Transaction {tid} not in mempool (might be duplicate)")
 
         async with state_lock:
             blockchain.append(block.hash())

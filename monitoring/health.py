@@ -12,7 +12,7 @@ from enum import Enum
 from prometheus_client import Gauge, Histogram, Info, generate_latest, CONTENT_TYPE_LATEST
 
 from database.database import get_db, get_current_height
-from state.state import pending_transactions
+from state.state import mempool_manager
 from log_utils import get_logger
 
 logger = get_logger(__name__)
@@ -216,7 +216,8 @@ class HealthMonitor:
     async def check_mempool_health(self) -> ComponentHealth:
         """Check transaction mempool status"""
         try:
-            pending_count = len(pending_transactions)
+            pending_count = mempool_manager.size()
+            stats = mempool_manager.get_stats()
             
             # Update Prometheus metric
             pending_transactions_count.set(pending_count)
@@ -227,7 +228,11 @@ class HealthMonitor:
                     status=HealthStatus.DEGRADED,
                     message=f"Large mempool: {pending_count} transactions",
                     last_check=time.time(),
-                    details={"pending_transactions": pending_count}
+                    details={
+                        "pending_transactions": pending_count,
+                        "memory_usage_mb": stats["memory_usage_mb"],
+                        "in_use_utxos": stats["in_use_utxos"]
+                    }
                 )
             
             health_check_status.labels(component='mempool').set(1.0)  # Healthy
@@ -235,7 +240,11 @@ class HealthMonitor:
                 status=HealthStatus.HEALTHY,
                 message="Mempool normal",
                 last_check=time.time(),
-                details={"pending_transactions": pending_count}
+                details={
+                    "pending_transactions": pending_count,
+                    "memory_usage_mb": stats["memory_usage_mb"],
+                    "in_use_utxos": stats["in_use_utxos"]
+                }
             )
             
         except Exception as e:

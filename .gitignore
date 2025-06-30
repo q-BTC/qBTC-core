@@ -4,6 +4,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+*.pem
+
 # C extensions
 *.so
 
@@ -192,7 +194,7 @@ ledger.rocksdb/
 *.rocksdb/
 db/
 data/
-node/
+# node/  # Commented out - needed for startup.py
 node_output.log
 server_output*.log
 qbtc.log
