@@ -24,7 +24,9 @@
         # Rate limits (requests per minute)
         RATE_LIMIT_WORKER: "10"
         RATE_LIMIT_BALANCE: "100"
-        RATE_LIMIT_TRANSACTIONS: "50"
+        RATE_LIMIT_TRANSACTIONS: "100"
+        RATE_LIMIT_HEALTH: "100"
+        RATE_LIMIT_UTXOS: "100"
         RATE_LIMIT_DEFAULT: "60"
       command: ["--bootstrap", "--dht-port", "8001", "--gossip-port", "8002"]
       ports:

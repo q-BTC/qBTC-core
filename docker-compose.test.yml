@@ -21,9 +21,16 @@ services:
       # Redis configuration
       USE_REDIS: "true"
       REDIS_URL: "redis://redis:6379/0"
+      # Rate limits (requests per minute)
+      RATE_LIMIT_WORKER: "10"
+      RATE_LIMIT_BALANCE: "100"
+      RATE_LIMIT_TRANSACTIONS: "100"
+      RATE_LIMIT_HEALTH: "100"
+      RATE_LIMIT_UTXOS: "100"
+      RATE_LIMIT_DEFAULT: "60"
     command: ["--bootstrap", "--dht-port", "8001", "--gossip-port", "8002"]
     ports:
-      - "8080:8080"     # Web API
+      # Remove 8080 from here since nginx will handle it in production mode
       - "8332:8332"     # RPC
       - "8001:8001/udp" # DHT UDP
       - "8002:8002"     # Gossip TCP
@@ -35,6 +42,16 @@ services:
     networks:
       - qbtc-network
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s
@@ -61,6 +78,13 @@ services:
       # Redis configuration
       USE_REDIS: "true"
       REDIS_URL: "redis://redis:6379/1"
+      # Rate limits (requests per minute)
+      RATE_LIMIT_WORKER: "10"
+      RATE_LIMIT_BALANCE: "100"
+      RATE_LIMIT_TRANSACTIONS: "100"
+      RATE_LIMIT_HEALTH: "100"
+      RATE_LIMIT_UTXOS: "100"
+      RATE_LIMIT_DEFAULT: "60"
     command: ["--bootstrap_server", "bootstrap", "--bootstrap_port", "8001", "--dht-port", "8003", "--gossip-port", "8004"]
     ports:
       - "8081:8080"
@@ -76,6 +100,16 @@ services:
     networks:
       - qbtc-network
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s
@@ -102,6 +136,13 @@ services:
       # Redis configuration
       USE_REDIS: "true"
       REDIS_URL: "redis://redis:6379/2"
+      # Rate limits (requests per minute)
+      RATE_LIMIT_WORKER: "10"
+      RATE_LIMIT_BALANCE: "100"
+      RATE_LIMIT_TRANSACTIONS: "100"
+      RATE_LIMIT_HEALTH: "100"
+      RATE_LIMIT_UTXOS: "100"
+      RATE_LIMIT_DEFAULT: "60"
     command: ["--bootstrap_server", "bootstrap", "--bootstrap_port", "8001", "--dht-port", "8005", "--gossip-port", "8006"]
     ports:
       - "8082:8080"
@@ -117,6 +158,16 @@ services:
     networks:
       - qbtc-network
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s
@@ -129,9 +180,16 @@ services:
     container_name: qbtc-redis
     volumes:
       - redis-data:/data
+      - ./config/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    command: redis-server /usr/local/etc/redis/redis.conf
     networks:
       - qbtc-network
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=50m
 
   # Prometheus for metrics collection
   prometheus:
@@ -145,8 +203,9 @@ services:
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
-      - '--storage.tsdb.retention.time=200h'
+      - '--storage.tsdb.retention.time=720h'  # 30 days retention
       - '--web.enable-lifecycle'
+      - '--web.listen-address=:9090'
     networks:
       - qbtc-network
     restart: unless-stopped
@@ -155,17 +214,35 @@ services:
       - validator1
       - validator2
 
-  # Grafana for visualization
+  # Grafana for visualization - TEST MODE (full access)
   grafana:
     image: grafana/grafana:latest
     container_name: qbtc-grafana
     ports:
       - "3000:3000"
     environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin123}
+      # Admin settings
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin123}
+      
+      # Test mode - full access
+      - GF_AUTH_ANONYMOUS_ENABLED=false
       - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_USERS_ALLOW_ORG_CREATE=false
+      - GF_AUTH_DISABLE_LOGIN_FORM=false
+      
+      # Security settings
+      - GF_SECURITY_DISABLE_GRAVATAR=true
+      - GF_SECURITY_COOKIE_SECURE=false  # false for test mode
+      - GF_SECURITY_STRICT_TRANSPORT_SECURITY=false  # false for test mode
+      
+      # Dashboard settings
       - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/qbtc-overview.json
+      
+      # Enable editing for test mode
+      - GF_USERS_DEFAULT_PERMISSIONS=Editor
+      - GF_USERS_VIEWERS_CAN_EDIT=true
+      - GF_EXPLORE_ENABLED=true
     volumes:
       - grafana-data:/var/lib/grafana
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
@@ -175,6 +252,24 @@ services:
     restart: unless-stopped
     depends_on:
       - prometheus
+
+  # Nginx reverse proxy - TEST MODE (simplified configuration)
+  nginx:
+    image: nginx:alpine
+    container_name: qbtc-nginx-test
+    ports:
+      - "8080:8080"    # API/WebSocket proxy
+    volumes:
+      - ./monitoring/nginx/nginx-test.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - qbtc-network
+    restart: unless-stopped
+    depends_on:
+      - bootstrap
+      - validator1
+      - validator2
+    security_opt:
+      - no-new-privileges:true
 
 volumes:
   bootstrap-data:

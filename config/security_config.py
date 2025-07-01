@@ -27,14 +27,19 @@ class SecurityConfig:
                 "burst_limit": 20
             },
             "/transactions": {
-                "max_requests": int(os.getenv("RATE_LIMIT_TRANSACTIONS", "50")),
+                "max_requests": int(os.getenv("RATE_LIMIT_TRANSACTIONS", "100")),
                 "window_seconds": 60,
-                "burst_limit": 10
+                "burst_limit": 20
             },
             "/health": {
-                "max_requests": int(os.getenv("RATE_LIMIT_HEALTH", "30")),
+                "max_requests": int(os.getenv("RATE_LIMIT_HEALTH", "100")),
                 "window_seconds": 60,
-                "burst_limit": 10
+                "burst_limit": 20
+            },
+            "/utxos": {
+                "max_requests": int(os.getenv("RATE_LIMIT_UTXOS", "100")),
+                "window_seconds": 60,
+                "burst_limit": 20
             },
             "default": {
                 "max_requests": int(os.getenv("RATE_LIMIT_DEFAULT", "60")),
