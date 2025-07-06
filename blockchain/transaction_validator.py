@@ -73,8 +73,9 @@ class TransactionValidator:
             return False
         
         first_input = inputs[0]
-        # Check for coinbase pattern: txid is all zeros
-        return first_input.get("txid") == "00" * 32
+        # Check for coinbase pattern: txid or prev_txid is all zeros
+        txid = first_input.get("txid") or first_input.get("prev_txid", "")
+        return txid == "0" * 64
     
     def _validate_transaction(self, tx: dict, height: int, 
                             spent_in_block: Set[str]) -> Tuple[bool, Optional[str], Decimal]:
@@ -94,16 +95,17 @@ class TransactionValidator:
         # Get transaction body for signature verification
         body = tx.get("body")
         
-        if not body:
-            return False, f"Transaction {txid} missing body", Decimal("0")
+        # qBTC transactions MUST have body with signature data (except coinbase)
+        if not body and not self._is_coinbase_transaction(tx):
+            return False, f"Transaction {txid} missing body with signature data", Decimal("0")
         
         # Extract and validate message string
-        msg_str = body.get("msg_str", "")
-        signature = body.get("signature", "")
-        pubkey = body.get("pubkey", "")
+        msg_str = body.get("msg_str", "") if body else ""
+        signature = body.get("signature", "") if body else ""
+        pubkey = body.get("pubkey", "") if body else ""
         
         # Special handling ONLY for genesis distribution
-        if body.get("transaction_data") == "initial_distribution" and height == 1:
+        if body and body.get("transaction_data") == "initial_distribution" and height == 1:
             # Genesis transaction has special rules
             from_ = GENESIS_ADDRESS
             to_ = ADMIN_ADDRESS
@@ -228,9 +230,14 @@ class TransactionValidator:
         if height > 1 and total_to_recipient != total_authorized:
             return False, f"Invalid tx {txid}: authorized amount {total_authorized} != amount sent to recipient {total_to_recipient}", Decimal("0")
         
-        # Verify signature (skip for genesis transaction and during sync mode)
-        if height != 1 and not self.skip_time_validation and not verify_transaction(msg_str, signature, pubkey):
-            return False, f"Signature verification failed for tx {txid}", Decimal("0")
+        # Verify signature (skip only for genesis transaction)
+        # All non-genesis, non-coinbase transactions MUST have valid signatures
+        if height != 1 and not self._is_coinbase_transaction(tx):
+            if not signature or not pubkey or not msg_str:
+                return False, f"Transaction {txid} missing signature, pubkey, or message", Decimal("0")
+            
+            if not verify_transaction(msg_str, signature, pubkey):
+                return False, f"Signature verification failed for tx {txid}", Decimal("0")
         
         # Calculate actual transaction fee
         tx_fee = total_available - total_output

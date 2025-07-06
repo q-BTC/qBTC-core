@@ -50,6 +50,12 @@ def main():
             "receiver": ADMIN_ADDRESS,
             "amount": "21000000"  # 21 million coins
         }],
+        "body": {
+            "transaction_data": "initial_distribution",
+            "msg_str": "",  # No message for genesis
+            "pubkey": "",   # No pubkey for genesis
+            "signature": "" # No signature for genesis
+        },
         "txid": "2a827ec7858bd690949677ca8dc6302988163bc773c3494107eb090a5131a1d6"  # Same as bootstrap
     }
     

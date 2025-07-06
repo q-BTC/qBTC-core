@@ -736,6 +736,11 @@ async def submit_block(request: Request, data: dict) -> dict:
                 "amount": str(out["value"]),  # Changed from "amount" to "value"
                 "script_pubkey": out.get("script_pubkey", "")
             } for idx, out in enumerate(coinbase_tx["outputs"])],
+            "body": {
+                "msg_str": "",      # Coinbase has no message
+                "pubkey": "",       # Coinbase has no pubkey
+                "signature": ""     # Coinbase has no signature
+            },
             "locktime": coinbase_tx.get("locktime", 0)
         }
         batch.put(f"tx:{coinbase_txid}".encode(), json.dumps(coinbase_tx_data).encode())

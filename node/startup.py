@@ -68,6 +68,12 @@ async def startup(args=None):
                         "receiver": ADMIN_ADDRESS,
                         "amount": "21000000"  # 21 million coins
                     }],
+                    "body": {
+                        "transaction_data": "initial_distribution",
+                        "msg_str": "",  # No message for genesis
+                        "pubkey": "",   # No pubkey for genesis
+                        "signature": "" # No signature for genesis
+                    },
                     "txid": sha256d(f"genesis_tx_{ADMIN_ADDRESS}".encode()).hex()
                 }
                 
@@ -81,9 +87,8 @@ async def startup(args=None):
                     nonce=0
                 )
                 
-                # Calculate proper genesis block hash
-                genesis_block_content = f"{genesis_block.version}{genesis_block.prev_block_hash}{genesis_block.merkle_root}{genesis_block.timestamp}{genesis_block.bits}{genesis_block.nonce}"
-                genesis_block_hash = sha256d(genesis_block_content.encode()).hex()
+                # Genesis block has special all-zeros hash
+                genesis_block_hash = "0" * 64
                 
                 # Genesis block doesn't need PoW
                 genesis_block_data = {

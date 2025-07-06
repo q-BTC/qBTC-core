@@ -47,7 +47,7 @@
       deploy:
         resources:
           limits:
-            cpus: '2.0'
+            cpus: '0.8'
             memory: 2G
           reservations:
             cpus: '0.5'
