@@ -73,10 +73,8 @@ class TransactionValidator:
             return False
         
         first_input = inputs[0]
-        # Check for coinbase pattern: either txid is all zeros or prev_txid is all zeros
-        # Some blocks use txid field, others use prev_txid
-        return (first_input.get("txid") == "00" * 32 or 
-                first_input.get("prev_txid") == "00" * 32)
+        # Check for coinbase pattern: txid is all zeros
+        return first_input.get("txid") == "00" * 32
     
     def _validate_transaction(self, tx: dict, height: int, 
                             spent_in_block: Set[str]) -> Tuple[bool, Optional[str], Decimal]:
@@ -118,15 +116,9 @@ class TransactionValidator:
             # Parse and validate message string
             parts = msg_str.split(":")
             
-            # MANDATORY: All transactions must have exactly 5 parts including chain ID (relax during sync)
-            if len(parts) != 5 and not self.skip_time_validation:
+            # MANDATORY: All transactions must have exactly 5 parts including chain ID
+            if len(parts) != 5:
                 return False, f"Transaction {txid} invalid format - must have sender:receiver:amount:timestamp:chain_id", Decimal("0")
-            elif len(parts) != 5 and self.skip_time_validation:
-                # During sync mode, be more lenient with old transaction formats
-                logger.warning(f"Sync mode: transaction {txid} has {len(parts)} parts instead of 5, allowing...")
-                # Pad missing parts with defaults
-                while len(parts) < 5:
-                    parts.append("0")  # Default values for missing fields
             
             from_, to_, amount_str, time_str, tx_chain_id = parts
             
