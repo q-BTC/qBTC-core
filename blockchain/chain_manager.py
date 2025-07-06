@@ -26,8 +26,8 @@ class ChainManager:
     - Orphan block management
     """
     
-    def __init__(self):
-        self.db = get_db()
+    def __init__(self, db=None):
+        self.db = db if db is not None else get_db()
         self.orphan_blocks: Dict[str, dict] = {}  # hash -> block data
         self.validator = TransactionValidator(self.db)
         self.orphan_timestamps: Dict[str, int] = {}  # hash -> timestamp when added

@@ -17,25 +17,32 @@ def get_current_height(db) -> Tuple[int, str]:
     # Try to use ChainManager if available
     try:
         from blockchain.chain_manager import ChainManager
-        cm = ChainManager()
+        cm = ChainManager(db)  # Pass the db parameter to ChainManager
         best_hash, best_height = cm.get_best_chain_tip()
+        logging.info(f"ChainManager returned: hash={best_hash}, height={best_height}")
         if best_hash != "00" * 32:  # Not genesis
             return best_height, best_hash
     except Exception as e:
         # ChainManager not available or failed, fall back to old method
-        logging.debug(f"ChainManager not available, using legacy method: {e}")
+        logging.info(f"ChainManager failed, using legacy method: {e}")
     
     # Legacy method - find highest block
     try:
+        # Count blocks first
+        block_count = sum(1 for k, _ in db.items() if k.startswith(b"block:"))
+        logging.info(f"Legacy method: Found {block_count} blocks in database")
+        
         tip_block = max(
             (json.loads(v.decode())             # each decoded block dict
              for k, v in db.items()
              if k.startswith(b"block:")),
             key=lambda blk: blk["height"]       # pick the one with max height
         )
+        logging.info(f"Legacy method: Best block height={tip_block['height']}")
         return tip_block["height"], tip_block["block_hash"]
 
     except ValueError:                          # raised if the generator is empty
+        logging.info("Legacy method: No blocks found, returning -1")
         return -1, GENESIS_PREVHASH  # Return -1 for empty database
 
 def set_db(db_path):

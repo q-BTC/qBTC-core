@@ -87,13 +87,24 @@ class TransactionValidator:
         # Validate transaction structure
         if not tx:
             return False, "Invalid transaction format - empty transaction", Decimal("0")
-        elif "txid" not in tx:
-            return False, "Invalid transaction format - missing txid", Decimal("0")
-        
-        txid = tx["txid"]
         
         # Get transaction body for signature verification
         body = tx.get("body")
+        
+        # Special handling for initial distribution transaction in block 1
+        # Check this BEFORE checking for txid since initial distribution doesn't have one
+        if body and body.get("transaction_data") == "initial_distribution" and height == 1:
+            # Genesis transaction has special rules
+            from_ = GENESIS_ADDRESS
+            to_ = ADMIN_ADDRESS
+            total_authorized = Decimal("21000000")
+            # For initial distribution, we'll use a synthetic txid if not present
+            txid = tx.get("txid", "initial_distribution_tx")
+        else:
+            # For all other transactions, txid is required
+            if "txid" not in tx:
+                return False, "Invalid transaction format - missing txid", Decimal("0")
+            txid = tx["txid"]
         
         # qBTC transactions MUST have body with signature data (except coinbase)
         if not body and not self._is_coinbase_transaction(tx):
@@ -104,12 +115,10 @@ class TransactionValidator:
         signature = body.get("signature", "") if body else ""
         pubkey = body.get("pubkey", "") if body else ""
         
-        # Special handling ONLY for genesis distribution
+        # Continue with special handling for initial distribution
         if body and body.get("transaction_data") == "initial_distribution" and height == 1:
-            # Genesis transaction has special rules
-            from_ = GENESIS_ADDRESS
-            to_ = ADMIN_ADDRESS
-            total_authorized = Decimal("21000000")
+            # Already set from_, to_, and total_authorized above
+            pass
         else:
             # ALL OTHER TRANSACTIONS MUST FOLLOW STRICT RULES
             if not msg_str:
