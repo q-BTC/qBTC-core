@@ -3,7 +3,7 @@ from rocksdict import WriteBatch
 from blockchain.blockchain import Block, calculate_merkle_root, validate_pow, serialize_transaction, sha256d
 from blockchain.chain_singleton import get_chain_manager
 from config.config import ADMIN_ADDRESS, GENESIS_ADDRESS, CHAIN_ID, TX_EXPIRATION_TIME
-# Removed verify_transaction import - sync trusts already validated transactions
+from blockchain.transaction_validator import TransactionValidator
 from blockchain.event_integration import emit_database_event
 from state.state import mempool_manager
 from events.event_bus import event_bus, EventTypes
@@ -140,13 +140,51 @@ def _process_block_in_chain(block: dict):
     logging.info("[SYNC] Processing confirmed block height %s with hash %s", height, block_hash)
     logging.info("[SYNC] Block has %d full transactions", len(full_transactions))
     
-    # Track total fees collected in this block
-    total_fees = Decimal("0")
+    # Create transaction validator with sync mode enabled (skip time validation)
+    validator = TransactionValidator(db)
+    validator.skip_time_validation = True  # CRITICAL: Set this for historical blocks during sync
+    
+    # First validate all transactions in the block
+    is_valid, error_msg, total_fees = validator.validate_block_transactions(block)
+    if not is_valid:
+        raise ValueError(f"Block {block_hash} contains invalid transactions: {error_msg}")
+    
     # Track spent UTXOs within this block to prevent double-spending
     spent_in_block = set()
     # Store coinbase data for validation after fee calculation
     coinbase_data = None
 
+    # Find and validate coinbase transaction separately
+    for tx in full_transactions:
+        if tx and validator._is_coinbase_transaction(tx):
+            coinbase_tx_id = f"coinbase_{height}"
+            is_valid, error_msg = validator.validate_coinbase_transaction(tx, height, total_fees)
+            if not is_valid:
+                raise ValueError(f"Invalid coinbase transaction: {error_msg}")
+            
+            # Store coinbase outputs for later processing
+            coinbase_outputs = []
+            for idx, output in enumerate(tx.get("outputs", [])):
+                output_amount = Decimal(str(output.get("value", "0")))
+                output_key = f"utxo:{coinbase_tx_id}:{idx}".encode()
+                utxo = {
+                    "txid": coinbase_tx_id,
+                    "utxo_index": idx,
+                    "sender": "coinbase",
+                    "receiver": miner_address,
+                    "amount": str(output_amount),
+                    "spent": False,
+                }
+                coinbase_outputs.append((output_key, utxo))
+            
+            coinbase_data = {
+                "tx": tx,
+                "tx_id": coinbase_tx_id,
+                "outputs": coinbase_outputs
+            }
+            break
+    
+    # Now process all transactions (they've already been validated)
     for raw in full_transactions:
         if raw is None:
             continue
@@ -155,37 +193,8 @@ def _process_block_in_chain(block: dict):
             logging.debug("[SYNC] Genesis transaction detected")
             continue
 
-        is_probable_coinbase = all(k in tx for k in ("version", "inputs", "outputs")) and not tx.get("txid")
-        if is_probable_coinbase:
-            logging.debug("[SYNC] Coinbase transaction detected")
-            coinbase_tx_id = f"coinbase_{height}"
-            
-            # Store coinbase data for validation after processing all transactions
-            coinbase_total = Decimal("0")
-            coinbase_outputs = []
-            
-            for idx, output in enumerate(tx.get("outputs", [])):
-                output_amount = Decimal(str(output.get("value", "0")))
-                coinbase_total += output_amount
-                
-                output_key = f"utxo:{coinbase_tx_id}:{idx}".encode()
-                utxo = {
-                    "txid": coinbase_tx_id,
-                    "utxo_index": idx,
-                    "sender": "coinbase",
-                    "receiver": miner_address,   
-                    "amount": str(output_amount),
-                    "spent": False,
-                }
-                coinbase_outputs.append((output_key, utxo))
-            
-            # Store coinbase data for validation after fee calculation
-            coinbase_data = {
-                "tx": tx,
-                "tx_id": coinbase_tx_id,
-                "total": coinbase_total,
-                "outputs": coinbase_outputs
-            }
+        # Skip coinbase (already processed above)
+        if validator._is_coinbase_transaction(tx):
             continue
 
         # Handle block 1 initial distribution transaction without txid
@@ -200,62 +209,10 @@ def _process_block_in_chain(block: dict):
         
         inputs = tx.get("inputs", [])
         outputs = tx.get("outputs", [])
-        body = tx.get("body", {})
-
-        # Sync code only handles transactions in proper format with inputs/outputs
-        if not inputs or not outputs:
-            # Skip special case for initial distribution transaction
-            if body.get("transaction_data") == "initial_distribution" and height == 1:
-                # This is handled separately above
-                pass
-            else:
-                raise ValueError(f"Transaction {txid} missing inputs or outputs - sync only handles proper format")
-        
-        logging.debug(f"[SYNC] Processing transaction {txid} with {len(inputs)} inputs and {len(outputs)} outputs")
-
-        total_available = Decimal("0")
-        total_required = Decimal("0")
-        
-        for inp in inputs:
-            if "txid" not in inp and "prev_txid" not in inp:
-                continue
-            
-            # Handle both formats: txid/utxo_index and prev_txid/prev_index
-            inp_txid = inp.get('txid') or inp.get('prev_txid')
-            inp_index = inp.get('utxo_index', inp.get('prev_index', 0))
-            
-            spent_key = f"utxo:{inp_txid}:{inp_index}".encode()
-            spent_key_str = spent_key.decode()
-            
-            # Check if this UTXO was already spent in this block
-            if spent_key_str in spent_in_block:
-                raise ValueError(f"Double spend detected: UTXO {spent_key_str} already spent in this block")
-            
-            utxo_raw = db.get(spent_key)
-            if not utxo_raw:
-                # During sync, UTXOs might not exist yet if we're processing blocks out of order
-                logging.warning(f"[SYNC] UTXO not found (might be from earlier block): {spent_key_str}")
-                continue
-                
-            utxo = json.loads(utxo_raw.decode())
-
-            if utxo["spent"]:
-                raise ValueError(f"UTXO {spent_key} already spent")
-
-            total_available += Decimal(utxo["amount"])
-            # Mark as spent in this block
-            spent_in_block.add(spent_key_str)
-
-        # For sync format, we trust the transaction was already validated
-        for out in outputs:
-            amt = Decimal(out.get("amount", out.get("value", "0")))
-            total_required += amt
-
-        # During sync, we trust that transactions were already validated
-        # No need to re-validate amounts, signatures, etc.
 
         batch.put(f"tx:{txid}".encode(), json.dumps(tx).encode())
 
+        # Mark spent UTXOs
         for inp in inputs:
             if "txid" not in inp and "prev_txid" not in inp:
                 continue
@@ -269,7 +226,7 @@ def _process_block_in_chain(block: dict):
                 utxo_rec["spent"] = True
                 batch.put(spent_key, json.dumps(utxo_rec).encode())
 
-  
+        # Create new UTXOs
         for out in outputs:
             # Create proper UTXO record with all necessary fields
             utxo_record = {
@@ -283,26 +240,8 @@ def _process_block_in_chain(block: dict):
             out_key = f"utxo:{txid}:{out.get('utxo_index', 0)}".encode()
             batch.put(out_key, json.dumps(utxo_record).encode())
 
-    # Fix 1: Validate coinbase amount after all fees are calculated
+    # Store coinbase transaction and outputs
     if coinbase_data is not None:
-        # Define block reward schedule
-        # Bitcoin-like halving schedule: 50 BTC initially, halving every 210,000 blocks
-        halvings = height // 210000
-        if halvings >= 64:
-            block_subsidy = Decimal("0")
-        else:
-            block_subsidy = Decimal("50") / (2 ** halvings) * Decimal("100000000")  # In satoshis
-        
-        # Maximum allowed coinbase output
-        max_coinbase_amount = block_subsidy + total_fees
-        
-        logging.info(f"[SYNC] Validating coinbase: total={coinbase_data['total']}, subsidy={block_subsidy}, fees={total_fees}, max_allowed={max_coinbase_amount}")
-        
-        if coinbase_data['total'] > max_coinbase_amount:
-            raise ValueError(
-                f"Invalid coinbase amount at height {height}: {coinbase_data['total']} > allowed {max_coinbase_amount} (subsidy={block_subsidy} + fees={total_fees})")
-        
-        # Now that coinbase is validated, store it
         batch.put(f"tx:{coinbase_data['tx_id']}".encode(), json.dumps(coinbase_data['tx']).encode())
         for output_key, utxo in coinbase_data['outputs']:
             batch.put(output_key, json.dumps(utxo).encode())
