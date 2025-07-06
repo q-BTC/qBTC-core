@@ -33,64 +33,86 @@ async def startup(args=None):
         from config.config import GENESIS_ADDRESS, ADMIN_ADDRESS
         import time
         
-        # Check if genesis block exists
+        # Check current blockchain state
         cm = ChainManager()
         best_hash, best_height = cm.get_best_chain_tip()
         
-        if best_hash == "00" * 32 and best_height == 0:
-            # No blocks exist, create genesis block
-            logger.info("Creating genesis block...")
+        # Check if database is truly empty (no blocks at all)
+        has_any_blocks = False
+        try:
+            # Check if there are any blocks in the database
+            for key, _ in db.items():
+                if key.startswith(b"block:"):
+                    has_any_blocks = True
+                    break
+        except Exception as e:
+            logger.warning(f"Could not check database for existing blocks: {e}")
             
-            # Create genesis transaction (21M coins to admin)
-            genesis_tx = {
-                "version": 1,
-                "inputs": [{
-                    "txid": "00" * 32,
-                    "utxo_index": 0,
-                    "signature": "",
-                    "pubkey": ""
-                }],
-                "outputs": [{
-                    "sender": GENESIS_ADDRESS,
-                    "receiver": ADMIN_ADDRESS,
-                    "amount": "21000000"  # 21 million coins
-                }],
-                "txid": sha256d(f"genesis_tx_{ADMIN_ADDRESS}".encode()).hex()
-            }
-            
-            # Create genesis block
-            genesis_block = Block(
-                version=1,
-                prev_block_hash="00" * 32,
-                merkle_root=calculate_merkle_root([genesis_tx["txid"]]),
-                timestamp=int(time.time()),
-                bits=0x1d00ffff,  # Initial difficulty
-                nonce=0
-            )
-            
-            # Genesis block doesn't need PoW
-            genesis_block_data = {
-                "version": genesis_block.version,
-                "previous_hash": genesis_block.prev_block_hash,
-                "merkle_root": genesis_block.merkle_root,
-                "timestamp": genesis_block.timestamp,
-                "bits": genesis_block.bits,
-                "nonce": genesis_block.nonce,
-                "block_hash": "0" * 64,  # Special genesis hash
-                "height": 0,
-                "tx_ids": [genesis_tx["txid"]],
-                "full_transactions": [genesis_tx]
-            }
-            
-            # Add genesis block to chain
-            success, error = cm.add_block(genesis_block_data)
-            if success:
-                logger.info("Genesis block created successfully")
-                # Don't manually create the genesis UTXO - ChainManager already does this
-                # when processing the genesis block transactions
-                logger.info(f"Genesis block added with 21M coins to {ADMIN_ADDRESS}")
+        if not has_any_blocks:
+            # Database is completely empty - decide what to do based on node type
+            if args and args.bootstrap:
+                # Only bootstrap servers create genesis blocks
+                logger.info("Bootstrap server starting with empty database - creating genesis block...")
+                
+                # Create genesis transaction (21M coins to admin)
+                genesis_tx = {
+                    "version": 1,
+                    "inputs": [{
+                        "txid": "00" * 32,
+                        "utxo_index": 0,
+                        "signature": "",
+                        "pubkey": ""
+                    }],
+                    "outputs": [{
+                        "sender": GENESIS_ADDRESS,
+                        "receiver": ADMIN_ADDRESS,
+                        "amount": "21000000"  # 21 million coins
+                    }],
+                    "txid": sha256d(f"genesis_tx_{ADMIN_ADDRESS}".encode()).hex()
+                }
+                
+                # Create genesis block
+                genesis_block = Block(
+                    version=1,
+                    prev_block_hash="00" * 32,
+                    merkle_root=calculate_merkle_root([genesis_tx["txid"]]),
+                    timestamp=int(time.time()),
+                    bits=0x1d00ffff,  # Initial difficulty
+                    nonce=0
+                )
+                
+                # Calculate proper genesis block hash
+                genesis_block_content = f"{genesis_block.version}{genesis_block.prev_block_hash}{genesis_block.merkle_root}{genesis_block.timestamp}{genesis_block.bits}{genesis_block.nonce}"
+                genesis_block_hash = sha256d(genesis_block_content.encode()).hex()
+                
+                # Genesis block doesn't need PoW
+                genesis_block_data = {
+                    "version": genesis_block.version,
+                    "previous_hash": genesis_block.prev_block_hash,
+                    "merkle_root": genesis_block.merkle_root,
+                    "timestamp": genesis_block.timestamp,
+                    "bits": genesis_block.bits,
+                    "nonce": genesis_block.nonce,
+                    "block_hash": genesis_block_hash,
+                    "height": 0,
+                    "tx_ids": [genesis_tx["txid"]],
+                    "full_transactions": [genesis_tx]
+                }
+                
+                # Add genesis block to chain
+                success, error = cm.add_block(genesis_block_data)
+                if success:
+                    logger.info("Genesis block created successfully")
+                    logger.info(f"Genesis block added with 21M coins to {ADMIN_ADDRESS}")
+                else:
+                    logger.error(f"Failed to create genesis block: {error}")
             else:
-                logger.error(f"Failed to create genesis block: {error}")
+                # Validator nodes start with completely empty database - no genesis creation
+                # They will sync everything (including genesis) from the network
+                logger.info("Validator node starting with completely empty database - will sync genesis and all blocks from network")
+        else:
+            # Database has some blocks already
+            logger.info(f"Node starting with existing blockchain - best block: {best_hash[:16]}... at height {best_height}")
         
         logger.info("Blockchain components ready")
         

@@ -364,7 +364,7 @@ async def discover_peers_once(gossip_node):
         except Exception as e:
             logger.error(f"Error processing peer {vid}: {e}")
     
-    logger.info(f"Peer discovery complete: discovered {discovered_count}/{len(validator_ids)-1} peers")
+    logger.info(f"Peer discovery complete: discovered {discovered_count}/{len(discovered_validators)-1} peers")
 
 
 async def push_blocks(peer_ip, peer_port):
@@ -404,7 +404,7 @@ async def push_blocks(peer_ip, peer_port):
             #peer_tip = msg.get("current_tip")
             logger.info(f"*** Peer {peer_ip} responded with height {peer_height}")
 
-        # Only push if our height is greater
+        # Only push if our height is greater than peer's
         if int(peer_height) < local_height:
             print("***** WILL PUSH BLOCKS TO PEER ****")
 
@@ -463,9 +463,18 @@ async def push_blocks(peer_ip, peer_port):
             print(f"Sent {len(blocks_to_send)} blocks to {peer_ip}")
         
         elif peer_height > local_height:
+            # We need blocks from peer
             print("***** WILL PULL BLOCKS FROM PEER *****")
-            start_height = local_height + 1
+            print(f"Decision logic: peer_height={peer_height}, local_height={local_height}")
+            
+            if local_height == -1:
+                # We have no blocks, request from genesis
+                start_height = 0
+            else:
+                start_height = local_height + 1
             end_height = peer_height
+            
+            logger.info(f"Requesting blocks from height {start_height} to {end_height}")
 
             get_blocks_request = {
                 "type": "get_blocks",
@@ -520,6 +529,8 @@ async def push_blocks(peer_ip, peer_port):
 
         else:
             print("Peer up to date")
+            print(f"Decision logic: peer_height={peer_height}, local_height={local_height}")
+            logger.info(f"No sync needed: peer_height={peer_height}, local_height={local_height}")
 
         w.close()
         await w.wait_closed()

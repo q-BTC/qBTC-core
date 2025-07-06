@@ -36,6 +36,9 @@ def _process_blocks_from_peer_impl(blocks: list[dict]):
         print("**** RAW BLOCkS ****")
         print(raw_blocks)
         
+        # Enable sync mode for bulk block processing
+        cm.set_sync_mode(True)
+        
         # Log the type and structure for debugging
         logging.info(f"Received blocks type: {type(blocks)}")
         if blocks and len(blocks) > 0:
@@ -71,47 +74,52 @@ def _process_blocks_from_peer_impl(blocks: list[dict]):
     accepted_count = 0
     rejected_count = 0
     
-    for block in blocks:
-        try:
-            height = block.get("height")
-            block_hash = block.get("block_hash")
-            prev_hash = block.get("previous_hash")
-            
-            # Log block structure for debugging
-            logging.info(f"Processing block at height {height} with hash {block_hash}")
-            logging.info(f"Block has bits field: {'bits' in block}")
-            
-            # Add full_transactions to block if not present
-            if "full_transactions" not in block:
-                block["full_transactions"] = block.get("full_transactions", [])
-            
-            # Let ChainManager handle consensus
-            success, error = cm.add_block(block)
-            
-            if success:
-                accepted_count += 1
-                # Only process if block is in main chain
-                if cm.is_block_in_main_chain(block_hash):
-                    # Process the block transactions
-                    _process_block_in_chain(block)
-                else:
-                    logging.info("Block %s accepted but not in main chain yet", block_hash)
-            else:
-                rejected_count += 1
-                logging.warning("Block %s rejected: %s", block_hash, error)
-                continue
+    try:
+        for block in blocks:
+            try:
+                height = block.get("height")
+                block_hash = block.get("block_hash")
+                prev_hash = block.get("previous_hash")
                 
-        except Exception as e:
-            logging.error("Error processing block %s: %s", block.get("block_hash", "unknown"), e)
-            rejected_count += 1
+                # Log block structure for debugging
+                logging.info(f"Processing block at height {height} with hash {block_hash}")
+                logging.info(f"Block has bits field: {'bits' in block}")
+                
+                # Add full_transactions to block if not present
+                if "full_transactions" not in block:
+                    block["full_transactions"] = block.get("full_transactions", [])
+                
+                # Let ChainManager handle consensus
+                success, error = cm.add_block(block)
+                
+                if success:
+                    accepted_count += 1
+                    # Only process if block is in main chain
+                    if cm.is_block_in_main_chain(block_hash):
+                        # Process the block transactions
+                        _process_block_in_chain(block)
+                    else:
+                        logging.info("Block %s accepted but not in main chain yet", block_hash)
+                else:
+                    rejected_count += 1
+                    logging.warning("Block %s rejected: %s", block_hash, error)
+                    continue
+                    
+            except Exception as e:
+                logging.error("Error processing block %s: %s", block.get("block_hash", "unknown"), e)
+                rejected_count += 1
 
-    logging.info("Block processing complete: %d accepted, %d rejected", accepted_count, rejected_count)
+        logging.info("Block processing complete: %d accepted, %d rejected", accepted_count, rejected_count)
+        
+        # Check if we need to request more blocks
+        best_tip, best_height = cm.get_best_chain_tip()
+        logging.info("Current best chain height: %d", best_height)
+        
+        return accepted_count > 0
     
-    # Check if we need to request more blocks
-    best_tip, best_height = cm.get_best_chain_tip()
-    logging.info("Current best chain height: %d", best_height)
-    
-    return accepted_count > 0
+    finally:
+        # Always disable sync mode after processing
+        cm.set_sync_mode(False)
 
 def _process_block_in_chain(block: dict):
     """Process a block that is confirmed to be in the main chain"""
@@ -144,8 +152,6 @@ def _process_block_in_chain(block: dict):
         if raw is None:
             continue
         tx = raw
-        if "transaction" in tx:
-            tx = tx["transaction"]
         if tx.get("txid") == "genesis_tx":
             logging.debug("[SYNC] Genesis transaction detected")
             continue
@@ -183,144 +189,155 @@ def _process_block_in_chain(block: dict):
             }
             continue
 
-        if "txid" in tx:
+        # Handle block 1 initial distribution transaction without txid
+        if height == 1 and "txid" not in tx and tx.get("body", {}).get("transaction_data") == "initial_distribution":
+            # This is the special initial distribution transaction
+            txid = "initial_distribution_tx"
+            tx["txid"] = txid  # Add synthetic txid for processing
+        elif "txid" in tx:
             txid = tx["txid"]
-            inputs = tx.get("inputs", [])
-            outputs = tx.get("outputs", [])
-            body = tx.get("body", {})
+        else:
+            continue  # Skip transactions without txid (except initial distribution)
+        
+        inputs = tx.get("inputs", [])
+        outputs = tx.get("outputs", [])
+        body = tx.get("body", {})
 
-            pubkey = body.get("pubkey", "unknown")
-            signature = body.get("signature", "unknown")
+        pubkey = body.get("pubkey", "unknown")
+        signature = body.get("signature", "unknown")
 
-            from_ = to_ = total_authorized = time_ = None
-            if body.get("transaction_data") == "initial_distribution" and height == 1:
-                total_authorized = "21000000"  
-                to_ = ADMIN_ADDRESS
-                from_ = GENESIS_ADDRESS
-            else:
-                msg_str = body.get("msg_str", "")
-                parts = msg_str.split(":")
-                # MANDATORY format: sender:receiver:amount:timestamp:chain_id
-                if len(parts) != 5:
-                    raise ValueError(f"Transaction {txid} invalid format - must have sender:receiver:amount:timestamp:chain_id")
-                from_, to_, total_authorized, time_, tx_chain_id = parts
-                
-                # Validate chain ID
-                if int(tx_chain_id) != CHAIN_ID:
-                    raise ValueError(f"Invalid chain ID in tx {txid}: expected {CHAIN_ID}, got {tx_chain_id}")
-                
-                # Validate timestamp for expiration
-                try:
-                    tx_timestamp = int(time_)
-                    current_time = int(time.time() * 1000)  # Convert to milliseconds
-                    tx_age = (current_time - tx_timestamp) / 1000  # Age in seconds
-                    
-                    if tx_age > TX_EXPIRATION_TIME:
-                        raise ValueError(f"Transaction {txid} expired: age {tx_age}s > max {TX_EXPIRATION_TIME}s")
-                    
-                    # Reject transactions with future timestamps (more than 5 minutes in the future)
-                    if tx_age < -300:  # -300 seconds = 5 minutes in the future
-                        raise ValueError(f"Transaction {txid} has future timestamp: {-tx_age}s in the future")
-                        
-                except (ValueError, TypeError) as e:
-                    raise ValueError(f"Invalid timestamp in tx {txid}: {time_}")
-
-            total_available = Decimal("0")
-            total_required = Decimal("0")
-
-            for inp in inputs:
-                if "txid" not in inp:
-                    continue
-                spent_key = f"utxo:{inp['txid']}:{inp.get('utxo_index', 0)}".encode()
-                spent_key_str = spent_key.decode()
-                
-                # Check if this UTXO was already spent in this block
-                if spent_key_str in spent_in_block:
-                    raise ValueError(f"Double spend detected: UTXO {spent_key_str} already spent in this block")
-                
-                utxo_raw = db.get(spent_key)
-                if not utxo_raw:
-                    raise ValueError(f"Missing UTXO for input: {spent_key}")
-                utxo = json.loads(utxo_raw.decode())
-
-                if utxo["spent"]:
-                    raise ValueError(f"UTXO {spent_key} already spent")
-                if utxo["receiver"] != from_:
-                    raise ValueError(f"UTXO {spent_key} not owned by sender {from_}")
-
-                total_available += Decimal(utxo["amount"])
-                # Mark as spent in this block
-                spent_in_block.add(spent_key_str)
-
-            total_to_recipient = Decimal("0")
-            total_change = Decimal("0")
+        from_ = to_ = total_authorized = time_ = None
+        if body.get("transaction_data") == "initial_distribution" and height == 1:
+            total_authorized = "21000000"  
+            to_ = ADMIN_ADDRESS
+            from_ = GENESIS_ADDRESS
+        else:
+            msg_str = body.get("msg_str", "")
+            parts = msg_str.split(":")
+            # MANDATORY format: sender:receiver:amount:timestamp:chain_id
+            if len(parts) != 5:
+                raise ValueError(f"Transaction {txid} invalid format - must have sender:receiver:amount:timestamp:chain_id")
+            from_, to_, total_authorized, time_, tx_chain_id = parts
             
-            for out in outputs:
-                recv = out.get("receiver")
-                amt = Decimal(out.get("amount", "0"))
-                print(out)
-                print("receiver:")
-                print(recv)
-                print("to:")
-                print(to_)
-                print(ADMIN_ADDRESS)
-                if recv == to_:
-                    total_to_recipient += amt
-                elif recv == from_:
-                    total_change += amt
-                elif recv == ADMIN_ADDRESS:
-                    # This is fee to admin
-                    total_required += amt
-                else:
-                    raise ValueError(
-                        f"Hack detected: unauthorized output to {recv} in tx {txid}")
+            # Validate chain ID
+            if int(tx_chain_id) != CHAIN_ID:
+                raise ValueError(f"Invalid chain ID in tx {txid}: expected {CHAIN_ID}, got {tx_chain_id}")
+            
+            # Validate timestamp for expiration
+            try:
+                tx_timestamp = int(time_)
+                current_time = int(time.time() * 1000)  # Convert to milliseconds
+                tx_age = (current_time - tx_timestamp) / 1000  # Age in seconds
+                
+                if tx_age > TX_EXPIRATION_TIME:
+                    raise ValueError(f"Transaction {txid} expired: age {tx_age}s > max {TX_EXPIRATION_TIME}s")
+                
+                # Reject transactions with future timestamps (more than 5 minutes in the future)
+                if tx_age < -300:  # -300 seconds = 5 minutes in the future
+                    raise ValueError(f"Transaction {txid} has future timestamp: {-tx_age}s in the future")
+                    
+            except (ValueError, TypeError) as e:
+                raise ValueError(f"Invalid timestamp in tx {txid}: {time_}")
+
+        total_available = Decimal("0")
+        total_required = Decimal("0")
+
+        for inp in inputs:
+            if "txid" not in inp:
+                continue
+            spent_key = f"utxo:{inp['txid']}:{inp.get('utxo_index', 0)}".encode()
+            spent_key_str = spent_key.decode()
+            
+            # Check if this UTXO was already spent in this block
+            if spent_key_str in spent_in_block:
+                raise ValueError(f"Double spend detected: UTXO {spent_key_str} already spent in this block")
+            
+            utxo_raw = db.get(spent_key)
+            if not utxo_raw:
+                raise ValueError(f"Missing UTXO for input: {spent_key}")
+            utxo = json.loads(utxo_raw.decode())
+
+            if utxo["spent"]:
+                raise ValueError(f"UTXO {spent_key} already spent")
+            if utxo["receiver"] != from_:
+                raise ValueError(f"UTXO {spent_key} not owned by sender {from_}")
+
+            total_available += Decimal(utxo["amount"])
+            # Mark as spent in this block
+            spent_in_block.add(spent_key_str)
+
+        total_to_recipient = Decimal("0")
+        total_change = Decimal("0")
+        
+        for out in outputs:
+            recv = out.get("receiver")
+            amt = Decimal(out.get("amount", "0"))
+            print(out)
+            print("receiver:")
+            print(recv)
+            print("to:")
+            print(to_)
+            print(ADMIN_ADDRESS)
+            if recv == to_:
+                total_to_recipient += amt
+            elif recv == from_:
+                total_change += amt
+            elif recv == ADMIN_ADDRESS:
+                # This is fee to admin
                 total_required += amt
-
-            miner_fee = (Decimal(total_authorized) * Decimal("0.001")).quantize(
-                Decimal("0.00000001"), rounding=ROUND_DOWN)
-            grand_total_required = Decimal(total_authorized) + miner_fee
-
-            if height > 1 and grand_total_required > total_available:
+            else:
                 raise ValueError(
-                    f"Invalid tx {txid}: balance {total_available} < required {grand_total_required}")
-            
-            # Fix 3: Enforce exact payment amount to recipient
-            if height > 1 and total_to_recipient != Decimal(total_authorized):
-                raise ValueError(
-                    f"Invalid tx {txid}: authorized amount {total_authorized} != amount sent to recipient {total_to_recipient}")
+                    f"Hack detected: unauthorized output to {recv} in tx {txid}")
+            total_required += amt
 
-            if height != 1 and not verify_transaction(msg_str, signature, pubkey):
-                raise ValueError(f"Signature check failed for tx {txid}")
-            
-            # Calculate the actual transaction fee for this transaction
-            if height > 1:
-                tx_fee = total_available - (total_to_recipient + total_change)
-                total_fees += tx_fee
+        miner_fee = (Decimal(total_authorized) * Decimal("0.001")).quantize(
+            Decimal("0.00000001"), rounding=ROUND_DOWN)
+        grand_total_required = Decimal(total_authorized) + miner_fee
 
-            batch.put(f"tx:{txid}".encode(), json.dumps(tx).encode())
+        if height > 1 and grand_total_required > total_available:
+            raise ValueError(
+                f"Invalid tx {txid}: balance {total_available} < required {grand_total_required}")
+        
+        # Fix 3: Enforce exact payment amount to recipient
+        if height > 1 and total_to_recipient != Decimal(total_authorized):
+            raise ValueError(
+                f"Invalid tx {txid}: authorized amount {total_authorized} != amount sent to recipient {total_to_recipient}")
 
-            for inp in inputs:
-                if "txid" not in inp:
-                    continue
-                spent_key = f"utxo:{inp['txid']}:{inp.get('utxo_index', 0)}".encode()
-                if spent_key in db:
-                    utxo_rec = json.loads(db.get(spent_key).decode())
-                    utxo_rec["spent"] = True
-                    batch.put(spent_key, json.dumps(utxo_rec).encode())
+        # Skip signature verification for initial distribution transaction
+        if txid == "initial_distribution_tx":
+            pass  # No signature verification needed
+        elif height != 1 and not verify_transaction(msg_str, signature, pubkey):
+            raise ValueError(f"Signature check failed for tx {txid}")
+        
+        # Calculate the actual transaction fee for this transaction
+        if height > 1:
+            tx_fee = total_available - (total_to_recipient + total_change)
+            total_fees += tx_fee
+
+        batch.put(f"tx:{txid}".encode(), json.dumps(tx).encode())
+
+        for inp in inputs:
+            if "txid" not in inp:
+                continue
+            spent_key = f"utxo:{inp['txid']}:{inp.get('utxo_index', 0)}".encode()
+            if spent_key in db:
+                utxo_rec = json.loads(db.get(spent_key).decode())
+                utxo_rec["spent"] = True
+                batch.put(spent_key, json.dumps(utxo_rec).encode())
 
   
-            for out in outputs:
-                # Create proper UTXO record with all necessary fields
-                utxo_record = {
-                    "txid": txid,
-                    "utxo_index": out.get('utxo_index', 0),
-                    "sender": out.get('sender', ''),
-                    "receiver": out.get('receiver', ''),
-                    "amount": str(out.get('amount', '0')),  # Ensure string to avoid scientific notation
-                    "spent": False  # New UTXOs are always unspent
-                }
-                out_key = f"utxo:{txid}:{out.get('utxo_index', 0)}".encode()
-                batch.put(out_key, json.dumps(utxo_record).encode())
+        for out in outputs:
+            # Create proper UTXO record with all necessary fields
+            utxo_record = {
+                "txid": txid,
+                "utxo_index": out.get('utxo_index', 0),
+                "sender": out.get('sender', ''),
+                "receiver": out.get('receiver', ''),
+                "amount": str(out.get('amount', '0')),  # Ensure string to avoid scientific notation
+                "spent": False  # New UTXOs are always unspent
+            }
+            out_key = f"utxo:{txid}:{out.get('utxo_index', 0)}".encode()
+            batch.put(out_key, json.dumps(utxo_record).encode())
 
     # Fix 1: Validate coinbase amount after all fees are calculated
     if coinbase_data is not None:

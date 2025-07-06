@@ -10,7 +10,7 @@ from decimal import Decimal
 from collections import defaultdict
 from database.database import get_db
 from blockchain.blockchain import Block, validate_pow, bits_to_target, sha256d
-from blockchain.difficulty import get_next_bits, validate_block_bits, validate_block_timestamp
+from blockchain.difficulty import get_next_bits, validate_block_bits, validate_block_timestamp, MAX_FUTURE_TIME
 from blockchain.transaction_validator import TransactionValidator
 from rocksdict import WriteBatch
 
@@ -35,6 +35,7 @@ class ChainManager:
         self.chain_tips: Set[str] = set()  # Set of chain tip hashes
         self.MAX_ORPHAN_BLOCKS = 100  # Maximum number of orphan blocks to keep
         self.MAX_ORPHAN_AGE = 3600  # Maximum age of orphan blocks in seconds (1 hour)
+        self.is_syncing = False  # Flag to indicate if we're in initial sync
         self._initialize_index()
     
     def _initialize_index(self):
@@ -120,10 +121,15 @@ class ChainManager:
                 best_height = tip_info["height"]
         
         if not best_tip:
-            # No tips found, return genesis
-            return "00" * 32, 0
+            # No tips found, return -1 for empty blockchain
+            return "00" * 32, -1
             
         return best_tip, best_height
+    
+    def set_sync_mode(self, syncing: bool):
+        """Set whether we're in initial sync mode"""
+        self.is_syncing = syncing
+        logger.info(f"Sync mode set to: {syncing}")
     
     def add_block(self, block_data: dict) -> Tuple[bool, Optional[str]]:
         """
@@ -164,45 +170,78 @@ class ChainManager:
         # Special handling for genesis block
         is_genesis = block_hash == "0" * 64 and height == 0
         
+        # Always validate PoW (except for genesis)
         if not is_genesis and not validate_pow(block_obj):
             return False, "Invalid proof of work"
         
         # Validate difficulty adjustment (skip for genesis)
         if not is_genesis and height > 0:
-            # Get the expected difficulty for this height
-            parent_height = height - 1
-            expected_bits = get_next_bits(self.db, parent_height)
+            # For difficulty validation, we need to check against the parent block
+            # The parent must already be in our database for proper validation
+            parent_block_key = f"block:{prev_hash}".encode()
+            parent_block_data = self.db.get(parent_block_key)
             
-            if not validate_block_bits(block_data["bits"], expected_bits):
-                return False, f"Invalid difficulty bits: expected {expected_bits:#x}, got {block_data['bits']:#x}"
+            if parent_block_data:
+                # Parent exists, we can validate difficulty
+                parent_block = json.loads(parent_block_data.decode())
+                parent_height = parent_block["height"]
+                expected_bits = get_next_bits(self.db, parent_height)
+                
+                if not validate_block_bits(block_data["bits"], expected_bits):
+                    return False, f"Invalid difficulty bits at height {height}: expected {expected_bits:#x}, got {block_data['bits']:#x}"
+            else:
+                # Parent doesn't exist yet - this is an orphan block
+                # Store as orphan and process later
+                logger.warning(f"Parent block {prev_hash} not found for block {block_hash} at height {height}")
+                self.orphan_blocks[block_hash] = block_data
+                return False, "Parent block not found - stored as orphan"
         
-        # Validate timestamp (skip for genesis)
+        # Validate timestamp (skip only for genesis)
         if not is_genesis and prev_hash in self.block_index:
             parent_info = self.block_index[prev_hash]
-            current_time = int(time.time())
             
-            logger.info(f"Timestamp validation: block_ts={block_data['timestamp']}, parent_ts={parent_info['timestamp']}, current={current_time}")
-            
-            # Special handling for rapid mining (cpuminer compatibility)
-            # If the block timestamp equals or is less than parent timestamp, check if we're mining rapidly
-            if block_data["timestamp"] <= parent_info["timestamp"]:
-                # Check if parent block was mined very recently (within last 10 seconds)
-                time_since_parent = current_time - parent_info["timestamp"]
-                logger.info(f"Block timestamp <= parent. Time since parent: {time_since_parent}s")
-                
-                if time_since_parent <= 10:  # Increased window to 10 seconds
-                    logger.warning(f"Allowing timestamp {block_data['timestamp']} <= parent {parent_info['timestamp']} for rapid mining (parent mined {time_since_parent}s ago)")
-                    # Skip the normal timestamp validation for rapid mining
-                else:
-                    return False, f"Invalid block timestamp - must be greater than parent (block: {block_data['timestamp']}, parent: {parent_info['timestamp']})"
+            # During sync, we can't use current time for historical blocks
+            # Instead, we only validate that blocks are sequential in time
+            if self.is_syncing:
+                # During sync, only validate against parent timestamp
+                if block_data["timestamp"] <= parent_info["timestamp"]:
+                    # Allow equal timestamps for rapid mining scenarios
+                    if block_data["timestamp"] < parent_info["timestamp"]:
+                        return False, f"Invalid block timestamp during sync - must be >= parent (block: {block_data['timestamp']}, parent: {parent_info['timestamp']})"
+                logger.info(f"Sync mode timestamp validation: block_ts={block_data['timestamp']}, parent_ts={parent_info['timestamp']}")
             else:
-                # Normal timestamp validation
-                if not validate_block_timestamp(
-                    block_data["timestamp"],
-                    parent_info["timestamp"],
-                    current_time
-                ):
-                    return False, "Invalid block timestamp"
+                # Not syncing - validate against current time too
+                current_time = int(time.time())
+                logger.info(f"Timestamp validation: block_ts={block_data['timestamp']}, parent_ts={parent_info['timestamp']}, current={current_time}")
+                
+                # Additional validation when not syncing
+                # Special case: If parent is genesis (height 0), be more lenient with timestamp
+                parent_height = parent_info.get("height", 0)
+                if parent_height == 0:
+                    # For block 1 (child of genesis), only check that it's not too far in future
+                    if block_data["timestamp"] > current_time + MAX_FUTURE_TIME:
+                        return False, f"Block timestamp too far in future"
+                    logger.info("Allowing block 1 timestamp despite being before genesis (special case)")
+                elif block_data["timestamp"] <= parent_info["timestamp"]:
+                    # Special handling for rapid mining (cpuminer compatibility)
+                    # If the block timestamp equals or is less than parent timestamp, check if we're mining rapidly
+                    # Check if parent block was mined very recently (within last 10 seconds)
+                    time_since_parent = current_time - parent_info["timestamp"]
+                    logger.info(f"Block timestamp <= parent. Time since parent: {time_since_parent}s")
+                    
+                    if time_since_parent <= 10:  # Increased window to 10 seconds
+                        logger.warning(f"Allowing timestamp {block_data['timestamp']} <= parent {parent_info['timestamp']} for rapid mining (parent mined {time_since_parent}s ago)")
+                        # Skip the normal timestamp validation for rapid mining
+                    else:
+                        return False, f"Invalid block timestamp - must be greater than parent (block: {block_data['timestamp']}, parent: {parent_info['timestamp']})"
+                else:
+                    # Normal timestamp validation
+                    if not validate_block_timestamp(
+                        block_data["timestamp"],
+                        parent_info["timestamp"],
+                        current_time
+                    ):
+                        return False, "Invalid block timestamp"
         
         # Check if we have the parent block
         if prev_hash not in self.block_index and prev_hash != "00" * 32:
@@ -680,23 +719,14 @@ class ChainManager:
         if tx is None:
             return
             
-        # Handle transaction format variations
-        if "transaction" in tx:
-            tx = tx["transaction"]
         
         # Check if this is a coinbase transaction
         is_coinbase = self.validator._is_coinbase_transaction(tx)
         
-        # Get or generate transaction ID
+        # Get transaction ID
         txid = tx.get("txid")
-        if not txid and is_coinbase:
-            # Generate a proper txid for coinbase by hashing the transaction
-            tx_str = json.dumps(tx, sort_keys=True)
-            txid = sha256d(tx_str.encode()).hex()
-            tx["txid"] = txid  # Add txid to the transaction
-            logger.info(f"Generated txid for coinbase at height {height}: {txid}")
-        elif not txid:
-            logger.warning(f"Transaction without txid at height {height}")
+        if not txid:
+            logger.error(f"Transaction without txid at height {height}")
             return
         
         logger.debug(f"Applying transaction {txid}")
@@ -797,10 +827,9 @@ class ChainManager:
         # This prevents invalid transactions from being accepted during chain reorganization
         
         # Get transaction body for signature verification
-        if "transaction" in tx:
-            body = tx["transaction"].get("body", {})
-        else:
-            logger.error(f"Transaction {txid} missing transaction body")
+        body = tx.get("body")
+        if not body:
+            logger.error(f"Transaction {txid} missing body")
             return False
         
         msg_str = body.get("msg_str", "")
@@ -853,23 +882,14 @@ class ChainManager:
         if tx is None:
             return
             
-        # Handle transaction format variations
-        if "transaction" in tx:
-            tx = tx["transaction"]
         
         # Check if this is a coinbase transaction
         is_coinbase = self.validator._is_coinbase_transaction(tx)
         
-        # Get or generate transaction ID
+        # Get transaction ID
         txid = tx.get("txid")
-        if not txid and is_coinbase:
-            # Generate a proper txid for coinbase by hashing the transaction
-            tx_str = json.dumps(tx, sort_keys=True)
-            txid = sha256d(tx_str.encode()).hex()
-            tx["txid"] = txid  # Add txid to the transaction
-            logger.info(f"Generated txid for coinbase at height {height}: {txid}")
-        elif not txid:
-            logger.warning(f"Transaction without txid at height {height}")
+        if not txid:
+            logger.error(f"Transaction without txid at height {height}")
             return
         
         logger.debug(f"Safely applying transaction {txid}")

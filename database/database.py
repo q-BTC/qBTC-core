@@ -12,7 +12,7 @@ GENESIS_PREVHASH = "00" * 32
 def get_current_height(db) -> Tuple[int, str]:
     """
     Return (height, block_hash) of the chain tip.
-    Falls back to (0, GENESIS_PREVHASH) if the DB has no blocks yet.
+    Returns (-1, GENESIS_PREVHASH) if the DB has no blocks yet.
     """
     # Try to use ChainManager if available
     try:
@@ -36,7 +36,7 @@ def get_current_height(db) -> Tuple[int, str]:
         return tip_block["height"], tip_block["block_hash"]
 
     except ValueError:                          # raised if the generator is empty
-        return 0, GENESIS_PREVHASH
+        return -1, GENESIS_PREVHASH  # Return -1 for empty database
 
 def set_db(db_path):
     global db

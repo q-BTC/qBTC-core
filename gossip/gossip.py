@@ -521,6 +521,25 @@ class GossipNode:
     def add_peer(self, ip: str, port: int, peer_info=None):
         peer = (ip, port)
         
+        # Don't add ourselves as a peer
+        if port == self.gossip_port:
+            # Check if it's potentially our own IP
+            import socket
+            try:
+                # Get our hostname and potential IPs
+                hostname = socket.gethostname()
+                local_ips = {'localhost', '127.0.0.1', '0.0.0.0', hostname}
+                
+                # Also check our external IP if available
+                if hasattr(self, '_external_ip'):
+                    local_ips.add(self._external_ip)
+                
+                if ip in local_ips:
+                    logger.warning(f"Refusing to add self as peer: {ip}:{port}")
+                    return
+            except Exception as e:
+                logger.debug(f"Error checking self-connection: {e}")
+        
         # Reset failure count if peer is being re-added
         if peer in self.failed_peers:
             logger.info(f"Resetting failure count for peer {peer} (was {self.failed_peers[peer]})")

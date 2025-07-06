@@ -2,6 +2,7 @@
 Difficulty Adjustment Algorithm for qBTC
 Implements a Bitcoin-style difficulty adjustment with improvements
 """
+import json
 import logging
 from typing import Optional, Tuple
 from config.config import DIFFICULTY_ADJUSTMENT_INTERVAL, BLOCK_TIME_TARGET
