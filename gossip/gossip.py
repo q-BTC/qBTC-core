@@ -50,9 +50,7 @@ class GossipNode:
         self.is_full_node = is_full_node
         self.gossip_port = None  # Will be set when server starts
         self.synced_peers = set()
-        #if not is_bootstrap:
-            # Temporary workaround until DHT is fully debugged
-        #    self.dht_peers.add(('api.bitcoinqs.org', 7002))
+        self.bootstrap_peer = None
 
     async def start_server(self, host="0.0.0.0", port=DEFAULT_GOSSIP_PORT):
         self.gossip_port = port  # Store for NAT traversal
@@ -521,7 +519,13 @@ class GossipNode:
     def add_peer(self, ip: str, port: int, peer_info=None):
         peer = (ip, port)
         
-        # Don't add ourselves as a peer
+        # Don't add ourselves as a peer - check using dynamic validator ID
+        if peer_info and 'validator_id' in peer_info:
+            if peer_info['validator_id'] == self.node_id:
+                logger.warning(f"Refusing to add self as peer (same validator ID): {ip}:{port}")
+                return
+        
+        # Also check port and common local IPs
         if port == self.gossip_port:
             # Check if it's potentially our own IP
             import socket
@@ -533,6 +537,12 @@ class GossipNode:
                 # Also check our external IP if available
                 if hasattr(self, '_external_ip'):
                     local_ips.add(self._external_ip)
+                
+                # Check if external IP from NAT traversal matches
+                if hasattr(self, '_nat_external_ip'):
+                    if ip == self._nat_external_ip:
+                        logger.warning(f"Refusing to add self as peer (NAT external IP match): {ip}:{port}")
+                        return
                 
                 if ip in local_ips:
                     logger.warning(f"Refusing to add self as peer: {ip}:{port}")
