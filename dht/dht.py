@@ -97,12 +97,22 @@ async def run_kad_server(port, bootstrap_addr=None, wallet=None, gossip_node=Non
         # All nodes should discover peers
         await discover_peers_once(gossip_node)
         
-        # For non-bootstrap nodes, if we didn't find any peers, add bootstrap as fallback
-        if not is_bootstrap and len(gossip_node.dht_peers) == 0:
-            logger.warning("No peers discovered via DHT, adding bootstrap as fallback peer")
-            # Add bootstrap node as a peer directly
+        # For non-bootstrap nodes, always add bootstrap server as a peer to ensure we can sync
+        if not is_bootstrap:
+            logger.info("Adding bootstrap server as a gossip peer for synchronization")
+            # Resolve bootstrap hostname if needed
+            import socket
+            bootstrap_host = bootstrap_addr[0][0] if bootstrap_addr else "api.bitcoinqs.org"
+            try:
+                # Resolve hostname to IP
+                bootstrap_ip = socket.gethostbyname(bootstrap_host)
+                logger.info(f"Resolved bootstrap server {bootstrap_host} to {bootstrap_ip}")
+            except:
+                bootstrap_ip = bootstrap_host
+                logger.warning(f"Could not resolve {bootstrap_host}, using as-is")
+            
             bootstrap_info = {
-                "ip": bootstrap_addr[0][0] if bootstrap_addr else "api.bitcoinqs.org",
+                "ip": bootstrap_ip,
                 "port": 8002,  # Bootstrap gossip port
                 "validator_id": "bootstrap",
                 "nat_type": "direct"
@@ -479,10 +489,9 @@ async def push_blocks(peer_ip, peer_port):
                     tx_key = f"tx:{tx_id}".encode()
                     if tx_key in db:
                         tx_obj = json.loads(db[tx_key].decode())
-                        full_transactions.append({
-                            "tx_id": tx_id,
-                            "transaction": tx_obj
-                        })
+                        # Ensure the transaction has txid field
+                        tx_obj["txid"] = tx_id
+                        full_transactions.append(tx_obj)
 
                 cbase_key = f"tx:coinbase_{h}".encode()
                 if cbase_key in db:
