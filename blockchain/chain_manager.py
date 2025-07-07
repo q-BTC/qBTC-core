@@ -13,6 +13,7 @@ from blockchain.blockchain import Block, validate_pow, bits_to_target, sha256d
 from blockchain.difficulty import get_next_bits, validate_block_bits, validate_block_timestamp, MAX_FUTURE_TIME
 from blockchain.transaction_validator import TransactionValidator
 from rocksdict import WriteBatch
+from state.state import mempool_manager
 
 logger = logging.getLogger(__name__)
 
@@ -585,9 +586,28 @@ class ChainManager:
         block_key = f"block:{block_hash}".encode()
         block_data = json.loads(self.db.get(block_key).decode())
         
+        # Get full transactions to re-add to mempool
+        full_transactions = self._get_block_transactions(block_data)
+        
         # Revert all transactions in this block
         for txid in block_data.get("tx_ids", []):
             self._revert_transaction(txid, batch, utxo_backups)
+        
+        # Re-add non-coinbase transactions back to mempool
+        # (they might be valid again after reorg)
+        readded_count = 0
+        for tx in full_transactions:
+            if tx and "txid" in tx and not self.validator._is_coinbase_transaction(tx):
+                try:
+                    # Try to add back to mempool - it might fail if invalid
+                    success, _ = mempool_manager.add_transaction(tx)
+                    if success:
+                        readded_count += 1
+                except Exception as e:
+                    logger.debug(f"Could not re-add transaction {tx.get('txid')} to mempool: {e}")
+        
+        if readded_count > 0:
+            logger.info(f"Re-added {readded_count} transactions to mempool after disconnecting block {block_hash}")
         
         # Mark block as disconnected (don't delete - might reconnect later)
         block_data["connected"] = False
@@ -616,6 +636,18 @@ class ChainManager:
         # Process all transactions in the block
         for tx in full_transactions:
             self._apply_transaction(tx, block_data["height"], batch)
+        
+        # Remove mined transactions from mempool
+        # Skip coinbase (first transaction) as it's not in mempool
+        removed_count = 0
+        for tx in full_transactions:
+            if tx and "txid" in tx and not self.validator._is_coinbase_transaction(tx):
+                if mempool_manager.get_transaction(tx["txid"]) is not None:
+                    mempool_manager.remove_transaction(tx["txid"])
+                    removed_count += 1
+        
+        if removed_count > 0:
+            logger.info(f"Removed {removed_count} mined transactions from mempool after connecting block {block_data['block_hash']}")
         
         # Mark block as connected
         block_data["connected"] = True
@@ -698,6 +730,17 @@ class ChainManager:
                 if "txid" in inp and inp["txid"] != "00" * 32:
                     utxo_key = f"{inp['txid']}:{inp.get('utxo_index', 0)}"
                     block_spent_utxos.add(utxo_key)
+        
+        # Remove mined transactions from mempool during reorganization
+        removed_count = 0
+        for tx in full_transactions:
+            if tx and "txid" in tx and not self.validator._is_coinbase_transaction(tx):
+                if mempool_manager.get_transaction(tx["txid"]) is not None:
+                    mempool_manager.remove_transaction(tx["txid"])
+                    removed_count += 1
+        
+        if removed_count > 0:
+            logger.info(f"Removed {removed_count} mined transactions from mempool during reorg for block {block_data['block_hash']}")
         
         # Mark block as connected
         block_data["connected"] = True
