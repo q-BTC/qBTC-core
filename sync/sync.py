@@ -124,6 +124,7 @@ def _process_blocks_from_peer_impl(blocks: list[dict]):
                         _process_block_in_chain(block)
                     else:
                         logging.info("Block %s accepted but not in main chain yet", block_hash)
+                    continue
                 else:
                     rejected_count += 1
                     logging.warning("Block %s rejected: %s", block_hash, error)

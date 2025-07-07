@@ -46,6 +46,7 @@ class GossipNode:
         self.server_task = None
         self.server = None
         self.partition_task = None
+        self.sync_task = None
         self.is_bootstrap = is_bootstrap
         self.is_full_node = is_full_node
         self.gossip_port = None  # Will be set when server starts
@@ -60,6 +61,8 @@ class GossipNode:
         self.server_task = asyncio.create_task(self.server.serve_forever())
         # Enable partition check to recover failed peers
         self.partition_task = asyncio.create_task(self.check_partition())
+        # Start periodic sync task
+        self.sync_task = asyncio.create_task(self.periodic_sync())
         logger.info(f"Gossip server started on {host}:{port}")
 
     async def handle_client(self, reader: StreamReader, writer: StreamWriter):
@@ -539,6 +542,87 @@ class GossipNode:
                             del self.failed_peers[peer]
                             logger.info(f"Permanently removed peer {peer} after extended downtime")
             
+            await asyncio.sleep(30)
+
+    async def periodic_sync(self):
+        """Periodically check and sync with all connected peers"""
+        await asyncio.sleep(10)  # Initial delay to let connections establish
+        
+        while True:
+            try:
+                all_peers = self.dht_peers | self.client_peers
+                if not all_peers:
+                    logger.debug("No peers available for periodic sync")
+                    await asyncio.sleep(60)
+                    continue
+                
+                # Get our current height
+                db = get_db()
+                local_height, local_tip = get_current_height(db)
+                logger.info(f"[PERIODIC_SYNC] Starting sync check - local height: {local_height}")
+                
+                # Check height of each peer
+                for peer in list(all_peers):
+                    try:
+                        reader, writer = await asyncio.wait_for(
+                            asyncio.open_connection(peer[0], peer[1]),
+                            timeout=5
+                        )
+                        
+                        # Request peer's height
+                        height_request = {"type": "get_height", "timestamp": int(time.time() * 1000)}
+                        writer.write((json.dumps(height_request) + "\n").encode('utf-8'))
+                        await writer.drain()
+                        
+                        # Read response
+                        response = await asyncio.wait_for(reader.readline(), timeout=5)
+                        if response:
+                            msg = json.loads(response.decode('utf-8').strip())
+                            if msg.get("type") == "height_response":
+                                peer_height = msg.get("height", -1)
+                                logger.info(f"[PERIODIC_SYNC] Peer {peer} height: {peer_height}, local: {local_height}")
+                                
+                                # If peer is ahead, request blocks
+                                if peer_height > local_height:
+                                    logger.info(f"[PERIODIC_SYNC] Peer {peer} is ahead by {peer_height - local_height} blocks, requesting sync")
+                                    blocks_request = {
+                                        "type": "get_blocks",
+                                        "start_height": local_height + 1,
+                                        "end_height": min(local_height + 100, peer_height),  # Request max 100 blocks at a time
+                                        "timestamp": int(time.time() * 1000)
+                                    }
+                                    writer.write((json.dumps(blocks_request) + "\n").encode('utf-8'))
+                                    await writer.drain()
+                                    
+                                    # Read blocks response
+                                    blocks_response = await asyncio.wait_for(reader.readline(), timeout=30)
+                                    if blocks_response:
+                                        blocks_msg = json.loads(blocks_response.decode('utf-8').strip())
+                                        if blocks_msg.get("type") == "blocks_response":
+                                            blocks = blocks_msg.get("blocks", [])
+                                            if blocks:
+                                                logger.info(f"[PERIODIC_SYNC] Received {len(blocks)} blocks from {peer}")
+                                                process_blocks_from_peer(blocks)
+                                
+                                # If we're ahead, push blocks to peer
+                                elif peer_height < local_height:
+                                    logger.info(f"[PERIODIC_SYNC] We're ahead of {peer} by {local_height - peer_height} blocks")
+                                    # Close this connection and use push_blocks
+                                    writer.close()
+                                    await writer.wait_closed()
+                                    await push_blocks(peer[0], peer[1])
+                                    continue
+                        
+                        writer.close()
+                        await writer.wait_closed()
+                        
+                    except Exception as e:
+                        logger.debug(f"[PERIODIC_SYNC] Error syncing with peer {peer}: {e}")
+                
+            except Exception as e:
+                logger.error(f"[PERIODIC_SYNC] Error in periodic sync: {e}", exc_info=True)
+            
+            # Check every 30 seconds
             await asyncio.sleep(30)
 
     def add_peer(self, ip: str, port: int, peer_info=None):
