@@ -256,6 +256,22 @@ class GossipNode:
                 # Log first block structure for debugging
                 if blocks and len(blocks) > 0:
                     logger.info(f"First block keys: {list(blocks[0].keys())}")
+                
+                # Fix missing txid in transactions before processing
+                for block in blocks:
+                    if "full_transactions" in block and block["full_transactions"]:
+                        tx_ids = block.get("tx_ids", [])
+                        for i, tx in enumerate(block["full_transactions"]):
+                            if tx and "txid" not in tx:
+                                # Try to get txid from tx_ids array
+                                if i < len(tx_ids):
+                                    tx["txid"] = tx_ids[i]
+                                # Special case for coinbase
+                                elif tx.get("inputs") and len(tx["inputs"]) > 0 and tx["inputs"][0].get("txid") == "00" * 32:
+                                    tx["txid"] = f"coinbase_{block.get('height', 0)}"
+                                else:
+                                    logger.warning(f"Could not determine txid for transaction {i} in block {block.get('height', 'unknown')}")
+                
                 process_blocks_from_peer(blocks)
             else:
                 logger.warning("Received empty blocks_response")
@@ -297,13 +313,20 @@ class GossipNode:
                                     tx_key = f"tx:{txid}".encode()
                                     if tx_key in db:
                                         tx_data = json.loads(db[tx_key].decode())
+                                        # Ensure txid is in the transaction data
+                                        if "txid" not in tx_data:
+                                            tx_data["txid"] = txid
                                         expanded_txs.append(tx_data)
                                     else:
                                         logger.warning(f"Transaction {txid} not found in DB for block at height {h}")
 
                                 cb_key = f"tx:coinbase_{h}".encode()
                                 if cb_key in db:
-                                    expanded_txs.append(json.loads(db[cb_key].decode()))
+                                    cb_data = json.loads(db[cb_key].decode())
+                                    # Ensure coinbase has txid
+                                    if "txid" not in cb_data:
+                                        cb_data["txid"] = f"coinbase_{h}"
+                                    expanded_txs.append(cb_data)
 
                                 block["full_transactions"] = expanded_txs
                             else:

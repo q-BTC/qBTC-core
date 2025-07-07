@@ -259,10 +259,37 @@ class ChainManager:
                 for i, tx in enumerate(block_data['full_transactions']):
                     logger.info(f"Block 1 transaction {i}: has_txid={('txid' in tx) if tx else False}, keys={(list(tx.keys()) if tx else 'None')}")
             
+            # During sync mode, skip time validation for historical blocks
+            if self.is_syncing:
+                self.validator.skip_time_validation = True
+            
             # Validate all non-coinbase transactions
             is_valid, error_msg, total_fees = self.validator.validate_block_transactions(block_data)
+            
+            # Reset skip_time_validation after validation
+            if self.is_syncing:
+                self.validator.skip_time_validation = False
             if not is_valid:
                 logger.error(f"Block {block_hash} rejected: {error_msg}")
+                
+                # Import mempool manager to clean up invalid transactions
+                from state.state import mempool_manager
+                
+                # Check if any transactions in this rejected block are in our mempool
+                # If they are, they're likely invalid and should be removed
+                if "tx_ids" in block_data and len(block_data.get("tx_ids", [])) > 1:
+                    tx_ids_to_check = block_data["tx_ids"][1:]  # Skip coinbase
+                    removed_txids = []
+                    
+                    for txid in tx_ids_to_check:
+                        if mempool_manager.get_transaction(txid) is not None:
+                            mempool_manager.remove_transaction(txid)
+                            removed_txids.append(txid)
+                            logger.info(f"[ChainManager] Removed invalid transaction {txid} from mempool")
+                    
+                    if removed_txids:
+                        logger.info(f"[ChainManager] Removed {len(removed_txids)} invalid transactions from mempool after block validation failure")
+                
                 return False, error_msg
             
             # Find and validate coinbase transaction

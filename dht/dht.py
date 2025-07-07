@@ -328,8 +328,13 @@ async def discover_peers_once(gossip_node):
     try:
         validators_json = await kad_server.get(VALIDATORS_LIST_KEY)
         if validators_json:
-            validator_ids = json.loads(validators_json)
-            discovered_validators.update(validator_ids)
+            try:
+                validator_ids = json.loads(validators_json)
+                discovered_validators.update(validator_ids)
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to parse validator list JSON: {e}")
+            except Exception as e:
+                logger.warning(f"Failed to process validator list: {e}")
     except Exception as e:
         logger.warning(f"Failed to get validator list: {e}")
     
@@ -576,6 +581,22 @@ async def push_blocks(peer_ip, peer_port):
 
             blocks = sorted(response.get("blocks", []), key=lambda x: x["height"])
             logger.info(f"Received {len(blocks)} blocks from from peer")
+            
+            # Fix missing txid in transactions before processing
+            for block in blocks:
+                if "full_transactions" in block and block["full_transactions"]:
+                    tx_ids = block.get("tx_ids", [])
+                    for i, tx in enumerate(block["full_transactions"]):
+                        if tx and "txid" not in tx:
+                            # Try to get txid from tx_ids array
+                            if i < len(tx_ids):
+                                tx["txid"] = tx_ids[i]
+                            # Special case for coinbase
+                            elif tx.get("inputs") and len(tx["inputs"]) > 0 and tx["inputs"][0].get("txid") == "00" * 32:
+                                tx["txid"] = f"coinbase_{block.get('height', 0)}"
+                            else:
+                                logger.warning(f"Could not determine txid for transaction {i} in block {block.get('height', 'unknown')}")
+            
             process_blocks_from_peer(blocks)
 
         else:
@@ -604,7 +625,11 @@ async def discover_peers_periodically(gossip_node, local_ip=None):
                 continue
                 
             validators_json = await kad_server.get(VALIDATORS_LIST_KEY)
-            validator_ids = json.loads(validators_json) if validators_json else []
+            try:
+                validator_ids = json.loads(validators_json) if validators_json else []
+            except (json.JSONDecodeError, TypeError) as e:
+                logger.warning(f"Failed to parse validators JSON in discover_peers_periodically: {e}")
+                validator_ids = []
             print("*** in discover peers periodically")
             logger.info(f"Discovered {len(validator_ids)} validators in DHT")
             

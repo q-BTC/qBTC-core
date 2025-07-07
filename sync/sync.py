@@ -14,6 +14,31 @@ import time
 from decimal import Decimal, ROUND_DOWN
 from typing import List, Dict, Tuple, Optional
 
+def _cleanup_mempool_after_sync(blocks: list[dict]):
+    """Clean up mempool after syncing blocks"""
+    try:
+        all_tx_ids = set()
+        for block in blocks:
+            tx_ids = block.get("tx_ids", [])
+            if len(tx_ids) > 1:  # Skip coinbase
+                all_tx_ids.update(tx_ids[1:])
+        
+        if not all_tx_ids:
+            return
+            
+        removed_count = 0
+        for txid in all_tx_ids:
+            if mempool_manager.get_transaction(txid) is not None:
+                mempool_manager.remove_transaction(txid)
+                removed_count += 1
+                logging.debug(f"[SYNC] Removed synced transaction {txid} from mempool")
+        
+        if removed_count > 0:
+            logging.info(f"[SYNC] Post-sync cleanup: removed {removed_count} mined transactions from mempool")
+            
+    except Exception as e:
+        logging.error(f"Error during mempool cleanup: {e}", exc_info=True)
+
 def process_blocks_from_peer(blocks: list[dict]):
     logging.info("***** IN GOSSIP MSG RECEIVE BLOCKS RESPONSE")
     
@@ -102,6 +127,22 @@ def _process_blocks_from_peer_impl(blocks: list[dict]):
                 else:
                     rejected_count += 1
                     logging.warning("Block %s rejected: %s", block_hash, error)
+                    
+                    # Even if block is rejected, we should still remove any transactions 
+                    # from mempool that are in this block (they might be invalid)
+                    if "tx_ids" in block and len(block.get("tx_ids", [])) > 1:
+                        # Skip coinbase (first transaction)
+                        tx_ids_to_check = block["tx_ids"][1:]
+                        removed_txids = []
+                        for txid in tx_ids_to_check:
+                            if mempool_manager.get_transaction(txid) is not None:
+                                mempool_manager.remove_transaction(txid)
+                                removed_txids.append(txid)
+                                logging.info(f"[SYNC] Removed transaction {txid} from mempool (block rejected)")
+                        
+                        if removed_txids:
+                            logging.info(f"[SYNC] Removed {len(removed_txids)} transactions from mempool after rejected block {block_hash}")
+                    
                     continue
                     
             except Exception as e:
@@ -109,6 +150,11 @@ def _process_blocks_from_peer_impl(blocks: list[dict]):
                 rejected_count += 1
 
         logging.info("Block processing complete: %d accepted, %d rejected", accepted_count, rejected_count)
+        
+        # After initial sync, do a final mempool cleanup
+        # This ensures any transactions that were mined in blocks we just synced are removed
+        if accepted_count > 0:
+            _cleanup_mempool_after_sync(blocks)
         
         # Check if we need to request more blocks
         best_tip, best_height = cm.get_best_chain_tip()
