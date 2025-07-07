@@ -335,12 +335,21 @@ class GossipNode:
                             else:
                                 logger.info(f"Block at height {h} already has {len(block['full_transactions'])} full transactions")
                             
-                            found_block = block
+                            # Make a deep copy to avoid modifying the original
+                            import copy
+                            found_block = copy.deepcopy(block)
                             break
 
                 if found_block:
                     blocks.append(found_block)
 
+            # Validate blocks before sending
+            for block in blocks:
+                if isinstance(block.get("height"), str) and len(block.get("height")) == 64:
+                    logger.error(f"CRITICAL: About to send block with hash in height field: {block}")
+                    # Skip this malformed block
+                    blocks = [b for b in blocks if b != block]
+            
             # Check if response is too large and needs chunking
             response = {"type": "blocks_response", "blocks": blocks}
             response_json = json.dumps(response)
@@ -670,7 +679,13 @@ class GossipNode:
             
             # Remove the old peer entry if it's different port or validator ID
             if old_port != port or old_vid != new_vid:
-                logger.warning(f"IP {ip} already has peer {old_vid} on port {old_port}, replacing with {new_vid} on port {port}")
+                # Keep the peer with the most recent timestamp
+                # If the old peer has a more recent timestamp, don't replace it
+                if old_timestamp > current_time:
+                    logger.info(f"Keeping existing peer {old_vid} on port {old_port} for IP {ip} (timestamp {old_timestamp} > {current_time})")
+                    return  # Don't add the new peer
+                
+                logger.warning(f"IP {ip} already has peer {old_vid} on port {old_port}, replacing with {new_vid} on port {port} (timestamp {current_time} > {old_timestamp})")
                 
                 # Remove old peer from all tracking structures
                 if old_peer in self.dht_peers:

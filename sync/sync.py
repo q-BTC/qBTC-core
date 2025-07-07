@@ -39,19 +39,47 @@ def _cleanup_mempool_after_sync(blocks: list[dict]):
     except Exception as e:
         logging.error(f"Error during mempool cleanup: {e}", exc_info=True)
 
+# Track concurrent calls
+_processing_lock = asyncio.Lock()
+_processing_count = 0
+
 def process_blocks_from_peer(blocks: list[dict]):
-    logging.info("***** IN GOSSIP MSG RECEIVE BLOCKS RESPONSE")
+    global _processing_count
+    _processing_count += 1
+    call_id = _processing_count
+    
+    logging.info(f"***** IN GOSSIP MSG RECEIVE BLOCKS RESPONSE (call #{call_id})")
+    logging.info(f"Call #{call_id}: Processing {len(blocks)} blocks")
     
     # Wrap entire function to catch any error
     try:
-        return _process_blocks_from_peer_impl(blocks)
+        result = _process_blocks_from_peer_impl(blocks)
+        logging.info(f"Call #{call_id}: Completed successfully")
+        return result
     except Exception as e:
-        logging.error(f"CRITICAL ERROR in process_blocks_from_peer: {e}", exc_info=True)
+        logging.error(f"CRITICAL ERROR in process_blocks_from_peer call #{call_id}: {e}", exc_info=True)
         # Re-raise to maintain original behavior
         raise
 
 def _process_blocks_from_peer_impl(blocks: list[dict]):
     """Actual implementation of process_blocks_from_peer"""
+    
+    # Debug logging to understand block structure
+    logging.info(f"_process_blocks_from_peer_impl called with {len(blocks) if isinstance(blocks, list) else 'non-list'} blocks")
+    if blocks and isinstance(blocks, list):
+        for i, block in enumerate(blocks[:3]):  # Log first 3 blocks
+            if isinstance(block, dict):
+                height = block.get("height")
+                block_hash = block.get("block_hash")
+                logging.info(f"Block {i}: height={height} (type: {type(height)}), hash={block_hash}")
+                if isinstance(height, str) and len(height) == 64:
+                    logging.error(f"Block {i} has hash in height field!")
+                    # Log all block fields to understand the corruption
+                    for k, v in block.items():
+                        if isinstance(v, str) and len(v) < 100:
+                            logging.error(f"  {k}: {v}")
+                        else:
+                            logging.error(f"  {k}: {type(v)}")
     
     try:
         db = get_db()
@@ -76,21 +104,57 @@ def _process_blocks_from_peer_impl(blocks: list[dict]):
         def get_height(block):
             height = block.get("height", 0)
             # Ensure height is an integer
-            if isinstance(height, str):
-                # Check if this looks like a block hash (64 hex chars)
-                if len(height) == 64 and all(c in '0123456789abcdefABCDEF' for c in height):
-                    logging.error(f"Block hash '{height}' found in height field for block {block.get('block_hash', 'unknown')}")
-                    logging.error(f"Full block data: {block}")
-                    return 0
+            if isinstance(height, int):
+                return height
+            elif isinstance(height, str):
                 try:
                     return int(height)
                 except ValueError:
-                    logging.warning(f"Invalid height value '{height}' in block {block.get('block_hash', 'unknown')}")
-                    return 0
-            return int(height) if height is not None else 0
+                    logging.error(f"Invalid height value '{height}' in block {block.get('block_hash', 'unknown')}")
+                    return -1  # Use -1 to sort invalid blocks first
+            else:
+                return 0
         
-        blocks = sorted(raw_blocks, key=get_height)
-        logging.info("Received %d blocks", len(blocks))
+        # Filter out malformed blocks before processing
+        valid_blocks = []
+        for block in raw_blocks:
+            if not isinstance(block, dict):
+                logging.error(f"Skipping non-dict block: {type(block)}")
+                continue
+            
+            height = block.get("height")
+            block_hash = block.get("block_hash")
+            
+            # Check if height looks like a block hash
+            if isinstance(height, str) and len(height) == 64 and all(c in '0123456789abcdefABCDEF' for c in height):
+                logging.error(f"Skipping malformed block with hash in height field: height={height}, hash={block_hash}")
+                continue
+                
+            # Check if block_hash looks valid
+            if not isinstance(block_hash, str) or len(block_hash) != 64:
+                logging.error(f"Skipping block with invalid hash: {block_hash}")
+                continue
+                
+            valid_blocks.append(block)
+        
+        blocks = sorted(valid_blocks, key=get_height)
+        logging.info("Received %d blocks, %d valid after filtering", len(raw_blocks), len(blocks))
+        
+        # Check for duplicate blocks
+        seen_hashes = set()
+        seen_heights = set()
+        for i, block in enumerate(blocks):
+            block_hash = block.get("block_hash")
+            height = block.get("height")
+            if block_hash in seen_hashes:
+                logging.error(f"Duplicate block hash found at index {i}: {block_hash}")
+                logging.error(f"Block {i} data: height={height} (type: {type(height)})")
+            if height in seen_heights and height is not None:
+                logging.error(f"Duplicate height found at index {i}: {height}")
+                logging.error(f"Block {i} hash: {block_hash}")
+            seen_hashes.add(block_hash)
+            if height is not None:
+                seen_heights.add(height)
     except Exception as e:
         logging.error(f"Error in process_blocks_from_peer setup: {e}", exc_info=True)
         raise
@@ -105,15 +169,24 @@ def _process_blocks_from_peer_impl(blocks: list[dict]):
                 block_hash = block.get("block_hash")
                 prev_hash = block.get("previous_hash")
                 
+                # Validate height before processing
+                if isinstance(height, str) and len(height) == 64 and all(c in '0123456789abcdefABCDEF' for c in height):
+                    logging.error(f"Skipping block with hash in height field: height={height}, block_hash={block_hash}")
+                    logging.error(f"Block keys: {list(block.keys())}")
+                    rejected_count += 1
+                    continue
+                
                 # Log block structure for debugging
-                logging.info(f"Processing block at height {height} with hash {block_hash}")
+                logging.info(f"Processing block at height {height} (type: {type(height)}) with hash {block_hash}")
                 logging.info(f"Block has bits field: {'bits' in block}")
+                logging.debug(f"Full block structure: {json.dumps(block, indent=2)}")
                 
                 # Add full_transactions to block if not present
                 if "full_transactions" not in block:
                     block["full_transactions"] = block.get("full_transactions", [])
                 
                 # Let ChainManager handle consensus
+                logging.debug(f"Calling add_block with height={block.get('height')} (type: {type(block.get('height'))})")
                 success, error = cm.add_block(block)
                 
                 if success:
@@ -148,6 +221,10 @@ def _process_blocks_from_peer_impl(blocks: list[dict]):
                     
             except Exception as e:
                 logging.error("Error processing block %s: %s", block.get("block_hash", "unknown"), e)
+                logging.error("Block data at error: height=%s (type: %s), hash=%s", 
+                            block.get("height"), type(block.get("height")), block.get("block_hash"))
+                logging.error("Exception type: %s", type(e).__name__)
+                logging.error("Full traceback:", exc_info=True)
                 rejected_count += 1
 
         logging.info("Block processing complete: %d accepted, %d rejected", accepted_count, rejected_count)
@@ -169,6 +246,10 @@ def _process_blocks_from_peer_impl(blocks: list[dict]):
 
 def _process_block_in_chain(block: dict):
     """Process a block that is confirmed to be in the main chain"""
+    # Validate input type
+    if not isinstance(block, dict):
+        raise TypeError(f"Expected dict for block, got {type(block)}: {block}")
+    
     db = get_db()
     batch = WriteBatch()
     
@@ -183,6 +264,21 @@ def _process_block_in_chain(block: dict):
     block_merkle_root = block.get("merkle_root")
     version = block.get("version")
     bits = block.get("bits")
+    
+    # Validate height is a proper integer
+    if isinstance(height, str):
+        try:
+            height = int(height)
+        except ValueError:
+            # Check if this looks like a block hash (64 hex chars)
+            if len(height) == 64 and all(c in '0123456789abcdefABCDEF' for c in height):
+                raise ValueError(f"Block hash '{height}' found in height field for block {block_hash}")
+            else:
+                raise ValueError(f"Invalid height value '{height}' in block {block_hash}")
+    elif height is None:
+        raise ValueError(f"Missing height in block {block_hash}")
+    elif not isinstance(height, int):
+        raise ValueError(f"Height must be an integer, got {type(height)} for block {block_hash}")
     
     logging.info("[SYNC] Processing confirmed block height %s with hash %s", height, block_hash)
     logging.info("[SYNC] Block has %d full transactions", len(full_transactions))
@@ -320,7 +416,20 @@ def _process_block_in_chain(block: dict):
     # Skip the first tx_id as it's the coinbase transaction
     
     # Remove confirmed transactions using mempool manager
-    confirmed_txids = tx_ids[1:]  # Skip coinbase (first transaction)
+    logging.info(f"[SYNC] Block has tx_ids: {tx_ids}")
+    
+    # If tx_ids is empty but we have full_transactions, extract tx_ids from them
+    if not tx_ids and full_transactions:
+        tx_ids = []
+        for tx in full_transactions:
+            if tx and "txid" in tx:
+                tx_ids.append(tx["txid"])
+            elif tx and validator._is_coinbase_transaction(tx):
+                # Generate coinbase txid
+                tx_ids.append(f"coinbase_{height}")
+        logging.info(f"[SYNC] Extracted tx_ids from full_transactions: {tx_ids}")
+    
+    confirmed_txids = tx_ids[1:] if len(tx_ids) > 1 else []  # Skip coinbase (first transaction)
     
     # Track which transactions were actually in our mempool before removal
     confirmed_from_mempool = []

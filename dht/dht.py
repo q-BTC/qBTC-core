@@ -480,7 +480,9 @@ async def push_blocks(peer_ip, peer_port):
                     if key.startswith(b"block:"):
                         block = json.loads(db[key].decode())
                         if block.get("height") == h:
-                            found_block = block
+                            # Make a deep copy to avoid modifying the original
+                            import copy
+                            found_block = copy.deepcopy(block)
                             break
 
                 if not found_block:
@@ -506,10 +508,18 @@ async def push_blocks(peer_ip, peer_port):
 
                 blocks_to_send.append(found_block)
 
+            # Validate blocks before sending
+            validated_blocks = []
+            for block in blocks_to_send:
+                if isinstance(block.get("height"), str) and len(block.get("height")) == 64:
+                    logger.error(f"CRITICAL: About to send block with hash in height field: {block}")
+                    continue  # Skip this malformed block
+                validated_blocks.append(block)
+            
             # Now send the blocks
             blocks_message = {
                 "type": "blocks_response",
-                "blocks": blocks_to_send,
+                "blocks": validated_blocks,
                 "timestamp": int(time.time() * 1000)
             }
             message_json = json.dumps(blocks_message)
