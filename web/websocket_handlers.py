@@ -238,7 +238,16 @@ class WebSocketEventHandlers:
             from state.state import mempool_manager
             
             logger.info(f"Broadcasting wallet update for: {wallet_address}")
-            logger.info(f"Current mempool before update: {list(mempool_manager.get_all_transactions().keys())}")
+            
+            # Safely log mempool state
+            if mempool_manager is not None:
+                mempool_txs = mempool_manager.get_all_transactions()
+                if mempool_txs is not None:
+                    logger.info(f"Current mempool before update: {list(mempool_txs.keys())}")
+                else:
+                    logger.warning("Mempool manager returned None for get_all_transactions()")
+            else:
+                logger.warning("Mempool manager is None")
             
             balance = get_balance(wallet_address)
             transactions = get_transactions(wallet_address)
