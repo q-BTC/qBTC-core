@@ -254,6 +254,11 @@ class ChainManager:
         if "full_transactions" in block_data and block_data["full_transactions"]:
             logger.info(f"Validating {len(block_data['full_transactions'])} transactions in block {block_hash}")
             
+            # Debug: Log transactions in the block
+            if height == 1:
+                for i, tx in enumerate(block_data['full_transactions']):
+                    logger.info(f"Block 1 transaction {i}: has_txid={('txid' in tx) if tx else False}, keys={(list(tx.keys()) if tx else 'None')}")
+            
             # Validate all non-coinbase transactions
             is_valid, error_msg, total_fees = self.validator.validate_block_transactions(block_data)
             if not is_valid:

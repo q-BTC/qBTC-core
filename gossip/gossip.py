@@ -51,6 +51,8 @@ class GossipNode:
         self.gossip_port = None  # Will be set when server starts
         self.synced_peers = set()
         self.bootstrap_peer = None
+        self.ip_to_peer = {}  # Track IP -> (port, validator_id, timestamp) mapping
+        self.peer_timestamps = {}  # Track (ip, port) -> timestamp
 
     async def start_server(self, host="0.0.0.0", port=DEFAULT_GOSSIP_PORT):
         self.gossip_port = port  # Store for NAT traversal
@@ -518,6 +520,7 @@ class GossipNode:
 
     def add_peer(self, ip: str, port: int, peer_info=None):
         peer = (ip, port)
+        current_time = time.time()
         
         # Don't add ourselves as a peer - check using dynamic validator ID
         if peer_info and 'validator_id' in peer_info:
@@ -550,6 +553,38 @@ class GossipNode:
             except Exception as e:
                 logger.debug(f"Error checking self-connection: {e}")
         
+        # Check if this IP already has a peer entry
+        if ip in self.ip_to_peer:
+            old_port, old_vid, old_timestamp = self.ip_to_peer[ip]
+            old_peer = (ip, old_port)
+            
+            # Extract validator_id from peer_info if available
+            new_vid = peer_info.get('validator_id', 'unknown') if peer_info else 'unknown'
+            
+            # Remove the old peer entry if it's different port or validator ID
+            if old_port != port or old_vid != new_vid:
+                logger.warning(f"IP {ip} already has peer {old_vid} on port {old_port}, replacing with {new_vid} on port {port}")
+                
+                # Remove old peer from all tracking structures
+                if old_peer in self.dht_peers:
+                    self.dht_peers.remove(old_peer)
+                if old_peer in self.synced_peers:
+                    self.synced_peers.remove(old_peer)
+                if old_peer in self.peer_info:
+                    del self.peer_info[old_peer]
+                if old_peer in self.failed_peers:
+                    del self.failed_peers[old_peer]
+                if old_peer in self.peer_timestamps:
+                    del self.peer_timestamps[old_peer]
+            else:
+                # Same peer, just update timestamp
+                logger.info(f"Updating timestamp for existing peer {ip}:{port}")
+        
+        # Update IP mapping with validator ID and timestamp
+        vid = peer_info.get('validator_id', 'unknown') if peer_info else 'unknown'
+        self.ip_to_peer[ip] = (port, vid, current_time)
+        self.peer_timestamps[peer] = current_time
+        
         # Reset failure count if peer is being re-added
         if peer in self.failed_peers:
             logger.info(f"Resetting failure count for peer {peer} (was {self.failed_peers[peer]})")
@@ -561,7 +596,7 @@ class GossipNode:
         
         if peer not in self.dht_peers:
             self.dht_peers.add(peer)
-            logger.info(f"Added DHT peer {peer} to validator list")
+            logger.info(f"Added DHT peer {peer} to validator list (validator_id: {vid})")
             if peer not in self.synced_peers:
                 self.synced_peers.add(peer)
                 asyncio.create_task(push_blocks(ip, port))
@@ -575,6 +610,15 @@ class GossipNode:
 
     def remove_peer(self, ip: str, port: int):
         peer = (ip, port)
+        
+        # Clean up IP mapping
+        if ip in self.ip_to_peer and self.ip_to_peer[ip][0] == port:
+            del self.ip_to_peer[ip]
+        
+        # Clean up timestamp
+        if peer in self.peer_timestamps:
+            del self.peer_timestamps[peer]
+        
         if peer in self.dht_peers:
             self.dht_peers.remove(peer)
             self.failed_peers.pop(peer, None)

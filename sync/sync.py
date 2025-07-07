@@ -197,15 +197,12 @@ def _process_block_in_chain(block: dict):
         if validator._is_coinbase_transaction(tx):
             continue
 
-        # Handle block 1 initial distribution transaction without txid
-        if height == 1 and "txid" not in tx and tx.get("body", {}).get("transaction_data") == "initial_distribution":
-            # This is the special initial distribution transaction
-            txid = "initial_distribution_tx"
-            tx["txid"] = txid  # Add synthetic txid for processing
-        elif "txid" in tx:
-            txid = tx["txid"]
-        else:
-            continue  # Skip transactions without txid (except initial distribution)
+        # All transactions MUST have a txid
+        if "txid" not in tx:
+            logging.warning(f"[SYNC] Skipping transaction without txid in block {height}")
+            continue
+        
+        txid = tx["txid"]
         
         inputs = tx.get("inputs", [])
         outputs = tx.get("outputs", [])
