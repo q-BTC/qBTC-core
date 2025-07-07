@@ -235,10 +235,10 @@ class WebSocketEventHandlers:
         """Broadcast update for specific wallet"""
         try:
             from web.web import get_balance, get_transactions
-            from state.state import pending_transactions
+            from state.state import mempool_manager
             
             logger.info(f"Broadcasting wallet update for: {wallet_address}")
-            logger.info(f"Current mempool before update: {list(pending_transactions.keys())}")
+            logger.info(f"Current mempool before update: {list(mempool_manager.get_all_transactions().keys())}")
             
             balance = get_balance(wallet_address)
             transactions = get_transactions(wallet_address)
