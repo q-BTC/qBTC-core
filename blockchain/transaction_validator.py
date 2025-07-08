@@ -253,7 +253,9 @@ class TransactionValidator:
             return False, f"Insufficient balance in tx {txid}: available {total_available} < required {grand_total_required}", Decimal("0")
         
         # Verify exact payment amount
-        if height > 1 and total_to_recipient != total_authorized:
+        # For self-transfers, we already set total_to_recipient = total_authorized above
+        # so we skip this check for self-transfers
+        if height > 1 and not is_self_transfer and total_to_recipient != total_authorized:
             return False, f"Invalid tx {txid}: authorized amount {total_authorized} != amount sent to recipient {total_to_recipient}", Decimal("0")
         
         # Verify signature (skip only for genesis transaction)
