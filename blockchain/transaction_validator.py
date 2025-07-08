@@ -200,6 +200,13 @@ class TransactionValidator:
         total_change = Decimal("0")
         total_output = Decimal("0")
         
+        # Handle self-transfers specially
+        is_self_transfer = (from_ == to_)
+        if is_self_transfer:
+            # For self-transfers, only count the authorized amount as the payment
+            # Everything else is considered change
+            total_to_recipient = total_authorized
+        
         for out in outputs:
             recv = out.get("receiver")
             if not recv:
@@ -210,16 +217,28 @@ class TransactionValidator:
             except:
                 return False, f"Invalid output amount in tx {txid}", Decimal("0")
             
-            if recv == to_:
-                total_to_recipient += amt
-            elif recv == from_:
-                total_change += amt
-            elif recv == ADMIN_ADDRESS and from_ != ADMIN_ADDRESS:
-                # This could be a fee to admin, but should be validated
-                pass
+            if is_self_transfer:
+                # For self-transfers, all outputs to the same address are valid
+                if recv == from_:  # which equals to_
+                    # All outputs to self are valid for self-transfers
+                    pass
+                elif recv == ADMIN_ADDRESS and from_ != ADMIN_ADDRESS:
+                    # Fee to admin is allowed
+                    pass
+                else:
+                    return False, f"Unauthorized output to {recv} in tx {txid}", Decimal("0")
             else:
-                # For now, only allow outputs to: recipient, sender (change), or admin (fee)
-                return False, f"Unauthorized output to {recv} in tx {txid}", Decimal("0")
+                # Normal transfer logic
+                if recv == to_:
+                    total_to_recipient += amt
+                elif recv == from_:
+                    total_change += amt
+                elif recv == ADMIN_ADDRESS and from_ != ADMIN_ADDRESS:
+                    # This could be a fee to admin, but should be validated
+                    pass
+                else:
+                    # For now, only allow outputs to: recipient, sender (change), or admin (fee)
+                    return False, f"Unauthorized output to {recv} in tx {txid}", Decimal("0")
             
             total_output += amt
         
