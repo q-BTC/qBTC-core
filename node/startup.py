@@ -28,13 +28,13 @@ async def startup(args=None):
             logger.info("Event bus started")
         
         # Initialize blockchain components
-        from blockchain.chain_manager import ChainManager
+        from blockchain.chain_singleton import get_chain_manager
         from blockchain.blockchain import Block, sha256d, calculate_merkle_root
         from config.config import GENESIS_ADDRESS, ADMIN_ADDRESS
         import time
         
         # Check current blockchain state
-        cm = ChainManager()
+        cm = get_chain_manager()
         best_hash, best_height = cm.get_best_chain_tip()
         
         # Check if database is truly empty (no blocks at all)

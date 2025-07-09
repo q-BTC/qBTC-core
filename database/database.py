@@ -16,8 +16,8 @@ def get_current_height(db) -> Tuple[int, str]:
     """
     # Try to use ChainManager if available
     try:
-        from blockchain.chain_manager import ChainManager
-        cm = ChainManager(db)  # Pass the db parameter to ChainManager
+        from blockchain.chain_singleton import get_chain_manager
+        cm = get_chain_manager()
         best_hash, best_height = cm.get_best_chain_tip()
         logging.info(f"ChainManager returned: hash={best_hash}, height={best_height}")
         if best_hash != "00" * 32:  # Not genesis
