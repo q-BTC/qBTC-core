@@ -37,6 +37,24 @@ async def startup(args=None):
         cm = get_chain_manager()
         best_hash, best_height = cm.get_best_chain_tip()
         
+        # Initialize height index
+        from blockchain.block_height_index import get_height_index
+        height_index = get_height_index()
+        
+        # Check if index needs to be rebuilt
+        if best_height > 0:
+            # Check if the index has the latest block
+            latest_indexed = height_index.get_highest_indexed_height()
+            if latest_indexed < best_height:
+                logger.info(f"Height index is behind (indexed: {latest_indexed}, chain: {best_height}). Rebuilding...")
+                logger.info("This may take a moment for large blockchains...")
+                start_time = time.time()
+                height_index.rebuild_index()
+                elapsed = time.time() - start_time
+                logger.info(f"Height index rebuild complete in {elapsed:.2f} seconds")
+            else:
+                logger.info(f"Height index is up to date (indexed: {latest_indexed}, chain: {best_height})")
+        
         # Check if database is truly empty (no blocks at all)
         has_any_blocks = False
         try:

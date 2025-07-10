@@ -7,6 +7,7 @@ from blockchain.transaction_validator import TransactionValidator
 from blockchain.event_integration import emit_database_event
 from state.state import mempool_manager
 from events.event_bus import event_bus, EventTypes
+from blockchain.block_height_index import get_height_index
 import asyncio
 import json
 import logging
@@ -411,6 +412,10 @@ def _process_block_in_chain(block: dict):
     
     db.write(batch)
     logging.info("[SYNC] Stored block %s (height %s) successfully", block_hash, height)
+    
+    # Update the height index
+    height_index = get_height_index()
+    height_index.add_block_to_index(height, block_hash)
     
     # Remove transactions from mempool
     # Skip the first tx_id as it's the coinbase transaction

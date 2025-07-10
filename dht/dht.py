@@ -8,6 +8,7 @@ from state.state import validator_keys, known_validators
 from database.database import get_db,get_current_height
 from sync.sync import process_blocks_from_peer
 from log_utils import get_logger
+from blockchain.block_height_index import get_height_index
 
 logger = get_logger(__name__)
 
@@ -469,25 +470,19 @@ async def push_blocks(peer_ip, peer_port):
             end_height = local_height
 
             blocks_to_send = []
+            height_index = get_height_index()
 
             for h in range(start_height, end_height+1):
-                found_block = None
-
-                print(f"Looking for block at height {h}")
-
-                # Search for the block at height h
-                for key in db.keys():
-                    if key.startswith(b"block:"):
-                        block = json.loads(db[key].decode())
-                        if block.get("height") == h:
-                            # Make a deep copy to avoid modifying the original
-                            import copy
-                            found_block = copy.deepcopy(block)
-                            break
-
+                # Use the efficient height index
+                found_block = height_index.get_block_by_height(h)
+                
                 if not found_block:
                     print(f"Block at height {h} not found!")
                     continue
+                
+                # Make a deep copy to avoid modifying the original
+                import copy
+                found_block = copy.deepcopy(found_block)
 
                 # Now fetch full transaction objects
                 full_transactions = []

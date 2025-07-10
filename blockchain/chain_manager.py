@@ -14,6 +14,7 @@ from blockchain.difficulty import get_next_bits, validate_block_bits, validate_b
 from blockchain.transaction_validator import TransactionValidator
 from rocksdict import WriteBatch
 from state.state import mempool_manager
+from blockchain.block_height_index import get_height_index
 
 logger = logging.getLogger(__name__)
 
@@ -612,6 +613,10 @@ class ChainManager:
         # Mark block as disconnected (don't delete - might reconnect later)
         block_data["connected"] = False
         batch.put(block_key, json.dumps(block_data).encode())
+        
+        # Remove from height index during disconnection
+        height_index = get_height_index()
+        height_index.remove_block_from_index(block_data["height"])
     
     def _connect_block(self, block_data: dict, batch: WriteBatch):
         """Connect a block to the active chain (apply its effects)"""
@@ -653,6 +658,10 @@ class ChainManager:
         block_data["connected"] = True
         block_key = f"block:{block_data['block_hash']}".encode()
         batch.put(block_key, json.dumps(block_data).encode())
+        
+        # Update the height index
+        height_index = get_height_index()
+        height_index.add_block_to_index(block_data["height"], block_data["block_hash"])
     
     def _connect_block_safe(self, block_data: dict, batch: WriteBatch, new_chain_spent_utxos: Set[str]):
         """
@@ -746,6 +755,10 @@ class ChainManager:
         block_data["connected"] = True
         block_key = f"block:{block_data['block_hash']}".encode()
         batch.put(block_key, json.dumps(block_data).encode())
+        
+        # Update the height index
+        height_index = get_height_index()
+        height_index.add_block_to_index(block_data["height"], block_data["block_hash"])
     
     def _revert_transaction(self, txid: str, batch: WriteBatch, utxo_backups: Dict[str, bytes] = None):
         """Revert a transaction's effects on the UTXO set"""

@@ -7,6 +7,7 @@ from config.config import DEFAULT_GOSSIP_PORT
 from state.state import mempool_manager
 from wallet.wallet import verify_transaction
 from database.database import get_db, get_current_height
+from blockchain.block_height_index import get_height_index
 from dht.dht import push_blocks
 from sync.sync import process_blocks_from_peer
 from network.peer_reputation import peer_reputation_manager
@@ -301,47 +302,42 @@ class GossipNode:
 
             blocks = []
 
+            height_index = get_height_index()
+            
             for h in range(start_height, end_height + 1):
-                found_block = None
-
-                for key in db.keys():
-                    if key.startswith(b"block:"):
-                        block = json.loads(db[key].decode())
-
-                        if block.get("height") == h:
-                            # Check if block already has full_transactions
-                            if "full_transactions" not in block or not block["full_transactions"]:
-                                expanded_txs = []
-                                for txid in block.get("tx_ids", []):
-                                    tx_key = f"tx:{txid}".encode()
-                                    if tx_key in db:
-                                        tx_data = json.loads(db[tx_key].decode())
-                                        # Ensure txid is in the transaction data
-                                        if "txid" not in tx_data:
-                                            tx_data["txid"] = txid
-                                        expanded_txs.append(tx_data)
-                                    else:
-                                        logger.warning(f"Transaction {txid} not found in DB for block at height {h}")
-
-                                cb_key = f"tx:coinbase_{h}".encode()
-                                if cb_key in db:
-                                    cb_data = json.loads(db[cb_key].decode())
-                                    # Ensure coinbase has txid
-                                    if "txid" not in cb_data:
-                                        cb_data["txid"] = f"coinbase_{h}"
-                                    expanded_txs.append(cb_data)
-
-                                block["full_transactions"] = expanded_txs
+                # Use the efficient height index
+                block = height_index.get_block_by_height(h)
+                
+                if block:
+                    # Check if block already has full_transactions
+                    if "full_transactions" not in block or not block["full_transactions"]:
+                        expanded_txs = []
+                        for txid in block.get("tx_ids", []):
+                            tx_key = f"tx:{txid}".encode()
+                            if tx_key in db:
+                                tx_data = json.loads(db[tx_key].decode())
+                                # Ensure txid is in the transaction data
+                                if "txid" not in tx_data:
+                                    tx_data["txid"] = txid
+                                expanded_txs.append(tx_data)
                             else:
-                                logger.info(f"Block at height {h} already has {len(block['full_transactions'])} full transactions")
-                            
-                            # Make a deep copy to avoid modifying the original
-                            import copy
-                            found_block = copy.deepcopy(block)
-                            break
+                                logger.warning(f"Transaction {txid} not found in DB for block at height {h}")
 
-                if found_block:
-                    blocks.append(found_block)
+                        cb_key = f"tx:coinbase_{h}".encode()
+                        if cb_key in db:
+                            cb_data = json.loads(db[cb_key].decode())
+                            # Ensure coinbase has txid
+                            if "txid" not in cb_data:
+                                cb_data["txid"] = f"coinbase_{h}"
+                            expanded_txs.append(cb_data)
+
+                        block["full_transactions"] = expanded_txs
+                    else:
+                        logger.info(f"Block at height {h} already has {len(block['full_transactions'])} full transactions")
+                    
+                    # Make a deep copy to avoid modifying the original
+                    import copy
+                    blocks.append(copy.deepcopy(block))
 
             # Validate blocks before sending
             for block in blocks:

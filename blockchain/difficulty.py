@@ -6,6 +6,7 @@ import json
 import logging
 from typing import Optional, Tuple
 from config.config import DIFFICULTY_ADJUSTMENT_INTERVAL, BLOCK_TIME_TARGET
+from blockchain.block_height_index import get_height_index
 
 logger = logging.getLogger(__name__)
 
@@ -145,29 +146,18 @@ def get_next_bits(db, current_height: int) -> int:
     # Only adjust at interval boundaries
     if next_height % DIFFICULTY_ADJUSTMENT_INTERVAL != 0:
         # Use the same difficulty as the last block
-        last_block_key = None
-        for key in db.keys():
-            if key.startswith(b"block:"):
-                block_data = json.loads(db[key].decode())
-                if block_data.get("height") == current_height:
-                    return block_data.get("bits", MAX_TARGET_BITS)
+        height_index = get_height_index()
+        last_block = height_index.get_block_by_height(current_height)
+        if last_block:
+            return last_block.get("bits", MAX_TARGET_BITS)
         return MAX_TARGET_BITS
     
     # Find the first and last block of the interval
     interval_start_height = current_height - DIFFICULTY_ADJUSTMENT_INTERVAL + 1
     
-    first_block = None
-    last_block = None
-    
-    for key in db.keys():
-        if key.startswith(b"block:"):
-            block_data = json.loads(db[key].decode())
-            height = block_data.get("height")
-            
-            if height == interval_start_height:
-                first_block = block_data
-            elif height == current_height:
-                last_block = block_data
+    height_index = get_height_index()
+    first_block = height_index.get_block_by_height(interval_start_height)
+    last_block = height_index.get_block_by_height(current_height)
     
     if not first_block or not last_block:
         logger.error(f"Could not find blocks for difficulty adjustment at height {current_height}")

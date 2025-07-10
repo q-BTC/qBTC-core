@@ -26,24 +26,45 @@ def get_current_height(db) -> Tuple[int, str]:
         # ChainManager not available or failed, fall back to old method
         logging.info(f"ChainManager failed, using legacy method: {e}")
     
-    # Legacy method - find highest block
+    # Legacy method - use height index for efficiency
     try:
-        # Count blocks first
-        block_count = sum(1 for k, _ in db.items() if k.startswith(b"block:"))
-        logging.info(f"Legacy method: Found {block_count} blocks in database")
+        from blockchain.block_height_index import get_height_index
+        height_index = get_height_index()
         
-        tip_block = max(
-            (json.loads(v.decode())             # each decoded block dict
-             for k, v in db.items()
-             if k.startswith(b"block:")),
-            key=lambda blk: blk["height"]       # pick the one with max height
-        )
-        logging.info(f"Legacy method: Best block height={tip_block['height']}")
-        return tip_block["height"], tip_block["block_hash"]
+        # Get the highest indexed height
+        highest_height = height_index.get_highest_indexed_height()
+        
+        if highest_height >= 0:
+            # Get the block hash at the highest height
+            block_hash = height_index.get_block_hash_by_height(highest_height)
+            if block_hash:
+                logging.info(f"Height index method: Best block height={highest_height}")
+                return highest_height, block_hash
+        
+        logging.info("Height index method: No blocks found, returning -1")
+        return -1, GENESIS_PREVHASH
+        
+    except Exception as e:
+        logging.warning(f"Height index failed: {e}, falling back to scan method")
+        
+        # Final fallback - scan all blocks (inefficient but works)
+        try:
+            # Count blocks first
+            block_count = sum(1 for k, _ in db.items() if k.startswith(b"block:"))
+            logging.info(f"Fallback scan method: Found {block_count} blocks in database")
+            
+            tip_block = max(
+                (json.loads(v.decode())             # each decoded block dict
+                 for k, v in db.items()
+                 if k.startswith(b"block:")),
+                key=lambda blk: blk["height"]       # pick the one with max height
+            )
+            logging.info(f"Fallback scan method: Best block height={tip_block['height']}")
+            return tip_block["height"], tip_block["block_hash"]
 
-    except ValueError:                          # raised if the generator is empty
-        logging.info("Legacy method: No blocks found, returning -1")
-        return -1, GENESIS_PREVHASH  # Return -1 for empty database
+        except ValueError:                          # raised if the generator is empty
+            logging.info("Fallback scan method: No blocks found, returning -1")
+            return -1, GENESIS_PREVHASH  # Return -1 for empty database
 
 def set_db(db_path):
     global db
