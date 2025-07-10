@@ -136,10 +136,16 @@ services:
       - GF_USERS_DEFAULT_PERMISSIONS=Viewer
       - GF_USERS_VIEWERS_CAN_EDIT=false
       - GF_EXPLORE_ENABLED=false
+      
+      # Performance and chunk loading fixes
+      - GF_DATAPROXY_TIMEOUT=300
+      - GF_DATAPROXY_KEEP_ALIVE_SECONDS=300
+      - GF_RENDERING_CONCURRENT_RENDER_REQUEST_LIMIT=10
     volumes:
       - grafana-data:/var/lib/grafana
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./monitoring/grafana/custom.ini:/etc/grafana/grafana.ini:ro
     networks:
       - qbtc-network
     restart: unless-stopped
