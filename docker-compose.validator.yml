@@ -161,7 +161,7 @@ services:
       - "80:80"        # HTTP redirect to HTTPS
       - "8080:8080"    # API/WebSocket with SSL
     volumes:
-      - ./monitoring/nginx/nginx-validator.conf:/etc/nginx/nginx.conf:ro
+      - ./monitoring/nginx/nginx-prod-split.conf:/etc/nginx/nginx.conf:ro
       - ./monitoring/nginx/ssl:/etc/nginx/ssl:ro
     networks:
       - qbtc-network
