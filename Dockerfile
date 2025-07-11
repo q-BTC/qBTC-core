@@ -64,6 +64,9 @@ COPY . .
 # ────────────────────────────────────────────────────────────────────────────────
 ENV WALLET_PASSWORD=your_wallet_password
 ENV ROCKSDB_PATH=/app/db
+ENV RPC_PORT=8332
+ENV GRAFANA=true
+ENV GRAFANA_PORT=443
 
 EXPOSE 8080/tcp 8332/tcp 8001/udp 8002/tcp
 

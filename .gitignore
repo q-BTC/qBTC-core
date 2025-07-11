@@ -198,6 +198,8 @@ data/
 node_output.log
 server_output*.log
 qbtc.log
+/validator-rocks-db/
+/liboqs/
 
 # Docker
 docker-compose.override.yml

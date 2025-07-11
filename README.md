@@ -10,9 +10,9 @@
 
 Built from the ground up in Python to demonstrate a proof-of-concept, qBTC introduces key innovations for the future of Bitcoin:
 
-- **Post-Quantum Security** using the ML-DSA signature scheme  
-- **Decentralized validator discovery** via a Kademlia DHT  
-- **Fast, scalable propagation** through an asynchronous gossip network  
+- **Post-Quantum Security** using the ML-DSA signature scheme
+- **Decentralized validator discovery** via a Kademlia DHT
+- **Fast, scalable propagation** through an asynchronous gossip network
 
 The cryptographic layer is modular, allowing ML-DSA to be replaced with other post-quantum algorithms as standards evolve.
 
@@ -109,6 +109,7 @@ usage: main.py [-h] [--bootstrap] [--bootstrap_server BOOTSTRAP_SERVER]
 ```
 
 Optional arguments:
+
 - `--bootstrap`: Run as bootstrap server
 - `--bootstrap_server`: Bootstrap server host (default: api.bitcoinqs.org)
 - `--bootstrap_port`: Bootstrap server port (default: 8001)
@@ -259,6 +260,7 @@ docker compose -f docker-compose.validator.yml logs -f validator
 ### Key Docker Features
 
 All configurations include:
+
 - **Automatic wallet generation** with secure passwords
 - **Redis** for caching and rate limiting
 - **Prometheus** metrics collection
@@ -270,6 +272,7 @@ All configurations include:
 - **Security hardening** (no-new-privileges, read-only filesystems where possible)
 
 Production configurations additionally include:
+
 - **SSL/TLS encryption** via nginx
 - **DDoS protection** and attack detection
 - **Rate limiting** on API endpoints
@@ -285,6 +288,7 @@ You can simulate multiple validators by launching separate containers or Python 
 ### Docker Multi-Node Network
 
 The test network (`docker-compose.test.yml`) creates:
+
 - 1 Bootstrap node (internal port 8080, accessed via nginx on 8080)
 - 2 Validator nodes (ports 8081, 8082)
 - Prometheus monitoring (port 9090)
@@ -298,21 +302,21 @@ All nodes automatically discover each other and maintain peer connections.
 
 ## 📜 Core Components
 
-| Component            | Description                                      |
-|---------------------|--------------------------------------------------|
-| `main.py`           | Entry point - starts web/RPC servers             |
-| `blockchain/`       | Block, transaction, UTXO, Merkle logic           |
-| `chain_manager.py`  | Manages blockchain state and fork resolution     |
-| `dht/`              | Kademlia-based peer discovery                    |
-| `gossip/`           | Gossip protocol for block/tx propagation         |
-| `web/`              | FastAPI web server with API endpoints            |
-| `rpc/`              | Bitcoin-compatible RPC for mining                |
-| `wallet/`           | Post-quantum key management (ML-DSA)             |
-| `database/`         | RocksDB storage layer                            |
-| `monitoring/`       | Health checks and Prometheus metrics             |
-| `events/`           | Event bus for internal communication             |
-| `security/`         | Rate limiting and DDoS protection                |
-| `mempool/`          | Transaction pool with conflict detection         |
+| Component          | Description                                  |
+| ------------------ | -------------------------------------------- |
+| `main.py`          | Entry point - starts web/RPC servers         |
+| `blockchain/`      | Block, transaction, UTXO, Merkle logic       |
+| `chain_manager.py` | Manages blockchain state and fork resolution |
+| `dht/`             | Kademlia-based peer discovery                |
+| `gossip/`          | Gossip protocol for block/tx propagation     |
+| `web/`             | FastAPI web server with API endpoints        |
+| `rpc/`             | Bitcoin-compatible RPC for mining            |
+| `wallet/`          | Post-quantum key management (ML-DSA)         |
+| `database/`        | RocksDB storage layer                        |
+| `monitoring/`      | Health checks and Prometheus metrics         |
+| `events/`          | Event bus for internal communication         |
+| `security/`        | Rate limiting and DDoS protection            |
+| `mempool/`         | Transaction pool with conflict detection     |
 
 ---
 
@@ -331,6 +335,7 @@ python3 broadcast_tx_test_harness.py \
 ```
 
 This sends 500 qBTC to the specified address using your signed wallet. The transaction includes:
+
 - **Chain ID** for replay protection
 - **Timestamp** for transaction expiration
 - **ML-DSA signature** for post-quantum security
@@ -348,6 +353,7 @@ docker run --rm -it cpuminer-opt \
 ```
 
 The RPC server automatically:
+
 - Includes pending transactions from the mempool
 - Creates proper coinbase transactions with fees
 - Broadcasts mined blocks to all peers via gossip
@@ -368,6 +374,7 @@ The RPC server automatically:
 ### Prometheus Metrics (http://localhost:9090)
 
 Key metrics include:
+
 - `qbtc_connected_peers_total` - Number of connected peers
 - `qbtc_blockchain_height` - Current blockchain height
 - `qbtc_pending_transactions` - Mempool size
@@ -377,6 +384,7 @@ Key metrics include:
 ### Grafana Dashboards (http://localhost:3000)
 
 Pre-configured dashboards show:
+
 - Network topology and peer connections
 - Blockchain growth and sync status
 - Transaction throughput
@@ -405,6 +413,7 @@ Internal and external audits can be found in the `audits/` folder. We are active
 ### Peer Discovery
 
 Nodes use Kademlia DHT for decentralized peer discovery:
+
 1. Bootstrap nodes maintain the DHT network
 2. New nodes query the DHT for active validators
 3. Validators announce their presence with gossip endpoints
@@ -413,6 +422,7 @@ Nodes use Kademlia DHT for decentralized peer discovery:
 ### Block & Transaction Propagation
 
 The gossip protocol ensures fast network-wide propagation:
+
 1. Transactions are broadcast to all connected peers
 2. Blocks are propagated immediately upon mining
 3. Nodes sync missing blocks automatically
@@ -430,6 +440,7 @@ The gossip protocol ensures fast network-wide propagation:
 ## 📈 Roadmap
 
 ### Completed ✅
+
 - Merkle Root validation
 - Gossip protocol implementation
 - Kademlia DHT integration
@@ -444,12 +455,14 @@ The gossip protocol ensures fast network-wide propagation:
 - Event-driven architecture
 
 ### In Progress 🚧
+
 - TLS encryption for all connections
 - Peer authentication with ML-DSA
 - Advanced fork choice rules
 - State pruning optimizations
 
 ### Planned 📋
+
 - Fee market implementation
 - Smart contract support
 - Light client protocol
@@ -468,11 +481,11 @@ MIT License. See [LICENSE](./LICENSE) for more information.
 
 PRs and issues welcome! To contribute:
 
-1. Fork the repo  
-2. Create your feature branch (`git checkout -b feature/foo`)  
-3. Commit your changes  
-4. Push to the branch  
-5. Open a PR  
+1. Fork the repo
+2. Create your feature branch (`git checkout -b feature/foo`)
+3. Commit your changes
+4. Push to the branch
+5. Open a PR
 
 ### Development Tips
 

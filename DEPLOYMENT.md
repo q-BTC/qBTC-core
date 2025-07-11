@@ -40,6 +40,7 @@ This creates a `wallet.json` file with your ML-DSA keypair. Keep it safe!
 ### Scenario 1: Local Test Network (3 Nodes)
 
 Perfect for development and testing. Creates a complete network with:
+
 - 1 Bootstrap node
 - 2 Validator nodes
 - Full monitoring stack (Prometheus + Grafana)
@@ -138,12 +139,14 @@ docker compose -f docker-compose.validator.yml logs -f validator
 ### Environment Variables
 
 #### Common Variables
+
 - `WALLET_PASSWORD` - Password for the wallet file (required)
 - `WALLET_FILE` - Wallet filename (default: varies by node type)
 - `ADMIN_ADDRESS` - Admin address for security features
 - `USE_REDIS` - Enable Redis caching (default: true)
 
 #### Security Configuration
+
 - `RATE_LIMIT_ENABLED` - Enable rate limiting (default: false)
 - `DDOS_PROTECTION_ENABLED` - Enable DDoS protection (default: true for production)
 - `ATTACK_PATTERN_DETECTION` - Detect attack patterns (default: true for production)
@@ -152,6 +155,7 @@ docker compose -f docker-compose.validator.yml logs -f validator
 - `SECURITY_LOGGING_ENABLED` - Enable security logging (default: true)
 
 #### Monitoring Configuration
+
 - `GRAFANA_ADMIN_USER` - Grafana admin username (default: admin)
 - `GRAFANA_ADMIN_PASSWORD` - Grafana admin password (required for production)
 - `GRAFANA_DOMAIN` - Domain for Grafana (required for production)
@@ -180,6 +184,7 @@ python3 main.py --external-ip YOUR_PUBLIC_IP
 ### Grafana Dashboards
 
 All deployments include pre-configured Grafana dashboards:
+
 - **Network Overview** - Peer connections, blockchain height, sync status
 - **Performance Metrics** - CPU, memory, disk usage
 - **Transaction Flow** - Mempool size, transaction throughput
@@ -188,6 +193,7 @@ All deployments include pre-configured Grafana dashboards:
 ### Prometheus Metrics
 
 Key metrics exposed:
+
 - `qbtc_connected_peers_total` - Number of connected peers
 - `qbtc_blockchain_height` - Current blockchain height
 - `qbtc_pending_transactions` - Mempool size
@@ -245,16 +251,19 @@ docker compose -f docker-compose.SCENARIO.yml logs -f SERVICE_NAME
 ### Connection Issues
 
 1. Check if bootstrap is reachable:
+
 ```bash
 curl http://api.bitcoinqs.org:8080/health
 ```
 
 2. Verify ports are open:
+
 ```bash
 netstat -tuln | grep -E "8001|8002|8080|8332"
 ```
 
 3. Check Docker network:
+
 ```bash
 docker network ls
 docker network inspect qbtc-core_qbtc-network
@@ -263,11 +272,13 @@ docker network inspect qbtc-core_qbtc-network
 ### Wallet Issues
 
 1. Verify wallet file exists:
+
 ```bash
 ls -la wallet.json
 ```
 
 2. Check wallet password in environment:
+
 ```bash
 docker compose -f docker-compose.SCENARIO.yml config | grep WALLET
 ```
@@ -275,22 +286,26 @@ docker compose -f docker-compose.SCENARIO.yml config | grep WALLET
 ### Performance Issues
 
 1. Check resource usage:
+
 ```bash
 docker stats
 ```
 
 2. View metrics in Grafana:
+
 - http://localhost:3000 (test network)
 - https://your-domain.com/grafana/ (production)
 
 ## Security Best Practices
 
 1. **Wallet Security**
+
    - Use strong passwords
    - Backup wallet files securely
    - Never commit wallets to git
 
 2. **Network Security**
+
    - Use firewalls to limit port access
    - Enable SSL for production
    - Regularly update Docker images
@@ -305,6 +320,7 @@ docker stats
 ### Custom Network Configuration
 
 Create a `.env` file:
+
 ```bash
 # Network settings
 BOOTSTRAP_SERVER=api.bitcoinqs.org
@@ -324,6 +340,7 @@ MEMORY_LIMIT=2G
 ### Multi-Region Deployment
 
 For geo-distributed networks:
+
 1. Deploy bootstrap servers in multiple regions
 2. Use external IPs for NAT traversal
 3. Configure monitoring aggregation
