@@ -270,9 +270,9 @@ class GossipNode:
                                 # Try to get txid from tx_ids array
                                 if i < len(tx_ids):
                                     tx["txid"] = tx_ids[i]
-                                # Special case for coinbase
+                                # Coinbase transactions should already have a txid from when they were mined
                                 elif tx.get("inputs") and len(tx["inputs"]) > 0 and tx["inputs"][0].get("txid") == "00" * 32:
-                                    tx["txid"] = f"coinbase_{block.get('height', 0)}"
+                                    logger.error(f"Coinbase transaction missing txid in block {block.get('height', 0)}")
                                 else:
                                     logger.warning(f"Could not determine txid for transaction {i} in block {block.get('height', 'unknown')}")
                 
@@ -323,13 +323,14 @@ class GossipNode:
                             else:
                                 logger.warning(f"Transaction {txid} not found in DB for block at height {h}")
 
-                        cb_key = f"tx:coinbase_{h}".encode()
-                        if cb_key in db:
-                            cb_data = json.loads(db[cb_key].decode())
-                            # Ensure coinbase has txid
-                            if "txid" not in cb_data:
-                                cb_data["txid"] = f"coinbase_{h}"
-                            expanded_txs.append(cb_data)
+                        # Skip legacy coinbase lookup - coinbase is already included in regular transactions
+                        # cb_key = f"tx:coinbase_{h}".encode()
+                        # if cb_key in db:
+                        #     cb_data = json.loads(db[cb_key].decode())
+                        #     # Ensure coinbase has txid
+                        #     if "txid" not in cb_data:
+                        #         cb_data["txid"] = f"coinbase_{h}"
+                        #     expanded_txs.append(cb_data)
 
                         block["full_transactions"] = expanded_txs
                     else:

@@ -495,9 +495,7 @@ async def push_blocks(peer_ip, peer_port):
                         tx_obj["txid"] = tx_id
                         full_transactions.append(tx_obj)
 
-                cbase_key = f"tx:coinbase_{h}".encode()
-                if cbase_key in db:
-                    full_transactions.append(json.loads(db[cbase_key].decode()))
+                # Legacy coinbase lookup removed - coinbase is already included in regular transactions
 
                 found_block["full_transactions"] = full_transactions
 
@@ -596,9 +594,9 @@ async def push_blocks(peer_ip, peer_port):
                             # Try to get txid from tx_ids array
                             if i < len(tx_ids):
                                 tx["txid"] = tx_ids[i]
-                            # Special case for coinbase
+                            # Coinbase transactions should already have a txid from when they were mined
                             elif tx.get("inputs") and len(tx["inputs"]) > 0 and tx["inputs"][0].get("txid") == "00" * 32:
-                                tx["txid"] = f"coinbase_{block.get('height', 0)}"
+                                logger.error(f"Coinbase transaction missing txid in block {block.get('height', 0)}")
                             else:
                                 logger.warning(f"Could not determine txid for transaction {i} in block {block.get('height', 'unknown')}")
             

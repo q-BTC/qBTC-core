@@ -90,9 +90,7 @@ def main():
     tx_key = f"tx:{genesis_tx['txid']}".encode()
     db[tx_key] = json.dumps(genesis_tx).encode()
     
-    # Store coinbase transaction
-    cb_key = f"tx:coinbase_0".encode()
-    db[cb_key] = json.dumps(genesis_tx).encode()
+    # Legacy coinbase storage removed - transaction already stored with its txid above
     
     # Create UTXO
     utxo_key = f"utxo:{genesis_tx['txid']}:0".encode()

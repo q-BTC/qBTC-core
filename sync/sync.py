@@ -301,7 +301,11 @@ def _process_block_in_chain(block: dict):
     # Find and validate coinbase transaction separately
     for tx in full_transactions:
         if tx and validator._is_coinbase_transaction(tx):
-            coinbase_tx_id = f"coinbase_{height}"
+            # Use the actual txid from the coinbase transaction
+            if "txid" not in tx:
+                raise ValueError(f"Coinbase transaction missing txid in block {height}")
+            coinbase_tx_id = tx["txid"]
+            
             is_valid, error_msg = validator.validate_coinbase_transaction(tx, height, total_fees)
             if not is_valid:
                 raise ValueError(f"Invalid coinbase transaction: {error_msg}")
@@ -430,8 +434,8 @@ def _process_block_in_chain(block: dict):
             if tx and "txid" in tx:
                 tx_ids.append(tx["txid"])
             elif tx and validator._is_coinbase_transaction(tx):
-                # Generate coinbase txid
-                tx_ids.append(f"coinbase_{height}")
+                # Coinbase should have txid, if not it's an error
+                logging.error(f"[SYNC] Coinbase transaction missing txid in block {height}")
         logging.info(f"[SYNC] Extracted tx_ids from full_transactions: {tx_ids}")
     
     confirmed_txids = tx_ids[1:] if len(tx_ids) > 1 else []  # Skip coinbase (first transaction)
