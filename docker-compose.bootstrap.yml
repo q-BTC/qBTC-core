@@ -1,5 +1,3 @@
-  version: '3.8'
-
   services:
     # Production Bootstrap node
     bootstrap:
@@ -28,10 +26,15 @@
         RATE_LIMIT_HEALTH: "100"
         RATE_LIMIT_UTXOS: "100"
         RATE_LIMIT_DEFAULT: "60"
+        # RPC configuration
+        RPC_PORT: ${RPC_PORT:-8332}
+        # Monitoring configuration
+        GRAFANA_ENABLED: ${GRAFANA:-true}
+        GRAFANA_PORT: ${GRAFANA_PORT:-443}
       command: ["--bootstrap", "--dht-port", "8001", "--gossip-port", "8002"]
       ports:
         # Remove 8080 from here since nginx will handle it
-        - "8332:8332"     # RPC
+        - "${RPC_PORT:-8332}:8332"     # RPC (configurable)
         - "8001:8001/udp" # DHT UDP
         - "8002:8002"     # Gossip TCP
       volumes:
@@ -94,11 +97,22 @@
       depends_on:
         - bootstrap
 
-    # Grafana for visualization - PUBLIC ACCESS
+    # Grafana for visualization - PUBLIC ACCESS (conditional)
     grafana:
       image: grafana/grafana:latest
       container_name: qbtc-grafana-prod
+      command: >
+        sh -c '
+        if [ "$${GRAFANA:-true}" = "false" ]; then
+          echo "Grafana disabled via GRAFANA=false";
+          exit 0;
+        else
+          exec /run.sh;
+        fi'
       environment:
+        # Grafana control
+        - GRAFANA=${GRAFANA:-true}
+
         # Admin settings (for backend access only)
         - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER}
         - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
@@ -136,7 +150,7 @@
         - GF_USERS_DEFAULT_PERMISSIONS=Viewer
         - GF_USERS_VIEWERS_CAN_EDIT=false
         - GF_EXPLORE_ENABLED=false
-        
+
         # Performance and chunk loading fixes
         - GF_DATAPROXY_TIMEOUT=300
         - GF_DATAPROXY_KEEP_ALIVE_SECONDS=300
@@ -148,26 +162,27 @@
         - ./monitoring/grafana/custom.ini:/etc/grafana/grafana.ini:ro
       networks:
         - qbtc-network
-      restart: unless-stopped
+      restart: "no"
       depends_on:
         - prometheus
 
-    # Nginx reverse proxy - Serves API on 8080 and Grafana on 443
+    # Nginx reverse proxy - Serves API on 8080 and optionally Grafana
     nginx:
       image: nginx:alpine
       container_name: qbtc-nginx-prod
       ports:
-        - "443:443"      # Grafana (public dashboard)
+        - "${GRAFANA_PORT:-443}:443"      # Grafana (configurable port)
         - "80:80"        # HTTP redirect to HTTPS
         - "8080:8080"    # API/WebSocket with SSL
       volumes:
         - ./monitoring/nginx/nginx-prod-split.conf:/etc/nginx/nginx.conf:ro
         - ./monitoring/nginx/ssl:/etc/nginx/ssl:ro
+      environment:
+        - GRAFANA_ENABLED=${GRAFANA:-true}
       networks:
         - qbtc-network
       restart: unless-stopped
       depends_on:
-        - grafana
         - bootstrap
       security_opt:
         - no-new-privileges:true

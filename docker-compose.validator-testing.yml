@@ -28,9 +28,6 @@ services:
       RATE_LIMIT_DEFAULT: "60"
       # RPC configuration
       RPC_PORT: ${RPC_PORT:-8332}
-      # Monitoring configuration
-      GRAFANA_ENABLED: ${GRAFANA:-true}
-      GRAFANA_PORT: ${GRAFANA_PORT:-443}
     command: ["--bootstrap_server", "${BOOTSTRAP_SERVER:-api.bitcoinqs.org}", "--bootstrap_port", "${BOOTSTRAP_PORT:-8001}", "--dht-port", "8001", "--gossip-port", "8002"]
     ports:
       # Remove 8080 from here since nginx will handle it
@@ -97,18 +94,14 @@ services:
     depends_on:
       - validator
 
-  # Nginx reverse proxy - Serves API on 8080 and Grafana on 8443
+  # Nginx reverse proxy - Only serves API on 8080
   nginx:
     image: nginx:alpine
     container_name: qbtc-nginx-validator
     ports:
-      - "${GRAFANA_PORT:-443}:443"      # Grafana (configurable port)
-      - "80:80"        # HTTP redirect to HTTPS
       - "8080:8080"    # API/WebSocket with SSL
-    environment:
-      - GRAFANA_ENABLED=${GRAFANA:-true}
     volumes:
-      - ./monitoring/nginx/nginx-validator.conf:/etc/nginx/nginx.conf:ro
+      - ./monitoring/nginx/nginx-validator-testing.conf:/etc/nginx/nginx.conf:ro
       - ./monitoring/nginx/ssl:/etc/nginx/ssl:ro
     networks:
       - qbtc-network
@@ -118,80 +111,10 @@ services:
     security_opt:
       - no-new-privileges:true
 
-  # Grafana for visualization - PUBLIC ACCESS
-  grafana:
-    image: grafana/grafana:latest
-    container_name: qbtc-grafana-validator
-    command: >
-      sh -c '
-      if [ "$${GRAFANA:-true}" = "false" ]; then
-        echo "Grafana disabled via GRAFANA=false";
-        exit 0;
-      else
-        exec /run.sh;
-      fi'
-    environment:
-      # Grafana control
-      - GRAFANA=${GRAFANA:-true}
-
-      # Admin settings (for backend access only)
-      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER}
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
-
-      # Enable anonymous access - FIXED ORG NAME
-      - GF_AUTH_ANONYMOUS_ENABLED=true
-      - GF_AUTH_ANONYMOUS_ORG_NAME=Main Org.
-      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
-
-      # Disable sign ups but keep login form for admin
-      - GF_USERS_ALLOW_SIGN_UP=false
-      - GF_USERS_ALLOW_ORG_CREATE=false
-      - GF_AUTH_DISABLE_LOGIN_FORM=false
-      - GF_AUTH_DISABLE_SIGNOUT_MENU=true
-
-      # Security settings
-      - GF_SECURITY_DISABLE_GRAVATAR=true
-      - GF_SECURITY_COOKIE_SECURE=true
-      - GF_SECURITY_STRICT_TRANSPORT_SECURITY=true
-      - GF_SECURITY_STRICT_TRANSPORT_SECURITY_MAX_AGE_SECONDS=86400
-      - GF_SECURITY_STRICT_TRANSPORT_SECURITY_PRELOAD=true
-      - GF_SECURITY_STRICT_TRANSPORT_SECURITY_SUBDOMAINS=true
-      - GF_SECURITY_X_CONTENT_TYPE_OPTIONS=true
-      - GF_SECURITY_X_XSS_PROTECTION=true
-      - GF_SECURITY_CONTENT_SECURITY_POLICY=true
-
-      # Server settings
-      - GF_SERVER_ROOT_URL=https://${GRAFANA_DOMAIN}/
-      - GF_SERVER_ENABLE_GZIP=true
-
-      # Dashboard settings
-      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/qbtc-overview.json
-
-      # Disable editing for viewers
-      - GF_USERS_DEFAULT_PERMISSIONS=Viewer
-      - GF_USERS_VIEWERS_CAN_EDIT=false
-      - GF_EXPLORE_ENABLED=false
-
-      # Performance and chunk loading fixes
-      - GF_DATAPROXY_TIMEOUT=300
-      - GF_DATAPROXY_KEEP_ALIVE_SECONDS=300
-      - GF_RENDERING_CONCURRENT_RENDER_REQUEST_LIMIT=10
-    volumes:
-      - grafana-data:/var/lib/grafana
-      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
-      - ./monitoring/grafana/custom.ini:/etc/grafana/grafana.ini:ro
-    networks:
-      - qbtc-network
-    restart: "no"
-    depends_on:
-      - prometheus
-
 volumes:
   validator-data:
   redis-data:
   prometheus-data:
-  grafana-data:
 
 networks:
   qbtc-network:

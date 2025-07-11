@@ -5,6 +5,7 @@ This directory contains the monitoring configuration for qBTC nodes using Promet
 ## Architecture
 
 Each qBTC node exposes a `/health` endpoint that provides Prometheus-compatible metrics including:
+
 - Node health status (database, blockchain, network, mempool)
 - Blockchain height
 - Connected and synced peer counts
@@ -15,6 +16,7 @@ Each qBTC node exposes a `/health` endpoint that provides Prometheus-compatible 
 ## Docker Compose Configurations
 
 ### 1. Test Environment (docker-compose.test.yml)
+
 - 3-node test network (1 bootstrap + 2 validators)
 - Prometheus and Grafana included
 - Nginx load balancer for API access
@@ -23,11 +25,13 @@ Each qBTC node exposes a `/health` endpoint that provides Prometheus-compatible 
 - Suitable for development and testing
 
 **Start with:**
+
 ```bash
 docker compose -f docker-compose.test.yml up -d
 ```
 
 **Access:**
+
 - Bootstrap API: http://localhost:8080 (via nginx)
 - Validator 1 API: http://localhost:8081
 - Validator 2 API: http://localhost:8082
@@ -36,6 +40,7 @@ docker compose -f docker-compose.test.yml up -d
 - RPC: localhost:8332, 8333, 8334
 
 ### 2. Production Bootstrap (docker-compose.bootstrap.yml)
+
 - Single bootstrap node with secure monitoring
 - Nginx reverse proxy with SSL/TLS
 - Public read-only Grafana dashboards
@@ -43,10 +48,12 @@ docker compose -f docker-compose.test.yml up -d
 - DDoS protection enabled
 
 **Requirements:**
+
 - SSL certificates in `monitoring/nginx/ssl/`
 - Environment variables set
 
 **Start with:**
+
 ```bash
 # Set required environment variables
 export BOOTSTRAP_WALLET_PASSWORD="your-secure-password"
@@ -67,6 +74,7 @@ docker compose -f docker-compose.bootstrap.yml up -d
 ```
 
 **Access:**
+
 - API: https://localhost:8080 (SSL)
 - Grafana: https://localhost:443 (public read-only)
 - Admin Grafana: https://localhost:443 (login as admin)
@@ -75,6 +83,7 @@ docker compose -f docker-compose.bootstrap.yml up -d
 - Gossip: localhost:8002/tcp
 
 ### 3. Production Validator (docker-compose.validator.yml)
+
 - Connects to mainnet via api.bitcoinqs.org:8001
 - Local monitoring stack
 - SSL/TLS enabled
@@ -82,6 +91,7 @@ docker compose -f docker-compose.bootstrap.yml up -d
 - DDoS protection enabled
 
 **Start with:**
+
 ```bash
 # Set required environment variables
 export VALIDATOR_WALLET_PASSWORD="your-secure-password"
@@ -106,6 +116,7 @@ BOOTSTRAP_SERVER=your.bootstrap.server BOOTSTRAP_PORT=8001 \
 ```
 
 **Access:**
+
 - API: https://localhost:8080 (SSL)
 - Grafana: https://localhost:443 (public read-only)
 - Admin Grafana: https://localhost:443 (login as admin)
@@ -114,6 +125,7 @@ BOOTSTRAP_SERVER=your.bootstrap.server BOOTSTRAP_PORT=8001 \
 ## Grafana Dashboard
 
 A pre-configured dashboard (`qbtc-overview.json`) is automatically loaded showing:
+
 - Node health status
 - Blockchain height over time
 - Network peer statistics
@@ -124,6 +136,7 @@ A pre-configured dashboard (`qbtc-overview.json`) is automatically loaded showin
 ## Production Security Features
 
 Both production configurations (bootstrap and validator) include:
+
 - **Anonymous Access**: Public read-only dashboards
 - **Admin Access**: Secured admin login for configuration
 - **SSL/TLS**: All traffic encrypted
@@ -134,6 +147,7 @@ Both production configurations (bootstrap and validator) include:
 ## Prometheus Metrics
 
 Available metrics include:
+
 - `qbtc_node_info` - Node information
 - `qbtc_uptime_seconds` - Node uptime
 - `qbtc_blockchain_height` - Current blockchain height
@@ -149,6 +163,7 @@ Available metrics include:
 ## Nginx Configuration
 
 Production deployments use nginx for:
+
 - SSL/TLS termination
 - Reverse proxy to API and Grafana
 - Load balancing (test environment)
@@ -156,27 +171,32 @@ Production deployments use nginx for:
 - Rate limiting (when configured)
 
 Configuration files:
+
 - `nginx-test.conf` - Simple load balancer for test environment
 - `nginx-prod-split.conf` - Production config with SSL and split ports
 
 ## Troubleshooting
 
 ### Grafana not showing data
+
 1. Check Prometheus targets at http://localhost:9090/targets
 2. Verify nodes are running and `/health` endpoint is accessible
 3. Check container logs: `docker compose logs prometheus grafana`
 
 ### SSL Certificate Issues
+
 1. Ensure `server.crt` and `server.key` are in `monitoring/nginx/ssl/`
 2. Verify certificate validity and domain match
 3. Check nginx logs: `docker compose -f docker-compose.bootstrap.yml logs nginx`
 
 ### Authentication Issues
+
 1. Verify GRAFANA_ADMIN_PASSWORD is set correctly
 2. For public dashboards, ensure anonymous access is working
 3. Admin login at /login with configured credentials
 
 ### Connection Issues
+
 1. Check if bootstrap is reachable: `curl http://api.bitcoinqs.org:8080/health`
 2. Verify Docker network: `docker network inspect qbtc-core_qbtc-network`
 3. Check firewall rules for required ports

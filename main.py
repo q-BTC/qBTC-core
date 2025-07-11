@@ -7,6 +7,7 @@ from web.web import app
 from rpc.rpc import rpc_app
 from node.startup import startup, shutdown
 from log_utils import setup_logging
+from config.config import RPC_PORT
 
 # Setup structured logging
 logger = setup_logging(
@@ -21,7 +22,7 @@ async def main(args):
     logger.info(f"Mode: {'bootstrap' if args.bootstrap else 'peer'}")
     logger.info(f"Args: bootstrap={args.bootstrap}, dht_port={args.dht_port}, gossip_port={args.gossip_port}")
     logger.info(f"Bootstrap server: {args.bootstrap_server}:{args.bootstrap_port}")
-    
+
     try:
         await startup(args)
         logger.info("Node startup completed successfully")
@@ -42,12 +43,12 @@ async def main(args):
     config_rpc = uvicorn.Config(
         rpc_app,
         host="0.0.0.0",
-        port=8332,
+        port=RPC_PORT,
         log_level="info",
         access_log=True
     )
     server_rpc = uvicorn.Server(config_rpc)
-    logger.info("RPC server configured on port 8332")
+    logger.info(f"RPC server configured on port {RPC_PORT}")
 
     try:
         logger.info("Starting web and RPC servers")
@@ -64,7 +65,7 @@ async def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='qBTC Node')
-    parser.add_argument('--bootstrap', action='store_true', 
+    parser.add_argument('--bootstrap', action='store_true',
                         help='Run as bootstrap server')
     parser.add_argument('--bootstrap_server', type=str, default='api.bitcoinqs.org',
                         help='Bootstrap server host (default: api.bitcoinqs.org)')
@@ -76,9 +77,9 @@ if __name__ == "__main__":
                         help='Gossip port (default: 8002)')
     parser.add_argument('--external-ip', type=str, default=None,
                         help='External IP address for NAT traversal')
-    
+
     args = parser.parse_args()
-    
+
     try:
         asyncio.run(main(args))
     except KeyboardInterrupt:

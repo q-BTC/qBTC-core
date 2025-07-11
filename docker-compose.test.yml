@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # Bootstrap node - initial network node
   bootstrap:
@@ -28,10 +26,15 @@ services:
       RATE_LIMIT_HEALTH: "100"
       RATE_LIMIT_UTXOS: "100"
       RATE_LIMIT_DEFAULT: "60"
+      # RPC configuration
+      RPC_PORT: ${RPC_PORT:-8332}
+      # Monitoring configuration
+      GRAFANA_ENABLED: ${GRAFANA:-true}
+      GRAFANA_PORT: ${GRAFANA_PORT:-3000}
     command: ["--bootstrap", "--dht-port", "8001", "--gossip-port", "8002"]
     ports:
       # Remove 8080 from here since nginx will handle it in production mode
-      - "8332:8332"     # RPC
+      - "${RPC_PORT:-8332}:8332"     # RPC (configurable)
       - "8001:8001/udp" # DHT UDP
       - "8002:8002"     # Gossip TCP
     volumes:
@@ -85,10 +88,15 @@ services:
       RATE_LIMIT_HEALTH: "100"
       RATE_LIMIT_UTXOS: "100"
       RATE_LIMIT_DEFAULT: "60"
+      # RPC configuration
+      RPC_PORT: ${RPC_PORT:-8333}
+      # Monitoring configuration
+      GRAFANA_ENABLED: ${GRAFANA:-true}
+      GRAFANA_PORT: ${GRAFANA_PORT:-3000}
     command: ["--bootstrap_server", "bootstrap", "--bootstrap_port", "8001", "--dht-port", "8003", "--gossip-port", "8004"]
     ports:
       - "8081:8080"
-      - "8333:8332"
+      - "${RPC_PORT:-8333}:8332"     # RPC (configurable)
       - "8003:8003/udp"
       - "8004:8004"
     volumes:
@@ -143,10 +151,15 @@ services:
       RATE_LIMIT_HEALTH: "100"
       RATE_LIMIT_UTXOS: "100"
       RATE_LIMIT_DEFAULT: "60"
+      # RPC configuration
+      RPC_PORT: ${RPC_PORT:-8334}
+      # Monitoring configuration
+      GRAFANA_ENABLED: ${GRAFANA:-true}
+      GRAFANA_PORT: ${GRAFANA_PORT:-3000}
     command: ["--bootstrap_server", "bootstrap", "--bootstrap_port", "8001", "--dht-port", "8005", "--gossip-port", "8006"]
     ports:
       - "8082:8080"
-      - "8334:8332"
+      - "${RPC_PORT:-8334}:8332"     # RPC (configurable)
       - "8005:8005/udp"
       - "8006:8006"
     volumes:
@@ -214,36 +227,47 @@ services:
       - validator1
       - validator2
 
-  # Grafana for visualization - TEST MODE (full access)
+  # Grafana for visualization - TEST MODE (full access) - Conditional
   grafana:
     image: grafana/grafana:latest
     container_name: qbtc-grafana
+    command: >
+      sh -c '
+      if [ "$${GRAFANA:-true}" = "false" ]; then
+        echo "Grafana disabled via GRAFANA=false";
+        exit 0;
+      else
+        exec /run.sh;
+      fi'
     ports:
-      - "3000:3000"
+      - "${GRAFANA_PORT:-3000}:3000"     # Grafana (configurable port)
     environment:
+      # Grafana control
+      - GRAFANA=${GRAFANA:-true}
+
       # Admin settings
       - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin123}
-      
+
       # Test mode - full access
       - GF_AUTH_ANONYMOUS_ENABLED=false
       - GF_USERS_ALLOW_SIGN_UP=false
       - GF_USERS_ALLOW_ORG_CREATE=false
       - GF_AUTH_DISABLE_LOGIN_FORM=false
-      
+
       # Security settings
       - GF_SECURITY_DISABLE_GRAVATAR=true
       - GF_SECURITY_COOKIE_SECURE=false  # false for test mode
       - GF_SECURITY_STRICT_TRANSPORT_SECURITY=false  # false for test mode
-      
+
       # Dashboard settings
       - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/qbtc-overview.json
-      
+
       # Enable editing for test mode
       - GF_USERS_DEFAULT_PERMISSIONS=Editor
       - GF_USERS_VIEWERS_CAN_EDIT=true
       - GF_EXPLORE_ENABLED=true
-      
+
       # Performance and chunk loading fixes
       - GF_DATAPROXY_TIMEOUT=300
       - GF_DATAPROXY_KEEP_ALIVE_SECONDS=300
@@ -255,7 +279,7 @@ services:
       - ./monitoring/grafana/custom.ini:/etc/grafana/grafana.ini:ro
     networks:
       - qbtc-network
-    restart: unless-stopped
+    restart: "no"
     depends_on:
       - prometheus
 
