@@ -7,7 +7,7 @@ import asyncio
 from decimal import Decimal
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from database.database import get_db, get_current_height
+from database.database import get_db, get_current_height, invalidate_height_cache
 from config.config import ADMIN_ADDRESS
 from wallet.wallet import verify_transaction
 from blockchain.blockchain import derive_qsafe_address,Block, bits_to_target, serialize_transaction,scriptpubkey_to_address, read_varint, parse_tx, validate_pow, sha256d, calculate_merkle_root
@@ -757,6 +757,9 @@ async def submit_block(request: Request, data: dict) -> dict:
         # Store block and transactions in database
         batch.put(b"block:" + block.hash().encode(), json.dumps(block_data).encode())
         db.write(batch)
+        
+        # Invalidate height cache since we added a new block
+        invalidate_height_cache()
 
         # Remove all non-coinbase transactions from mempool
         for tid in txids[1:]:

@@ -1,4 +1,4 @@
-from database.database import get_db, get_current_height
+from database.database import get_db, get_current_height, invalidate_height_cache
 from rocksdict import WriteBatch
 from blockchain.blockchain import Block, calculate_merkle_root, validate_pow, serialize_transaction, sha256d
 from blockchain.chain_singleton import get_chain_manager
@@ -420,6 +420,9 @@ def _process_block_in_chain(block: dict):
     # Update the height index
     height_index = get_height_index()
     height_index.add_block_to_index(height, block_hash)
+    
+    # Invalidate height cache since we added a new block
+    invalidate_height_cache()
     
     # Remove transactions from mempool
     # Skip the first tx_id as it's the coinbase transaction
