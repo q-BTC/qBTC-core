@@ -1,12 +1,13 @@
-from database.database import get_db, get_current_height
+from database.database import get_db, get_current_height, invalidate_height_cache
 from rocksdict import WriteBatch
 from blockchain.blockchain import Block, calculate_merkle_root, validate_pow, serialize_transaction, sha256d
 from blockchain.chain_singleton import get_chain_manager
 from config.config import ADMIN_ADDRESS, GENESIS_ADDRESS, CHAIN_ID, TX_EXPIRATION_TIME
-from wallet.wallet import verify_transaction
+from blockchain.transaction_validator import TransactionValidator
 from blockchain.event_integration import emit_database_event
 from state.state import mempool_manager
 from events.event_bus import event_bus, EventTypes
+from blockchain.block_height_index import get_height_index
 import asyncio
 import json
 import logging
@@ -14,27 +15,82 @@ import time
 from decimal import Decimal, ROUND_DOWN
 from typing import List, Dict, Tuple, Optional
 
+def _cleanup_mempool_after_sync(blocks: list[dict]):
+    """Clean up mempool after syncing blocks"""
+    try:
+        all_tx_ids = set()
+        for block in blocks:
+            tx_ids = block.get("tx_ids", [])
+            if len(tx_ids) > 1:  # Skip coinbase
+                all_tx_ids.update(tx_ids[1:])
+        
+        if not all_tx_ids:
+            return
+            
+        removed_count = 0
+        for txid in all_tx_ids:
+            if mempool_manager.get_transaction(txid) is not None:
+                mempool_manager.remove_transaction(txid)
+                removed_count += 1
+                logging.debug(f"[SYNC] Removed synced transaction {txid} from mempool")
+        
+        if removed_count > 0:
+            logging.info(f"[SYNC] Post-sync cleanup: removed {removed_count} mined transactions from mempool")
+            
+    except Exception as e:
+        logging.error(f"Error during mempool cleanup: {e}", exc_info=True)
+
+# Track concurrent calls
+_processing_lock = asyncio.Lock()
+_processing_count = 0
+
 def process_blocks_from_peer(blocks: list[dict]):
-    logging.info("***** IN GOSSIP MSG RECEIVE BLOCKS RESPONSE")
+    global _processing_count
+    _processing_count += 1
+    call_id = _processing_count
+    
+    logging.info(f"***** IN GOSSIP MSG RECEIVE BLOCKS RESPONSE (call #{call_id})")
+    logging.info(f"Call #{call_id}: Processing {len(blocks)} blocks")
     
     # Wrap entire function to catch any error
     try:
-        return _process_blocks_from_peer_impl(blocks)
+        result = _process_blocks_from_peer_impl(blocks)
+        logging.info(f"Call #{call_id}: Completed successfully")
+        return result
     except Exception as e:
-        logging.error(f"CRITICAL ERROR in process_blocks_from_peer: {e}", exc_info=True)
+        logging.error(f"CRITICAL ERROR in process_blocks_from_peer call #{call_id}: {e}", exc_info=True)
         # Re-raise to maintain original behavior
         raise
 
 def _process_blocks_from_peer_impl(blocks: list[dict]):
     """Actual implementation of process_blocks_from_peer"""
     
+    # Debug logging to understand block structure
+    logging.info(f"_process_blocks_from_peer_impl called with {len(blocks) if isinstance(blocks, list) else 'non-list'} blocks")
+    if blocks and isinstance(blocks, list):
+        for i, block in enumerate(blocks[:3]):  # Log first 3 blocks
+            if isinstance(block, dict):
+                height = block.get("height")
+                block_hash = block.get("block_hash")
+                logging.info(f"Block {i}: height={height} (type: {type(height)}), hash={block_hash}")
+                if isinstance(height, str) and len(height) == 64:
+                    logging.error(f"Block {i} has hash in height field!")
+                    # Log all block fields to understand the corruption
+                    for k, v in block.items():
+                        if isinstance(v, str) and len(v) < 100:
+                            logging.error(f"  {k}: {v}")
+                        else:
+                            logging.error(f"  {k}: {type(v)}")
+    
     try:
         db = get_db()
         cm = get_chain_manager()
         raw_blocks = blocks
 
-        print("**** RAW BLOCkS ****")
-        print(raw_blocks)
+        logging.debug(f"[SYNC] Processing {len(raw_blocks)} blocks from peer")
+        
+        # Enable sync mode for bulk block processing
+        cm.set_sync_mode(True)
         
         # Log the type and structure for debugging
         logging.info(f"Received blocks type: {type(blocks)}")
@@ -49,21 +105,57 @@ def _process_blocks_from_peer_impl(blocks: list[dict]):
         def get_height(block):
             height = block.get("height", 0)
             # Ensure height is an integer
-            if isinstance(height, str):
-                # Check if this looks like a block hash (64 hex chars)
-                if len(height) == 64 and all(c in '0123456789abcdefABCDEF' for c in height):
-                    logging.error(f"Block hash '{height}' found in height field for block {block.get('block_hash', 'unknown')}")
-                    logging.error(f"Full block data: {block}")
-                    return 0
+            if isinstance(height, int):
+                return height
+            elif isinstance(height, str):
                 try:
                     return int(height)
                 except ValueError:
-                    logging.warning(f"Invalid height value '{height}' in block {block.get('block_hash', 'unknown')}")
-                    return 0
-            return int(height) if height is not None else 0
+                    logging.error(f"Invalid height value '{height}' in block {block.get('block_hash', 'unknown')}")
+                    return -1  # Use -1 to sort invalid blocks first
+            else:
+                return 0
         
-        blocks = sorted(raw_blocks, key=get_height)
-        logging.info("Received %d blocks", len(blocks))
+        # Filter out malformed blocks before processing
+        valid_blocks = []
+        for block in raw_blocks:
+            if not isinstance(block, dict):
+                logging.error(f"Skipping non-dict block: {type(block)}")
+                continue
+            
+            height = block.get("height")
+            block_hash = block.get("block_hash")
+            
+            # Check if height looks like a block hash
+            if isinstance(height, str) and len(height) == 64 and all(c in '0123456789abcdefABCDEF' for c in height):
+                logging.error(f"Skipping malformed block with hash in height field: height={height}, hash={block_hash}")
+                continue
+                
+            # Check if block_hash looks valid
+            if not isinstance(block_hash, str) or len(block_hash) != 64:
+                logging.error(f"Skipping block with invalid hash: {block_hash}")
+                continue
+                
+            valid_blocks.append(block)
+        
+        blocks = sorted(valid_blocks, key=get_height)
+        logging.info("Received %d blocks, %d valid after filtering", len(raw_blocks), len(blocks))
+        
+        # Check for duplicate blocks
+        seen_hashes = set()
+        seen_heights = set()
+        for i, block in enumerate(blocks):
+            block_hash = block.get("block_hash")
+            height = block.get("height")
+            if block_hash in seen_hashes:
+                logging.error(f"Duplicate block hash found at index {i}: {block_hash}")
+                logging.error(f"Block {i} data: height={height} (type: {type(height)})")
+            if height in seen_heights and height is not None:
+                logging.error(f"Duplicate height found at index {i}: {height}")
+                logging.error(f"Block {i} hash: {block_hash}")
+            seen_hashes.add(block_hash)
+            if height is not None:
+                seen_heights.add(height)
     except Exception as e:
         logging.error(f"Error in process_blocks_from_peer setup: {e}", exc_info=True)
         raise
@@ -71,50 +163,94 @@ def _process_blocks_from_peer_impl(blocks: list[dict]):
     accepted_count = 0
     rejected_count = 0
     
-    for block in blocks:
-        try:
-            height = block.get("height")
-            block_hash = block.get("block_hash")
-            prev_hash = block.get("previous_hash")
-            
-            # Log block structure for debugging
-            logging.info(f"Processing block at height {height} with hash {block_hash}")
-            logging.info(f"Block has bits field: {'bits' in block}")
-            
-            # Add full_transactions to block if not present
-            if "full_transactions" not in block:
-                block["full_transactions"] = block.get("full_transactions", [])
-            
-            # Let ChainManager handle consensus
-            success, error = cm.add_block(block)
-            
-            if success:
-                accepted_count += 1
-                # Only process if block is in main chain
-                if cm.is_block_in_main_chain(block_hash):
-                    # Process the block transactions
-                    _process_block_in_chain(block)
-                else:
-                    logging.info("Block %s accepted but not in main chain yet", block_hash)
-            else:
-                rejected_count += 1
-                logging.warning("Block %s rejected: %s", block_hash, error)
-                continue
+    try:
+        for block in blocks:
+            try:
+                height = block.get("height")
+                block_hash = block.get("block_hash")
+                prev_hash = block.get("previous_hash")
                 
-        except Exception as e:
-            logging.error("Error processing block %s: %s", block.get("block_hash", "unknown"), e)
-            rejected_count += 1
+                # Validate height before processing
+                if isinstance(height, str) and len(height) == 64 and all(c in '0123456789abcdefABCDEF' for c in height):
+                    logging.error(f"Skipping block with hash in height field: height={height}, block_hash={block_hash}")
+                    logging.error(f"Block keys: {list(block.keys())}")
+                    rejected_count += 1
+                    continue
+                
+                # Log block structure for debugging
+                logging.info(f"Processing block at height {height} (type: {type(height)}) with hash {block_hash}")
+                logging.info(f"Block has bits field: {'bits' in block}")
+                logging.debug(f"Full block structure: {json.dumps(block, indent=2)}")
+                
+                # Add full_transactions to block if not present
+                if "full_transactions" not in block:
+                    block["full_transactions"] = block.get("full_transactions", [])
+                
+                # Let ChainManager handle consensus
+                logging.debug(f"Calling add_block with height={block.get('height')} (type: {type(block.get('height'))})")
+                success, error = cm.add_block(block)
+                
+                if success:
+                    accepted_count += 1
+                    # Only process if block is in main chain
+                    if cm.is_block_in_main_chain(block_hash):
+                        # Process the block transactions
+                        _process_block_in_chain(block)
+                    else:
+                        logging.info("Block %s accepted but not in main chain yet", block_hash)
+                    continue
+                else:
+                    rejected_count += 1
+                    logging.warning("Block %s rejected: %s", block_hash, error)
+                    
+                    # Even if block is rejected, we should still remove any transactions 
+                    # from mempool that are in this block (they might be invalid)
+                    if "tx_ids" in block and len(block.get("tx_ids", [])) > 1:
+                        # Skip coinbase (first transaction)
+                        tx_ids_to_check = block["tx_ids"][1:]
+                        removed_txids = []
+                        for txid in tx_ids_to_check:
+                            if mempool_manager.get_transaction(txid) is not None:
+                                mempool_manager.remove_transaction(txid)
+                                removed_txids.append(txid)
+                                logging.info(f"[SYNC] Removed transaction {txid} from mempool (block rejected)")
+                        
+                        if removed_txids:
+                            logging.info(f"[SYNC] Removed {len(removed_txids)} transactions from mempool after rejected block {block_hash}")
+                    
+                    continue
+                    
+            except Exception as e:
+                logging.error("Error processing block %s: %s", block.get("block_hash", "unknown"), e)
+                logging.error("Block data at error: height=%s (type: %s), hash=%s", 
+                            block.get("height"), type(block.get("height")), block.get("block_hash"))
+                logging.error("Exception type: %s", type(e).__name__)
+                logging.error("Full traceback:", exc_info=True)
+                rejected_count += 1
 
-    logging.info("Block processing complete: %d accepted, %d rejected", accepted_count, rejected_count)
+        logging.info("Block processing complete: %d accepted, %d rejected", accepted_count, rejected_count)
+        
+        # After initial sync, do a final mempool cleanup
+        # This ensures any transactions that were mined in blocks we just synced are removed
+        if accepted_count > 0:
+            _cleanup_mempool_after_sync(blocks)
+        
+        # Check if we need to request more blocks
+        best_tip, best_height = cm.get_best_chain_tip()
+        logging.info("Current best chain height: %d", best_height)
+        
+        return accepted_count > 0
     
-    # Check if we need to request more blocks
-    best_tip, best_height = cm.get_best_chain_tip()
-    logging.info("Current best chain height: %d", best_height)
-    
-    return accepted_count > 0
+    finally:
+        # Always disable sync mode after processing
+        cm.set_sync_mode(False)
 
 def _process_block_in_chain(block: dict):
     """Process a block that is confirmed to be in the main chain"""
+    # Validate input type
+    if not isinstance(block, dict):
+        raise TypeError(f"Expected dict for block, got {type(block)}: {block}")
+    
     db = get_db()
     batch = WriteBatch()
     
@@ -130,218 +266,127 @@ def _process_block_in_chain(block: dict):
     version = block.get("version")
     bits = block.get("bits")
     
+    # Validate height is a proper integer
+    if isinstance(height, str):
+        try:
+            height = int(height)
+        except ValueError:
+            # Check if this looks like a block hash (64 hex chars)
+            if len(height) == 64 and all(c in '0123456789abcdefABCDEF' for c in height):
+                raise ValueError(f"Block hash '{height}' found in height field for block {block_hash}")
+            else:
+                raise ValueError(f"Invalid height value '{height}' in block {block_hash}")
+    elif height is None:
+        raise ValueError(f"Missing height in block {block_hash}")
+    elif not isinstance(height, int):
+        raise ValueError(f"Height must be an integer, got {type(height)} for block {block_hash}")
+    
     logging.info("[SYNC] Processing confirmed block height %s with hash %s", height, block_hash)
     logging.info("[SYNC] Block has %d full transactions", len(full_transactions))
     
-    # Track total fees collected in this block
-    total_fees = Decimal("0")
+    # Create transaction validator with sync mode enabled (skip time validation)
+    validator = TransactionValidator(db)
+    validator.skip_time_validation = True  # CRITICAL: Set this for historical blocks during sync
+    
+    # First validate all transactions in the block
+    is_valid, error_msg, total_fees = validator.validate_block_transactions(block)
+    if not is_valid:
+        raise ValueError(f"Block {block_hash} contains invalid transactions: {error_msg}")
+    
     # Track spent UTXOs within this block to prevent double-spending
     spent_in_block = set()
     # Store coinbase data for validation after fee calculation
     coinbase_data = None
 
-    for raw in full_transactions:
-        if raw is None:
-            continue
-        tx = raw
-        if "transaction" in tx:
-            tx = tx["transaction"]
-        if tx.get("txid") == "genesis_tx":
-            logging.debug("[SYNC] Genesis transaction detected")
-            continue
-
-        is_probable_coinbase = all(k in tx for k in ("version", "inputs", "outputs")) and not tx.get("txid")
-        if is_probable_coinbase:
-            logging.debug("[SYNC] Coinbase transaction detected")
-            coinbase_tx_id = f"coinbase_{height}"
+    # Find and validate coinbase transaction separately
+    for tx in full_transactions:
+        if tx and validator._is_coinbase_transaction(tx):
+            # Use the actual txid from the coinbase transaction
+            if "txid" not in tx:
+                raise ValueError(f"Coinbase transaction missing txid in block {height}")
+            coinbase_tx_id = tx["txid"]
             
-            # Store coinbase data for validation after processing all transactions
-            coinbase_total = Decimal("0")
+            is_valid, error_msg = validator.validate_coinbase_transaction(tx, height, total_fees)
+            if not is_valid:
+                raise ValueError(f"Invalid coinbase transaction: {error_msg}")
+            
+            # Store coinbase outputs for later processing
             coinbase_outputs = []
-            
             for idx, output in enumerate(tx.get("outputs", [])):
                 output_amount = Decimal(str(output.get("value", "0")))
-                coinbase_total += output_amount
-                
                 output_key = f"utxo:{coinbase_tx_id}:{idx}".encode()
                 utxo = {
                     "txid": coinbase_tx_id,
                     "utxo_index": idx,
                     "sender": "coinbase",
-                    "receiver": miner_address,   
+                    "receiver": miner_address,
                     "amount": str(output_amount),
                     "spent": False,
                 }
                 coinbase_outputs.append((output_key, utxo))
             
-            # Store coinbase data for validation after fee calculation
             coinbase_data = {
                 "tx": tx,
                 "tx_id": coinbase_tx_id,
-                "total": coinbase_total,
                 "outputs": coinbase_outputs
             }
+            break
+    
+    # Now process all transactions (they've already been validated)
+    for raw in full_transactions:
+        if raw is None:
+            continue
+        tx = raw
+        if tx.get("txid") == "genesis_tx":
+            logging.debug("[SYNC] Genesis transaction detected")
             continue
 
-        if "txid" in tx:
-            txid = tx["txid"]
-            inputs = tx.get("inputs", [])
-            outputs = tx.get("outputs", [])
-            body = tx.get("body", {})
+        # Skip coinbase (already processed above)
+        if validator._is_coinbase_transaction(tx):
+            continue
 
-            pubkey = body.get("pubkey", "unknown")
-            signature = body.get("signature", "unknown")
+        # All transactions MUST have a txid
+        if "txid" not in tx:
+            logging.warning(f"[SYNC] Skipping transaction without txid in block {height}")
+            continue
+        
+        txid = tx["txid"]
+        
+        inputs = tx.get("inputs", [])
+        outputs = tx.get("outputs", [])
 
-            from_ = to_ = total_authorized = time_ = None
-            if body.get("transaction_data") == "initial_distribution" and height == 1:
-                total_authorized = "21000000"  
-                to_ = ADMIN_ADDRESS
-                from_ = GENESIS_ADDRESS
-            else:
-                msg_str = body.get("msg_str", "")
-                parts = msg_str.split(":")
-                # MANDATORY format: sender:receiver:amount:timestamp:chain_id
-                if len(parts) != 5:
-                    raise ValueError(f"Transaction {txid} invalid format - must have sender:receiver:amount:timestamp:chain_id")
-                from_, to_, total_authorized, time_, tx_chain_id = parts
-                
-                # Validate chain ID
-                if int(tx_chain_id) != CHAIN_ID:
-                    raise ValueError(f"Invalid chain ID in tx {txid}: expected {CHAIN_ID}, got {tx_chain_id}")
-                
-                # Validate timestamp for expiration
-                try:
-                    tx_timestamp = int(time_)
-                    current_time = int(time.time() * 1000)  # Convert to milliseconds
-                    tx_age = (current_time - tx_timestamp) / 1000  # Age in seconds
-                    
-                    if tx_age > TX_EXPIRATION_TIME:
-                        raise ValueError(f"Transaction {txid} expired: age {tx_age}s > max {TX_EXPIRATION_TIME}s")
-                    
-                    # Reject transactions with future timestamps (more than 5 minutes in the future)
-                    if tx_age < -300:  # -300 seconds = 5 minutes in the future
-                        raise ValueError(f"Transaction {txid} has future timestamp: {-tx_age}s in the future")
-                        
-                except (ValueError, TypeError) as e:
-                    raise ValueError(f"Invalid timestamp in tx {txid}: {time_}")
+        batch.put(f"tx:{txid}".encode(), json.dumps(tx).encode())
 
-            total_available = Decimal("0")
-            total_required = Decimal("0")
-
-            for inp in inputs:
-                if "txid" not in inp:
-                    continue
-                spent_key = f"utxo:{inp['txid']}:{inp.get('utxo_index', 0)}".encode()
-                spent_key_str = spent_key.decode()
-                
-                # Check if this UTXO was already spent in this block
-                if spent_key_str in spent_in_block:
-                    raise ValueError(f"Double spend detected: UTXO {spent_key_str} already spent in this block")
-                
-                utxo_raw = db.get(spent_key)
-                if not utxo_raw:
-                    raise ValueError(f"Missing UTXO for input: {spent_key}")
-                utxo = json.loads(utxo_raw.decode())
-
-                if utxo["spent"]:
-                    raise ValueError(f"UTXO {spent_key} already spent")
-                if utxo["receiver"] != from_:
-                    raise ValueError(f"UTXO {spent_key} not owned by sender {from_}")
-
-                total_available += Decimal(utxo["amount"])
-                # Mark as spent in this block
-                spent_in_block.add(spent_key_str)
-
-            total_to_recipient = Decimal("0")
-            total_change = Decimal("0")
+        # Mark spent UTXOs
+        for inp in inputs:
+            if "txid" not in inp and "prev_txid" not in inp:
+                continue
+            # Handle both formats
+            inp_txid = inp.get('txid') or inp.get('prev_txid')
+            inp_index = inp.get('utxo_index', inp.get('prev_index', 0))
             
-            for out in outputs:
-                recv = out.get("receiver")
-                amt = Decimal(out.get("amount", "0"))
-                print(out)
-                print("receiver:")
-                print(recv)
-                print("to:")
-                print(to_)
-                print(ADMIN_ADDRESS)
-                if recv == to_:
-                    total_to_recipient += amt
-                elif recv == from_:
-                    total_change += amt
-                elif recv == ADMIN_ADDRESS:
-                    # This is fee to admin
-                    total_required += amt
-                else:
-                    raise ValueError(
-                        f"Hack detected: unauthorized output to {recv} in tx {txid}")
-                total_required += amt
+            spent_key = f"utxo:{inp_txid}:{inp_index}".encode()
+            if spent_key in db:
+                utxo_rec = json.loads(db.get(spent_key).decode())
+                utxo_rec["spent"] = True
+                batch.put(spent_key, json.dumps(utxo_rec).encode())
 
-            miner_fee = (Decimal(total_authorized) * Decimal("0.001")).quantize(
-                Decimal("0.00000001"), rounding=ROUND_DOWN)
-            grand_total_required = Decimal(total_authorized) + miner_fee
+        # Create new UTXOs
+        for out in outputs:
+            # Create proper UTXO record with all necessary fields
+            utxo_record = {
+                "txid": txid,
+                "utxo_index": out.get('utxo_index', 0),
+                "sender": out.get('sender', ''),
+                "receiver": out.get('receiver', ''),
+                "amount": str(out.get('amount', '0')),  # Ensure string to avoid scientific notation
+                "spent": False  # New UTXOs are always unspent
+            }
+            out_key = f"utxo:{txid}:{out.get('utxo_index', 0)}".encode()
+            batch.put(out_key, json.dumps(utxo_record).encode())
 
-            if height > 1 and grand_total_required > total_available:
-                raise ValueError(
-                    f"Invalid tx {txid}: balance {total_available} < required {grand_total_required}")
-            
-            # Fix 3: Enforce exact payment amount to recipient
-            if height > 1 and total_to_recipient != Decimal(total_authorized):
-                raise ValueError(
-                    f"Invalid tx {txid}: authorized amount {total_authorized} != amount sent to recipient {total_to_recipient}")
-
-            if height != 1 and not verify_transaction(msg_str, signature, pubkey):
-                raise ValueError(f"Signature check failed for tx {txid}")
-            
-            # Calculate the actual transaction fee for this transaction
-            if height > 1:
-                tx_fee = total_available - (total_to_recipient + total_change)
-                total_fees += tx_fee
-
-            batch.put(f"tx:{txid}".encode(), json.dumps(tx).encode())
-
-            for inp in inputs:
-                if "txid" not in inp:
-                    continue
-                spent_key = f"utxo:{inp['txid']}:{inp.get('utxo_index', 0)}".encode()
-                if spent_key in db:
-                    utxo_rec = json.loads(db.get(spent_key).decode())
-                    utxo_rec["spent"] = True
-                    batch.put(spent_key, json.dumps(utxo_rec).encode())
-
-  
-            for out in outputs:
-                # Create proper UTXO record with all necessary fields
-                utxo_record = {
-                    "txid": txid,
-                    "utxo_index": out.get('utxo_index', 0),
-                    "sender": out.get('sender', ''),
-                    "receiver": out.get('receiver', ''),
-                    "amount": str(out.get('amount', '0')),  # Ensure string to avoid scientific notation
-                    "spent": False  # New UTXOs are always unspent
-                }
-                out_key = f"utxo:{txid}:{out.get('utxo_index', 0)}".encode()
-                batch.put(out_key, json.dumps(utxo_record).encode())
-
-    # Fix 1: Validate coinbase amount after all fees are calculated
+    # Store coinbase transaction and outputs
     if coinbase_data is not None:
-        # Define block reward schedule
-        # Bitcoin-like halving schedule: 50 BTC initially, halving every 210,000 blocks
-        halvings = height // 210000
-        if halvings >= 64:
-            block_subsidy = Decimal("0")
-        else:
-            block_subsidy = Decimal("50") / (2 ** halvings) * Decimal("100000000")  # In satoshis
-        
-        # Maximum allowed coinbase output
-        max_coinbase_amount = block_subsidy + total_fees
-        
-        logging.info(f"[SYNC] Validating coinbase: total={coinbase_data['total']}, subsidy={block_subsidy}, fees={total_fees}, max_allowed={max_coinbase_amount}")
-        
-        if coinbase_data['total'] > max_coinbase_amount:
-            raise ValueError(
-                f"Invalid coinbase amount at height {height}: {coinbase_data['total']} > allowed {max_coinbase_amount} (subsidy={block_subsidy} + fees={total_fees})")
-        
-        # Now that coinbase is validated, store it
         batch.put(f"tx:{coinbase_data['tx_id']}".encode(), json.dumps(coinbase_data['tx']).encode())
         for output_key, utxo in coinbase_data['outputs']:
             batch.put(output_key, json.dumps(utxo).encode())
@@ -372,11 +417,31 @@ def _process_block_in_chain(block: dict):
     db.write(batch)
     logging.info("[SYNC] Stored block %s (height %s) successfully", block_hash, height)
     
+    # Update the height index
+    height_index = get_height_index()
+    height_index.add_block_to_index(height, block_hash)
+    
+    # Invalidate height cache since we added a new block
+    invalidate_height_cache()
+    
     # Remove transactions from mempool
     # Skip the first tx_id as it's the coinbase transaction
     
     # Remove confirmed transactions using mempool manager
-    confirmed_txids = tx_ids[1:]  # Skip coinbase (first transaction)
+    logging.info(f"[SYNC] Block has tx_ids: {tx_ids}")
+    
+    # If tx_ids is empty but we have full_transactions, extract tx_ids from them
+    if not tx_ids and full_transactions:
+        tx_ids = []
+        for tx in full_transactions:
+            if tx and "txid" in tx:
+                tx_ids.append(tx["txid"])
+            elif tx and validator._is_coinbase_transaction(tx):
+                # Coinbase should have txid, if not it's an error
+                logging.error(f"[SYNC] Coinbase transaction missing txid in block {height}")
+        logging.info(f"[SYNC] Extracted tx_ids from full_transactions: {tx_ids}")
+    
+    confirmed_txids = tx_ids[1:] if len(tx_ids) > 1 else []  # Skip coinbase (first transaction)
     
     # Track which transactions were actually in our mempool before removal
     confirmed_from_mempool = []

@@ -47,9 +47,14 @@ The cryptographic layer is modular, allowing ML-DSA to be replaced with other po
 | Blockchain Logic  | <-----> | Protobuf Structures  |
 | - Merkle Root     |         | - Blocks, Txns       |
 | - UTXO State      |         +----------------------+
-| - Chain Manager   |
-+-------------------+
-         |
+| - Chain Manager   |                 |
++-------------------+                 v
+         |                   +----------------------+
+         |                   | Mempool Manager      |
+         |                   | - Conflict Detection |
+         |                   | - Fee Prioritization |
+         |                   | - Size Limits        |
+         |                   +----------------------+
          v
 +----------------------+       +----------------------+
 | Local DB (RocksDB)   | <---> | Event Bus System     |
@@ -147,45 +152,129 @@ This starts a node with custom DHT and gossip ports while connecting to the defa
 
 ## 🐳 Docker Usage
 
-The project includes several Docker Compose configurations for different deployment scenarios:
+The project includes three Docker Compose configurations for different deployment scenarios. Note that there is no default `docker-compose.yml` file - you must specify which configuration to use.
 
-### Development/Testing Environment
+### Available Configurations
+
+- **docker-compose.test.yml** - Development/testing environment with 3 nodes
+- **docker-compose.bootstrap.yml** - Production bootstrap server with monitoring
+- **docker-compose.validator.yml** - Production validator node that connects to mainnet
+
+For detailed deployment instructions, see [DEPLOYMENT.md](./DEPLOYMENT.md).
+
+### Quick Start: Test Network (3 Nodes)
+
+Perfect for development and testing:
 
 ```bash
 # Start a test network with 1 bootstrap node and 2 validators
-docker compose up -d
+docker compose -f docker-compose.test.yml up -d
 
 # View logs
-docker compose logs -f
+docker compose -f docker-compose.test.yml logs -f
+
+# Access services:
+# - Bootstrap API: http://localhost:8080 (via nginx load balancer)
+# - Validator1 API: http://localhost:8081
+# - Validator2 API: http://localhost:8082
+# - Grafana: http://localhost:3000 (admin/admin123)
+# - Prometheus: http://localhost:9090
+# - RPC ports: 8332 (bootstrap), 8333 (validator1), 8334 (validator2)
 
 # Stop the network
-docker compose down
+docker compose -f docker-compose.test.yml down
 
 # Stop and remove all data
-docker compose down --volumes
+docker compose -f docker-compose.test.yml down --volumes
 ```
-
-### Key Docker Features:
-- **Automatic wallet generation** with secure passwords
-- **Redis** for caching and rate limiting
-- **Prometheus** metrics collection (http://localhost:9090)
-- **Grafana** dashboards for monitoring (http://localhost:3000)
-- **Persistent storage** using Docker volumes
-- **Automatic peer discovery** between containers
 
 ### Production Bootstrap Server
 
+Run a bootstrap server that other nodes can connect to:
+
 ```bash
-# Start a production bootstrap server
+# Set required environment variables
+export BOOTSTRAP_WALLET_PASSWORD=your-secure-password
+export ADMIN_ADDRESS=your-admin-address
+export GRAFANA_ADMIN_USER=admin
+export GRAFANA_ADMIN_PASSWORD=secure-password
+export GRAFANA_DOMAIN=your-domain.com
+
+# Generate SSL certificates (or provide your own)
+mkdir -p ./monitoring/nginx/ssl
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout ./monitoring/nginx/ssl/server.key \
+  -out ./monitoring/nginx/ssl/server.crt \
+  -subj "/C=US/ST=State/L=City/O=Organization/CN=your-domain.com"
+
+# Start bootstrap server
 docker compose -f docker-compose.bootstrap.yml up -d
+
+# View logs
+docker compose -f docker-compose.bootstrap.yml logs -f bootstrap
+
+# Access services:
+# - API: https://localhost:8080 (SSL via nginx)
+# - Grafana: https://localhost:443 (public read-only access)
+# - RPC: localhost:8332
+# - DHT: localhost:8001/udp
+# - Gossip: localhost:8002/tcp
 ```
 
-### Production Validator
+### Production Validator Node
+
+Connect to the mainnet as a validator:
 
 ```bash
-# Start a production validator node
+# Set required environment variables
+export VALIDATOR_WALLET_PASSWORD=your-secure-password
+export ADMIN_ADDRESS=your-admin-address
+export GRAFANA_ADMIN_USER=admin
+export GRAFANA_ADMIN_PASSWORD=secure-password
+export GRAFANA_DOMAIN=your-domain.com
+
+# Generate SSL certificates (same as bootstrap)
+mkdir -p ./monitoring/nginx/ssl
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout ./monitoring/nginx/ssl/server.key \
+  -out ./monitoring/nginx/ssl/server.crt \
+  -subj "/C=US/ST=State/L=City/O=Organization/CN=your-domain.com"
+
+# Connect to default mainnet (api.bitcoinqs.org)
 docker compose -f docker-compose.validator.yml up -d
+
+# OR connect to custom bootstrap server
+BOOTSTRAP_SERVER=your.bootstrap.server BOOTSTRAP_PORT=8001 \
+  docker compose -f docker-compose.validator.yml up -d
+
+# View logs
+docker compose -f docker-compose.validator.yml logs -f validator
+
+# Access services (same ports as bootstrap):
+# - API: https://localhost:8080 (SSL via nginx)
+# - Grafana: https://localhost:443 (public read-only access)
+# - RPC: localhost:8332
 ```
+
+### Key Docker Features
+
+All configurations include:
+- **Automatic wallet generation** with secure passwords
+- **Redis** for caching and rate limiting
+- **Prometheus** metrics collection
+- **Grafana** dashboards for monitoring
+- **Persistent storage** using Docker volumes
+- **Automatic peer discovery** between containers
+- **Health checks** for all services
+- **Resource limits** to prevent runaway processes
+- **Security hardening** (no-new-privileges, read-only filesystems where possible)
+
+Production configurations additionally include:
+- **SSL/TLS encryption** via nginx
+- **DDoS protection** and attack detection
+- **Rate limiting** on API endpoints
+- **Public read-only Grafana dashboards**
+- **Enhanced security logging**
 
 ---
 
@@ -195,12 +284,13 @@ You can simulate multiple validators by launching separate containers or Python 
 
 ### Docker Multi-Node Network
 
-The default `docker-compose.yml` creates:
-- 1 Bootstrap node (port 8080)
+The test network (`docker-compose.test.yml`) creates:
+- 1 Bootstrap node (internal port 8080, accessed via nginx on 8080)
 - 2 Validator nodes (ports 8081, 8082)
 - Prometheus monitoring (port 9090)
 - Grafana dashboards (port 3000)
-- Redis cache
+- Redis cache (with 3 databases for separate node caching)
+- Nginx reverse proxy (port 8080 for load-balanced API access)
 
 All nodes automatically discover each other and maintain peer connections.
 
@@ -222,6 +312,7 @@ All nodes automatically discover each other and maintain peer connections.
 | `monitoring/`       | Health checks and Prometheus metrics             |
 | `events/`           | Event bus for internal communication             |
 | `security/`         | Rate limiting and DDoS protection                |
+| `mempool/`          | Transaction pool with conflict detection         |
 
 ---
 

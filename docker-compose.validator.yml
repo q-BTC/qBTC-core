@@ -11,7 +11,7 @@ services:
       DISABLE_NAT_TRAVERSAL: "false"
       ROCKSDB_PATH: "/app/db"
       # Production security configuration
-      RATE_LIMIT_ENABLED: "true"
+      RATE_LIMIT_ENABLED: "false"
       DDOS_PROTECTION_ENABLED: "true"
       ADMIN_ADDRESS: ${ADMIN_ADDRESS}
       ATTACK_PATTERN_DETECTION: "true"
@@ -24,11 +24,13 @@ services:
       # Rate limits (requests per minute)
       RATE_LIMIT_WORKER: "10"
       RATE_LIMIT_BALANCE: "100"
-      RATE_LIMIT_TRANSACTIONS: "50"
+      RATE_LIMIT_TRANSACTIONS: "100"
+      RATE_LIMIT_HEALTH: "100"
+      RATE_LIMIT_UTXOS: "100"
       RATE_LIMIT_DEFAULT: "60"
-    command: ["--bootstrap_server", "api.bitcoinqs.org", "--bootstrap_port", "8001", "--dht-port", "8001", "--gossip-port", "8002"]
+    command: ["--bootstrap_server", "${BOOTSTRAP_SERVER:-api.bitcoinqs.org}", "--bootstrap_port", "${BOOTSTRAP_PORT:-8001}", "--dht-port", "8001", "--gossip-port", "8002"]
     ports:
-      - "8080:8080"     # Web API
+      # Remove 8080 from here since nginx will handle it
       - "8332:8332"     # RPC
       - "8001:8001/udp" # DHT UDP
       - "8002:8002"     # Gossip TCP
@@ -45,7 +47,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '2.0'
+          cpus: '1.0'
           memory: 2G
         reservations:
           cpus: '0.5'
@@ -77,8 +79,6 @@ services:
   prometheus:
     image: prom/prometheus:latest
     container_name: qbtc-prometheus-validator
-    ports:
-      - "9090:9090"
     volumes:
       - ./monitoring/prometheus-validator.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
@@ -87,32 +87,90 @@ services:
       - '--storage.tsdb.path=/prometheus'
       - '--storage.tsdb.retention.time=720h'  # 30 days retention
       - '--web.enable-lifecycle'
+      - '--web.listen-address=:9090'
     networks:
       - qbtc-network
     restart: unless-stopped
     depends_on:
       - validator
 
-  # Grafana for visualization
+  # Grafana for visualization - PUBLIC ACCESS
   grafana:
     image: grafana/grafana:latest
     container_name: qbtc-grafana-validator
-    ports:
-      - "3000:3000"
     environment:
-      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin123}
+      # Admin settings (for backend access only)
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
+
+      # Enable anonymous access - FIXED ORG NAME
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_NAME=Main Org.
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+
+      # Disable sign ups but keep login form for admin
       - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_USERS_ALLOW_ORG_CREATE=false
+      - GF_AUTH_DISABLE_LOGIN_FORM=false
+      - GF_AUTH_DISABLE_SIGNOUT_MENU=true
+
+      # Security settings
+      - GF_SECURITY_DISABLE_GRAVATAR=true
+      - GF_SECURITY_COOKIE_SECURE=true
+      - GF_SECURITY_STRICT_TRANSPORT_SECURITY=true
+      - GF_SECURITY_STRICT_TRANSPORT_SECURITY_MAX_AGE_SECONDS=86400
+      - GF_SECURITY_STRICT_TRANSPORT_SECURITY_PRELOAD=true
+      - GF_SECURITY_STRICT_TRANSPORT_SECURITY_SUBDOMAINS=true
+      - GF_SECURITY_X_CONTENT_TYPE_OPTIONS=true
+      - GF_SECURITY_X_XSS_PROTECTION=true
+      - GF_SECURITY_CONTENT_SECURITY_POLICY=true
+
+      # Server settings
+      - GF_SERVER_ROOT_URL=https://${GRAFANA_DOMAIN}/
+      - GF_SERVER_ENABLE_GZIP=true
+
+      # Dashboard settings
       - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/qbtc-overview.json
+
+      # Disable editing for viewers
+      - GF_USERS_DEFAULT_PERMISSIONS=Viewer
+      - GF_USERS_VIEWERS_CAN_EDIT=false
+      - GF_EXPLORE_ENABLED=false
+      
+      # Performance and chunk loading fixes
+      - GF_DATAPROXY_TIMEOUT=300
+      - GF_DATAPROXY_KEEP_ALIVE_SECONDS=300
+      - GF_RENDERING_CONCURRENT_RENDER_REQUEST_LIMIT=10
     volumes:
       - grafana-data:/var/lib/grafana
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./monitoring/grafana/custom.ini:/etc/grafana/grafana.ini:ro
     networks:
       - qbtc-network
     restart: unless-stopped
     depends_on:
       - prometheus
+
+  # Nginx reverse proxy - Serves API on 8080 and Grafana on 443
+  nginx:
+    image: nginx:alpine
+    container_name: qbtc-nginx-validator
+    ports:
+      - "443:443"      # Grafana (public dashboard)
+      - "80:80"        # HTTP redirect to HTTPS
+      - "8080:8080"    # API/WebSocket with SSL
+    volumes:
+      - ./monitoring/nginx/nginx-validator.conf:/etc/nginx/nginx.conf:ro
+      - ./monitoring/nginx/ssl:/etc/nginx/ssl:ro
+    networks:
+      - qbtc-network
+    restart: unless-stopped
+    depends_on:
+      - grafana
+      - validator
+    security_opt:
+      - no-new-privileges:true
 
 volumes:
   validator-data:

@@ -24,7 +24,9 @@
         # Rate limits (requests per minute)
         RATE_LIMIT_WORKER: "10"
         RATE_LIMIT_BALANCE: "100"
-        RATE_LIMIT_TRANSACTIONS: "50"
+        RATE_LIMIT_TRANSACTIONS: "100"
+        RATE_LIMIT_HEALTH: "100"
+        RATE_LIMIT_UTXOS: "100"
         RATE_LIMIT_DEFAULT: "60"
       command: ["--bootstrap", "--dht-port", "8001", "--gossip-port", "8002"]
       ports:
@@ -45,7 +47,7 @@
       deploy:
         resources:
           limits:
-            cpus: '2.0'
+            cpus: '0.8'
             memory: 2G
           reservations:
             cpus: '0.5'
@@ -134,10 +136,16 @@
         - GF_USERS_DEFAULT_PERMISSIONS=Viewer
         - GF_USERS_VIEWERS_CAN_EDIT=false
         - GF_EXPLORE_ENABLED=false
+        
+        # Performance and chunk loading fixes
+        - GF_DATAPROXY_TIMEOUT=300
+        - GF_DATAPROXY_KEEP_ALIVE_SECONDS=300
+        - GF_RENDERING_CONCURRENT_RENDER_REQUEST_LIMIT=10
       volumes:
         - grafana-data:/var/lib/grafana
         - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
         - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+        - ./monitoring/grafana/custom.ini:/etc/grafana/grafana.ini:ro
       networks:
         - qbtc-network
       restart: unless-stopped

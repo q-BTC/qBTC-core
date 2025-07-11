@@ -1,226 +1,335 @@
 # qBTC Deployment Guide
 
-This guide covers different deployment scenarios for qBTC nodes with monitoring.
+This guide covers different deployment scenarios for qBTC nodes.
+
+## Overview
+
+qBTC-core provides three Docker Compose configurations for different deployment scenarios:
+
+1. **docker-compose.test.yml** - Local development/testing with 3 nodes
+2. **docker-compose.bootstrap.yml** - Production bootstrap server with monitoring
+3. **docker-compose.validator.yml** - Production validator node that connects to mainnet
+
+## Prerequisites
+
+- Docker and Docker Compose installed
+- Python 3.8+ (for wallet generation)
+- Git
 
 ## Quick Start
 
-### Option 1: Interactive Setup (Recommended)
+### 1. Clone the Repository
+
 ```bash
-./scripts/wallet-setup.sh
-```
-This script will:
-- Help you create a new wallet or use an existing one
-- Choose between mainnet connection or local bootstrap
-- Configure all necessary environment variables
-- Optionally start the services
-
-### Option 2: Manual Setup
-
-#### Connect to Mainnet
-```bash
-# Create wallet (if needed)
-./scripts/create-wallet-docker.sh
-
-# Set environment variables
-export WALLET_PATH=./wallet.json
-export WALLET_PASSWORD=your-password
-export GRAFANA_ADMIN_PASSWORD=admin-password
-
-# Start services
-docker-compose -f docker-compose.mainnet.yml up -d
+git clone https://github.com/q-btc/qBTC-core.git
+cd qBTC-core
 ```
 
-#### Run Bootstrap Server
-```bash
-# Use the production setup for bootstrap server
-sudo bash monitoring/setup-production.sh
-```
+### 2. Generate a Wallet
 
-## Deployment Options
+Before starting any node, you need a wallet:
 
-### 1. Mainnet Node (docker-compose.mainnet.yml)
-
-Connects to the existing qBTC network at api.bitcoinqs.org.
-
-**Features:**
-- Connects to mainnet bootstrap at api.bitcoinqs.org:8001
-- Local monitoring with Prometheus and Grafana
-- Configurable ports via environment variables
-- System metrics collection
-
-**Default Ports:**
-- API: 8080
-- RPC: 8332
-- Gossip: 7002
-- DHT: 8001
-- Grafana: 3000
-- Prometheus: 9091
-
-**Environment Variables:**
-```bash
-# Required
-WALLET_PATH=./wallet.json
-WALLET_PASSWORD=your-password
-
-# Optional (with defaults)
-API_PORT=8080
-RPC_PORT=8332
-GOSSIP_PORT=7002
-DHT_PORT=8001
-GRAFANA_PORT=3000
-PROMETHEUS_PORT=9091
-NODE_EXPORTER_PORT=9100
-GRAFANA_ADMIN_PASSWORD=admin
-```
-
-### 2. Bootstrap Server (docker-compose.production.yml)
-
-Runs a bootstrap server with public Grafana dashboards.
-
-**Features:**
-- SSL/TLS with Let's Encrypt
-- Public read-only Grafana dashboards
-- Nginx reverse proxy
-- Security hardened
-- Automatic certificate renewal
-
-**Requirements:**
-- Domain name
-- Ports 80, 443 open
-
-## Wallet Management
-
-### Create New Wallet
-
-**Option 1: Using Docker (Recommended)**
-```bash
-./scripts/create-wallet-docker.sh
-```
-
-**Option 2: Using Python directly**
 ```bash
 python3 wallet/wallet.py
 ```
 
-### Use Existing Wallet
+This creates a `wallet.json` file with your ML-DSA keypair. Keep it safe!
 
-Set the `WALLET_PATH` environment variable to your wallet location:
+## Deployment Scenarios
+
+### Scenario 1: Local Test Network (3 Nodes)
+
+Perfect for development and testing. Creates a complete network with:
+- 1 Bootstrap node
+- 2 Validator nodes
+- Full monitoring stack (Prometheus + Grafana)
+- Redis for caching
+- Nginx load balancer
+
 ```bash
-export WALLET_PATH=/path/to/your/wallet.json
+# Start the test network
+docker compose -f docker-compose.test.yml up -d
+
+# View logs
+docker compose -f docker-compose.test.yml logs -f
+
+# Access services:
+# - Bootstrap API: http://localhost:8080 (via nginx)
+# - Validator1 API: http://localhost:8081
+# - Validator2 API: http://localhost:8082
+# - Grafana: http://localhost:3000 (admin/admin123)
+# - Prometheus: http://localhost:9090
+# - RPC ports: 8332, 8333, 8334
+
+# Stop the network
+docker compose -f docker-compose.test.yml down
+
+# Clean up all data
+docker compose -f docker-compose.test.yml down --volumes
 ```
 
-## Monitoring Access
+### Scenario 2: Production Bootstrap Server
 
-### Mainnet Deployment
-- Grafana: http://localhost:3000
-- Prometheus: http://localhost:9091
-- Default login: admin / [your-password]
+Run a bootstrap server that other nodes can connect to:
 
-### Production Bootstrap
-- Grafana: https://your-domain.com/grafana/ (public read-only)
-- Admin login: admin / [your-password]
-
-## Common Commands
-
-### View Logs
 ```bash
-# Mainnet node
-docker-compose -f docker-compose.mainnet.yml logs -f
+# Set required environment variables
+export BOOTSTRAP_WALLET_PASSWORD=your-secure-password
+export ADMIN_ADDRESS=your-admin-address
+export GRAFANA_ADMIN_USER=admin
+export GRAFANA_ADMIN_PASSWORD=secure-password
+export GRAFANA_DOMAIN=your-domain.com
 
-# Production bootstrap
-docker-compose -f docker-compose.production.yml logs -f
+# Generate SSL certificates (or provide your own)
+mkdir -p ./monitoring/nginx/ssl
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout ./monitoring/nginx/ssl/server.key \
+  -out ./monitoring/nginx/ssl/server.crt \
+  -subj "/C=US/ST=State/L=City/O=Organization/CN=your-domain.com"
+
+# Start bootstrap server
+docker compose -f docker-compose.bootstrap.yml up -d
+
+# View logs
+docker compose -f docker-compose.bootstrap.yml logs -f bootstrap
+
+# Access services:
+# - API: https://localhost:8080 (SSL)
+# - Grafana: https://localhost:443 (public read-only)
+# - RPC: localhost:8332
+# - DHT: localhost:8001/udp
+# - Gossip: localhost:8002/tcp
 ```
 
-### Stop Services
-```bash
-# Mainnet node
-docker-compose -f docker-compose.mainnet.yml down
+### Scenario 3: Production Validator Node
 
-# Production bootstrap
-docker-compose -f docker-compose.production.yml down
+Connect to the mainnet as a validator:
+
+```bash
+# Set required environment variables
+export VALIDATOR_WALLET_PASSWORD=your-secure-password
+export ADMIN_ADDRESS=your-admin-address
+export GRAFANA_ADMIN_USER=admin
+export GRAFANA_ADMIN_PASSWORD=secure-password
+export GRAFANA_DOMAIN=your-domain.com
+
+# Generate SSL certificates (same as bootstrap)
+mkdir -p ./monitoring/nginx/ssl
+# ... (same SSL generation command as above)
+
+# Connect to default mainnet (api.bitcoinqs.org)
+docker compose -f docker-compose.validator.yml up -d
+
+# OR connect to custom bootstrap server
+BOOTSTRAP_SERVER=your.bootstrap.server BOOTSTRAP_PORT=8001 \
+  docker compose -f docker-compose.validator.yml up -d
+
+# View logs
+docker compose -f docker-compose.validator.yml logs -f validator
+
+# Access services (same as bootstrap):
+# - API: https://localhost:8080 (SSL)
+# - Grafana: https://localhost:443 (public read-only)
+# - RPC: localhost:8332
 ```
 
-### Update Services
-```bash
-# Pull latest images
-docker-compose -f docker-compose.mainnet.yml pull
+## Configuration Options
 
-# Recreate containers
-docker-compose -f docker-compose.mainnet.yml up -d --force-recreate
+### Environment Variables
+
+#### Common Variables
+- `WALLET_PASSWORD` - Password for the wallet file (required)
+- `WALLET_FILE` - Wallet filename (default: varies by node type)
+- `ADMIN_ADDRESS` - Admin address for security features
+- `USE_REDIS` - Enable Redis caching (default: true)
+
+#### Security Configuration
+- `RATE_LIMIT_ENABLED` - Enable rate limiting (default: false)
+- `DDOS_PROTECTION_ENABLED` - Enable DDoS protection (default: true for production)
+- `ATTACK_PATTERN_DETECTION` - Detect attack patterns (default: true for production)
+- `BOT_DETECTION_ENABLED` - Detect bots (default: true for production)
+- `PEER_REPUTATION_ENABLED` - Track peer reputation (default: true)
+- `SECURITY_LOGGING_ENABLED` - Enable security logging (default: true)
+
+#### Monitoring Configuration
+- `GRAFANA_ADMIN_USER` - Grafana admin username (default: admin)
+- `GRAFANA_ADMIN_PASSWORD` - Grafana admin password (required for production)
+- `GRAFANA_DOMAIN` - Domain for Grafana (required for production)
+
+### CLI Arguments
+
+When running without Docker, use these arguments:
+
+```bash
+# Bootstrap server
+python3 main.py --bootstrap --dht-port 8001 --gossip-port 8002
+
+# Validator connecting to mainnet
+python3 main.py --bootstrap_server api.bitcoinqs.org --bootstrap_port 8001
+
+# Validator with custom ports
+python3 main.py --bootstrap_server api.bitcoinqs.org --bootstrap_port 8001 \
+  --dht-port 8003 --gossip-port 8004
+
+# With external IP for NAT traversal
+python3 main.py --external-ip YOUR_PUBLIC_IP
 ```
 
-### Backup Data
+## Monitoring
+
+### Grafana Dashboards
+
+All deployments include pre-configured Grafana dashboards:
+- **Network Overview** - Peer connections, blockchain height, sync status
+- **Performance Metrics** - CPU, memory, disk usage
+- **Transaction Flow** - Mempool size, transaction throughput
+- **Security Events** - Attack detection, rate limiting
+
+### Prometheus Metrics
+
+Key metrics exposed:
+- `qbtc_connected_peers_total` - Number of connected peers
+- `qbtc_blockchain_height` - Current blockchain height
+- `qbtc_pending_transactions` - Mempool size
+- `qbtc_health_check_status` - Component health status
+
+## Mining
+
+To mine blocks to your node:
+
+```bash
+# Connect to any node's RPC port
+docker run --rm -it cpuminer-opt \
+  -a sha256d \
+  -o http://localhost:8332 \
+  -u test -p x \
+  --coinbase-addr=YOUR_QBTC_ADDRESS
+```
+
+## Maintenance
+
+### Backup
+
 ```bash
 # Backup blockchain data
-docker run --rm -v qbtc-mainnet-data:/data -v $(pwd):/backup alpine \
-  tar czf /backup/qbtc-data-backup.tar.gz -C /data .
+docker run --rm -v VOLUME_NAME:/data -v $(pwd):/backup alpine \
+  tar czf /backup/blockchain-backup.tar.gz -C /data .
 
-# Backup Prometheus data
-docker run --rm -v prometheus-mainnet-data:/data -v $(pwd):/backup alpine \
-  tar czf /backup/prometheus-backup.tar.gz -C /data .
+# Example for test network bootstrap node
+docker run --rm -v qbtc-core_bootstrap-data:/data -v $(pwd):/backup alpine \
+  tar czf /backup/bootstrap-backup.tar.gz -C /data .
+```
+
+### Update
+
+```bash
+# Pull latest changes
+git pull
+
+# Rebuild and restart
+docker compose -f docker-compose.SCENARIO.yml up -d --build
+```
+
+### View Logs
+
+```bash
+# All services
+docker compose -f docker-compose.SCENARIO.yml logs -f
+
+# Specific service
+docker compose -f docker-compose.SCENARIO.yml logs -f SERVICE_NAME
 ```
 
 ## Troubleshooting
 
 ### Connection Issues
-```bash
-# Check if node is syncing
-docker-compose -f docker-compose.mainnet.yml logs qbtc-node | grep -i "sync\|connect"
 
-# Test bootstrap connectivity
+1. Check if bootstrap is reachable:
+```bash
 curl http://api.bitcoinqs.org:8080/health
 ```
 
+2. Verify ports are open:
+```bash
+netstat -tuln | grep -E "8001|8002|8080|8332"
+```
+
+3. Check Docker network:
+```bash
+docker network ls
+docker network inspect qbtc-core_qbtc-network
+```
+
 ### Wallet Issues
-```bash
-# Verify wallet file is readable
-docker-compose -f docker-compose.mainnet.yml exec qbtc-node ls -la /data/wallet.json
 
-# Check wallet password in environment
-docker-compose -f docker-compose.mainnet.yml exec qbtc-node env | grep WALLET
+1. Verify wallet file exists:
+```bash
+ls -la wallet.json
 ```
 
-### Resource Usage
+2. Check wallet password in environment:
 ```bash
-# Check container resources
+docker compose -f docker-compose.SCENARIO.yml config | grep WALLET
+```
+
+### Performance Issues
+
+1. Check resource usage:
+```bash
 docker stats
-
-# View system metrics in Grafana
-# http://localhost:3000/d/qbtc-overview/
 ```
+
+2. View metrics in Grafana:
+- http://localhost:3000 (test network)
+- https://your-domain.com/grafana/ (production)
 
 ## Security Best Practices
 
 1. **Wallet Security**
-   - Keep wallet file backed up securely
    - Use strong passwords
-   - Don't commit wallet files to git
+   - Backup wallet files securely
+   - Never commit wallets to git
 
 2. **Network Security**
-   - Use firewall rules to limit access
-   - Enable SSL for production deployments
+   - Use firewalls to limit port access
+   - Enable SSL for production
    - Regularly update Docker images
 
 3. **Monitoring Security**
-   - Change default Grafana admin password
-   - Use read-only dashboards for public access
-   - Limit Prometheus access to localhost
+   - Change default Grafana passwords
+   - Use read-only access for public dashboards
+   - Limit Prometheus access
 
-## Mining Configuration
+## Advanced Configuration
 
-To mine blocks to your node:
+### Custom Network Configuration
+
+Create a `.env` file:
 ```bash
-# For mainnet node
-docker run --rm cpuminer-opt \
-  -a sha256d \
-  -o http://host.docker.internal:8332 \
-  -u test -p x \
-  --coinbase-addr=your-qbtc-address
+# Network settings
+BOOTSTRAP_SERVER=api.bitcoinqs.org
+BOOTSTRAP_PORT=8001
+DHT_PORT=8001
+GOSSIP_PORT=8002
 
-# For bootstrap server
-docker run --rm cpuminer-opt \
-  -a sha256d \
-  -o http://your-server:8332 \
-  -u test -p x \
-  --coinbase-addr=your-qbtc-address
+# Security settings
+RATE_LIMIT_ENABLED=true
+DDOS_PROTECTION_ENABLED=true
+
+# Resource limits
+CPU_LIMIT=2.0
+MEMORY_LIMIT=2G
 ```
+
+### Multi-Region Deployment
+
+For geo-distributed networks:
+1. Deploy bootstrap servers in multiple regions
+2. Use external IPs for NAT traversal
+3. Configure monitoring aggregation
+
+## Support
+
+- GitHub Issues: https://github.com/q-btc/qBTC-core/issues
+- Documentation: https://qb.tc/docs
+- Community: Discord/Telegram links

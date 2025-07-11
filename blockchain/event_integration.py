@@ -133,13 +133,18 @@ class EventEmittingDatabase:
                 logger.error(f"Error emitting event for transaction {txid}: {e}")
                 
         elif key_str.startswith('block:'):
-            # Block was stored
-            block_height = int(key_str[6:])
+            # Block was stored - key format is block:{hash}
+            block_hash = key_str[6:]
             try:
                 block_data = json.loads(value.decode())
-                asyncio.create_task(emit_block_event(block_height, block_data))
+                # Get block height from the block data
+                block_height = block_data.get('height')
+                if block_height is not None:
+                    asyncio.create_task(emit_block_event(block_height, block_data))
+                else:
+                    logger.error(f"Block {block_hash} missing height field")
             except Exception as e:
-                logger.error(f"Error emitting event for block {block_height}: {e}")
+                logger.error(f"Error emitting event for block {block_hash}: {e}")
                 
         elif key_str.startswith('utxo:'):
             # UTXO was stored/updated
@@ -176,13 +181,18 @@ def emit_database_event(key: bytes, value: bytes):
             logger.error(f"Error emitting event for transaction {txid}: {e}")
             
     elif key_str.startswith('block:'):
-        # Block was stored
-        block_height = int(key_str[6:])
+        # Block was stored - key format is block:{hash}
+        block_hash = key_str[6:]
         try:
             block_data = json.loads(value.decode())
-            asyncio.create_task(emit_block_event(block_height, block_data))
+            # Get block height from the block data
+            block_height = block_data.get('height')
+            if block_height is not None:
+                asyncio.create_task(emit_block_event(block_height, block_data))
+            else:
+                logger.error(f"Block {block_hash} missing height field")
         except Exception as e:
-            logger.error(f"Error emitting event for block {block_height}: {e}")
+            logger.error(f"Error emitting event for block {block_hash}: {e}")
             
     elif key_str.startswith('utxo:'):
         # UTXO was stored/updated

@@ -7,6 +7,7 @@ from config.config import DEFAULT_GOSSIP_PORT
 from state.state import mempool_manager
 from wallet.wallet import verify_transaction
 from database.database import get_db, get_current_height
+from blockchain.block_height_index import get_height_index
 from dht.dht import push_blocks
 from sync.sync import process_blocks_from_peer
 from network.peer_reputation import peer_reputation_manager
@@ -46,13 +47,14 @@ class GossipNode:
         self.server_task = None
         self.server = None
         self.partition_task = None
+        self.sync_task = None
         self.is_bootstrap = is_bootstrap
         self.is_full_node = is_full_node
         self.gossip_port = None  # Will be set when server starts
         self.synced_peers = set()
-        #if not is_bootstrap:
-            # Temporary workaround until DHT is fully debugged
-        #    self.dht_peers.add(('api.bitcoinqs.org', 7002))
+        self.bootstrap_peer = None
+        self.ip_to_peer = {}  # Track IP -> (port, validator_id, timestamp) mapping
+        self.peer_timestamps = {}  # Track (ip, port) -> timestamp
 
     async def start_server(self, host="0.0.0.0", port=DEFAULT_GOSSIP_PORT):
         self.gossip_port = port  # Store for NAT traversal
@@ -60,6 +62,8 @@ class GossipNode:
         self.server_task = asyncio.create_task(self.server.serve_forever())
         # Enable partition check to recover failed peers
         self.partition_task = asyncio.create_task(self.check_partition())
+        # Start periodic sync task
+        self.sync_task = asyncio.create_task(self.periodic_sync())
         logger.info(f"Gossip server started on {host}:{port}")
 
     async def handle_client(self, reader: StreamReader, writer: StreamWriter):
@@ -256,6 +260,22 @@ class GossipNode:
                 # Log first block structure for debugging
                 if blocks and len(blocks) > 0:
                     logger.info(f"First block keys: {list(blocks[0].keys())}")
+                
+                # Fix missing txid in transactions before processing
+                for block in blocks:
+                    if "full_transactions" in block and block["full_transactions"]:
+                        tx_ids = block.get("tx_ids", [])
+                        for i, tx in enumerate(block["full_transactions"]):
+                            if tx and "txid" not in tx:
+                                # Try to get txid from tx_ids array
+                                if i < len(tx_ids):
+                                    tx["txid"] = tx_ids[i]
+                                # Coinbase transactions should already have a txid from when they were mined
+                                elif tx.get("inputs") and len(tx["inputs"]) > 0 and tx["inputs"][0].get("txid") == "00" * 32:
+                                    logger.error(f"Coinbase transaction missing txid in block {block.get('height', 0)}")
+                                else:
+                                    logger.warning(f"Could not determine txid for transaction {i} in block {block.get('height', 'unknown')}")
+                
                 process_blocks_from_peer(blocks)
             else:
                 logger.warning("Received empty blocks_response")
@@ -282,39 +302,51 @@ class GossipNode:
 
             blocks = []
 
+            height_index = get_height_index()
+            
             for h in range(start_height, end_height + 1):
-                found_block = None
-
-                for key in db.keys():
-                    if key.startswith(b"block:"):
-                        block = json.loads(db[key].decode())
-
-                        if block.get("height") == h:
-                            # Check if block already has full_transactions
-                            if "full_transactions" not in block or not block["full_transactions"]:
-                                expanded_txs = []
-                                for txid in block.get("tx_ids", []):
-                                    tx_key = f"tx:{txid}".encode()
-                                    if tx_key in db:
-                                        tx_data = json.loads(db[tx_key].decode())
-                                        expanded_txs.append(tx_data)
-                                    else:
-                                        logger.warning(f"Transaction {txid} not found in DB for block at height {h}")
-
-                                cb_key = f"tx:coinbase_{h}".encode()
-                                if cb_key in db:
-                                    expanded_txs.append(json.loads(db[cb_key].decode()))
-
-                                block["full_transactions"] = expanded_txs
+                # Use the efficient height index
+                block = height_index.get_block_by_height(h)
+                
+                if block:
+                    # Check if block already has full_transactions
+                    if "full_transactions" not in block or not block["full_transactions"]:
+                        expanded_txs = []
+                        for txid in block.get("tx_ids", []):
+                            tx_key = f"tx:{txid}".encode()
+                            if tx_key in db:
+                                tx_data = json.loads(db[tx_key].decode())
+                                # Ensure txid is in the transaction data
+                                if "txid" not in tx_data:
+                                    tx_data["txid"] = txid
+                                expanded_txs.append(tx_data)
                             else:
-                                logger.info(f"Block at height {h} already has {len(block['full_transactions'])} full transactions")
-                            
-                            found_block = block
-                            break
+                                logger.warning(f"Transaction {txid} not found in DB for block at height {h}")
 
-                if found_block:
-                    blocks.append(found_block)
+                        # Skip legacy coinbase lookup - coinbase is already included in regular transactions
+                        # cb_key = f"tx:coinbase_{h}".encode()
+                        # if cb_key in db:
+                        #     cb_data = json.loads(db[cb_key].decode())
+                        #     # Ensure coinbase has txid
+                        #     if "txid" not in cb_data:
+                        #         cb_data["txid"] = f"coinbase_{h}"
+                        #     expanded_txs.append(cb_data)
 
+                        block["full_transactions"] = expanded_txs
+                    else:
+                        logger.info(f"Block at height {h} already has {len(block['full_transactions'])} full transactions")
+                    
+                    # Make a deep copy to avoid modifying the original
+                    import copy
+                    blocks.append(copy.deepcopy(block))
+
+            # Validate blocks before sending
+            for block in blocks:
+                if isinstance(block.get("height"), str) and len(block.get("height")) == 64:
+                    logger.error(f"CRITICAL: About to send block with hash in height field: {block}")
+                    # Skip this malformed block
+                    blocks = [b for b in blocks if b != block]
+            
             # Check if response is too large and needs chunking
             response = {"type": "blocks_response", "blocks": blocks}
             response_json = json.dumps(response)
@@ -518,8 +550,159 @@ class GossipNode:
             
             await asyncio.sleep(30)
 
+    async def periodic_sync(self):
+        """Periodically check and sync with all connected peers"""
+        await asyncio.sleep(10)  # Initial delay to let connections establish
+        
+        while True:
+            try:
+                all_peers = self.dht_peers | self.client_peers
+                if not all_peers:
+                    logger.debug("No peers available for periodic sync")
+                    await asyncio.sleep(60)
+                    continue
+                
+                # Get our current height
+                db = get_db()
+                local_height, local_tip = get_current_height(db)
+                logger.info(f"[PERIODIC_SYNC] Starting sync check - local height: {local_height}")
+                
+                # Check height of each peer
+                for peer in list(all_peers):
+                    try:
+                        reader, writer = await asyncio.wait_for(
+                            asyncio.open_connection(peer[0], peer[1]),
+                            timeout=5
+                        )
+                        
+                        # Request peer's height
+                        height_request = {"type": "get_height", "timestamp": int(time.time() * 1000)}
+                        writer.write((json.dumps(height_request) + "\n").encode('utf-8'))
+                        await writer.drain()
+                        
+                        # Read response
+                        response = await asyncio.wait_for(reader.readline(), timeout=5)
+                        if response:
+                            msg = json.loads(response.decode('utf-8').strip())
+                            if msg.get("type") == "height_response":
+                                peer_height = msg.get("height", -1)
+                                logger.info(f"[PERIODIC_SYNC] Peer {peer} height: {peer_height}, local: {local_height}")
+                                
+                                # If peer is ahead, request blocks
+                                if peer_height > local_height:
+                                    logger.info(f"[PERIODIC_SYNC] Peer {peer} is ahead by {peer_height - local_height} blocks, requesting sync")
+                                    blocks_request = {
+                                        "type": "get_blocks",
+                                        "start_height": local_height + 1,
+                                        "end_height": min(local_height + 100, peer_height),  # Request max 100 blocks at a time
+                                        "timestamp": int(time.time() * 1000)
+                                    }
+                                    writer.write((json.dumps(blocks_request) + "\n").encode('utf-8'))
+                                    await writer.drain()
+                                    
+                                    # Read blocks response
+                                    blocks_response = await asyncio.wait_for(reader.readline(), timeout=30)
+                                    if blocks_response:
+                                        blocks_msg = json.loads(blocks_response.decode('utf-8').strip())
+                                        if blocks_msg.get("type") == "blocks_response":
+                                            blocks = blocks_msg.get("blocks", [])
+                                            if blocks:
+                                                logger.info(f"[PERIODIC_SYNC] Received {len(blocks)} blocks from {peer}")
+                                                process_blocks_from_peer(blocks)
+                                
+                                # If we're ahead, push blocks to peer
+                                elif peer_height < local_height:
+                                    logger.info(f"[PERIODIC_SYNC] We're ahead of {peer} by {local_height - peer_height} blocks")
+                                    # Close this connection and use push_blocks
+                                    writer.close()
+                                    await writer.wait_closed()
+                                    await push_blocks(peer[0], peer[1])
+                                    continue
+                        
+                        writer.close()
+                        await writer.wait_closed()
+                        
+                    except Exception as e:
+                        logger.debug(f"[PERIODIC_SYNC] Error syncing with peer {peer}: {e}")
+                
+            except Exception as e:
+                logger.error(f"[PERIODIC_SYNC] Error in periodic sync: {e}", exc_info=True)
+            
+            # Check every 30 seconds
+            await asyncio.sleep(30)
+
     def add_peer(self, ip: str, port: int, peer_info=None):
         peer = (ip, port)
+        current_time = time.time()
+        
+        # Don't add ourselves as a peer - check using dynamic validator ID
+        if peer_info and 'validator_id' in peer_info:
+            if peer_info['validator_id'] == self.node_id:
+                logger.warning(f"Refusing to add self as peer (same validator ID): {ip}:{port}")
+                return
+        
+        # Also check port and common local IPs
+        if port == self.gossip_port:
+            # Check if it's potentially our own IP
+            import socket
+            try:
+                # Get our hostname and potential IPs
+                hostname = socket.gethostname()
+                local_ips = {'localhost', '127.0.0.1', '0.0.0.0', hostname}
+                
+                # Also check our external IP if available
+                if hasattr(self, '_external_ip'):
+                    local_ips.add(self._external_ip)
+                
+                # Check if external IP from NAT traversal matches
+                if hasattr(self, '_nat_external_ip'):
+                    if ip == self._nat_external_ip:
+                        logger.warning(f"Refusing to add self as peer (NAT external IP match): {ip}:{port}")
+                        return
+                
+                if ip in local_ips:
+                    logger.warning(f"Refusing to add self as peer: {ip}:{port}")
+                    return
+            except Exception as e:
+                logger.debug(f"Error checking self-connection: {e}")
+        
+        # Check if this IP already has a peer entry
+        if ip in self.ip_to_peer:
+            old_port, old_vid, old_timestamp = self.ip_to_peer[ip]
+            old_peer = (ip, old_port)
+            
+            # Extract validator_id from peer_info if available
+            new_vid = peer_info.get('validator_id', 'unknown') if peer_info else 'unknown'
+            
+            # Remove the old peer entry if it's different port or validator ID
+            if old_port != port or old_vid != new_vid:
+                # Keep the peer with the most recent timestamp
+                # If the old peer has a more recent timestamp, don't replace it
+                if old_timestamp > current_time:
+                    logger.info(f"Keeping existing peer {old_vid} on port {old_port} for IP {ip} (timestamp {old_timestamp} > {current_time})")
+                    return  # Don't add the new peer
+                
+                logger.warning(f"IP {ip} already has peer {old_vid} on port {old_port}, replacing with {new_vid} on port {port} (timestamp {current_time} > {old_timestamp})")
+                
+                # Remove old peer from all tracking structures
+                if old_peer in self.dht_peers:
+                    self.dht_peers.remove(old_peer)
+                if old_peer in self.synced_peers:
+                    self.synced_peers.remove(old_peer)
+                if old_peer in self.peer_info:
+                    del self.peer_info[old_peer]
+                if old_peer in self.failed_peers:
+                    del self.failed_peers[old_peer]
+                if old_peer in self.peer_timestamps:
+                    del self.peer_timestamps[old_peer]
+            else:
+                # Same peer, just update timestamp
+                logger.info(f"Updating timestamp for existing peer {ip}:{port}")
+        
+        # Update IP mapping with validator ID and timestamp
+        vid = peer_info.get('validator_id', 'unknown') if peer_info else 'unknown'
+        self.ip_to_peer[ip] = (port, vid, current_time)
+        self.peer_timestamps[peer] = current_time
         
         # Reset failure count if peer is being re-added
         if peer in self.failed_peers:
@@ -532,7 +715,7 @@ class GossipNode:
         
         if peer not in self.dht_peers:
             self.dht_peers.add(peer)
-            logger.info(f"Added DHT peer {peer} to validator list")
+            logger.info(f"Added DHT peer {peer} to validator list (validator_id: {vid})")
             if peer not in self.synced_peers:
                 self.synced_peers.add(peer)
                 asyncio.create_task(push_blocks(ip, port))
@@ -546,6 +729,15 @@ class GossipNode:
 
     def remove_peer(self, ip: str, port: int):
         peer = (ip, port)
+        
+        # Clean up IP mapping
+        if ip in self.ip_to_peer and self.ip_to_peer[ip][0] == port:
+            del self.ip_to_peer[ip]
+        
+        # Clean up timestamp
+        if peer in self.peer_timestamps:
+            del self.peer_timestamps[peer]
+        
         if peer in self.dht_peers:
             self.dht_peers.remove(peer)
             self.failed_peers.pop(peer, None)

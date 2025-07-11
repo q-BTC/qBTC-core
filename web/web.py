@@ -286,7 +286,7 @@ def get_balance(wallet_address: str) -> Decimal:
     return total
 
 def get_transactions(wallet_address: str, limit: int = 50):
-    logging.info(f"=== get_transactions called for wallet: {wallet_address} ===")
+    logging.debug(f"=== get_transactions called for wallet: {wallet_address} ===")
     db = get_db()
     tx_list = []
     transactions = {}
@@ -294,16 +294,16 @@ def get_transactions(wallet_address: str, limit: int = 50):
     matching_utxos = 0
     
     # Log all transaction entries in the database
-    logging.info("=== SCANNING ALL TRANSACTIONS IN DATABASE ===")
+    logging.debug("=== SCANNING ALL TRANSACTIONS IN DATABASE ===")
     tx_entries = []
     for key, value in db.items():
         if key.startswith(b"tx:"):
             tx_data = json.loads(value.decode('utf-8'))
             tx_entries.append((key.decode(), tx_data))
     
-    logging.info(f"Found {len(tx_entries)} transaction entries in database")
+    logging.debug(f"Found {len(tx_entries)} transaction entries in database")
     for tx_key, tx_data in tx_entries[:10]:  # Log first 10
-        logging.info(f"Transaction: {tx_key} -> {json.dumps(tx_data, default=str)}")
+        logging.debug(f"Transaction: {tx_key} -> {json.dumps(tx_data, default=str)}")
 
     for key, value in db.items():
         if not key.startswith(b"utxo:"):
@@ -316,7 +316,7 @@ def get_transactions(wallet_address: str, limit: int = 50):
         amount = Decimal(utxo["amount"])
         txid = utxo["txid"]
         
-        logging.info(f"UTXO {utxo_count}: key={key.decode()}, txid={txid}, sender={sender}, receiver={receiver}, amount={amount}")
+        logging.debug(f"UTXO {utxo_count}: key={key.decode()}, txid={txid}, sender={sender}, receiver={receiver}, amount={amount}")
 
         # Skip change transactions explicitly
         if sender == wallet_address and receiver == wallet_address:
@@ -383,11 +383,11 @@ def get_transactions(wallet_address: str, limit: int = 50):
             
             # Log genesis transaction detection
             if received_from_addr == "GENESIS":
-                logging.info(f"*** GENESIS TRANSACTION DETECTED ***")
-                logging.info(f"  txid: {txid}")
-                logging.info(f"  counterpart: {received_from_addr}")
-                logging.info(f"  amount: {data['received']}")
-                logging.info(f"  timestamp: {data['timestamp']}")
+                logging.debug(f"*** GENESIS TRANSACTION DETECTED ***")
+                logging.debug(f"  txid: {txid}")
+                logging.debug(f"  counterpart: {received_from_addr}")
+                logging.debug(f"  amount: {data['received']}")
+                logging.debug(f"  timestamp: {data['timestamp']}")
                 
             tx_list.append({
                 "txid": txid,
@@ -397,14 +397,14 @@ def get_transactions(wallet_address: str, limit: int = 50):
                 "timestamp": data["timestamp"]
             })
 
-    logging.info(f"Summary: Found {utxo_count} total UTXOs, {matching_utxos} involving wallet {wallet_address}")
-    logging.info(f"Grouped into {len(transactions)} unique transactions")
+    logging.debug(f"Summary: Found {utxo_count} total UTXOs, {matching_utxos} involving wallet {wallet_address}")
+    logging.debug(f"Grouped into {len(transactions)} unique transactions")
     
     # Add pending transactions from mempool
-    logging.info(f"Checking mempool for pending transactions...")
+    logging.debug(f"Checking mempool for pending transactions...")
     all_mempool_txs = mempool_manager.get_all_transactions()
-    logging.info(f"Current mempool size: {len(all_mempool_txs)}")
-    logging.info(f"Mempool transactions: {list(all_mempool_txs.keys())}")
+    logging.debug(f"Current mempool size: {len(all_mempool_txs)}")
+    logging.debug(f"Mempool transactions: {list(all_mempool_txs.keys())}")
     mempool_count = 0
     for txid, tx in all_mempool_txs.items():
         # Check if this transaction involves our wallet
@@ -443,14 +443,14 @@ def get_transactions(wallet_address: str, limit: int = 50):
                         "isPending": True
                     })
     
-    logging.info(f"Found {mempool_count} pending transactions in mempool for wallet {wallet_address}")
+    logging.debug(f"Found {mempool_count} pending transactions in mempool for wallet {wallet_address}")
     
     tx_list.sort(key=lambda x: x["timestamp"], reverse=True)
     
-    logging.info(f"Final transaction list has {len(tx_list)} entries")
-    logging.info("=== ALL TRANSACTIONS BEING RETURNED ===")
+    logging.debug(f"Final transaction list has {len(tx_list)} entries")
+    logging.debug("=== ALL TRANSACTIONS BEING RETURNED ===")
     for idx, tx in enumerate(tx_list):
-        logging.info(f"  Transaction {idx+1}: txid={tx['txid']}, direction={tx['direction']}, counterpart={tx['counterpart']}, amount={tx['amount']}, timestamp={tx['timestamp']}")
+        logging.debug(f"  Transaction {idx+1}: txid={tx['txid']}, direction={tx['direction']}, counterpart={tx['counterpart']}, amount={tx['amount']}, timestamp={tx['timestamp']}")
 
     return tx_list[:limit]
 
@@ -1141,9 +1141,9 @@ async def websocket_endpoint(websocket: WebSocket):
                             transactions = get_transactions(wallet_address)
                             
                             formatted = []
-                            logging.info(f"=== WEBSOCKET FORMATTING {len(transactions)} TRANSACTIONS ===")
+                            logging.debug(f"=== WEBSOCKET FORMATTING {len(transactions)} TRANSACTIONS ===")
                             for idx, tx in enumerate(transactions):
-                                logging.info(f"WebSocket TX {idx+1}: txid={tx['txid']}, direction={tx['direction']}, counterpart={tx['counterpart']}, timestamp={tx['timestamp']}")
+                                logging.debug(f"WebSocket TX {idx+1}: txid={tx['txid']}, direction={tx['direction']}, counterpart={tx['counterpart']}, timestamp={tx['timestamp']}")
                                 
                                 tx_type = "send" if tx["direction"] == "sent" else "receive"
                                 amt_dec = Decimal(tx["amount"])
@@ -1151,18 +1151,18 @@ async def websocket_endpoint(websocket: WebSocket):
                                 address = tx["counterpart"] if tx["counterpart"] else "n/a"
                                 
                                 # Check if this is a genesis transaction
-                                logging.info(f"  Checking genesis conditions:")
-                                logging.info(f"    - txid == 'genesis_tx'? {tx['txid'] == 'genesis_tx'}")
-                                logging.info(f"    - direction == 'received'? {tx['direction'] == 'received'}")
-                                logging.info(f"    - counterpart == 'GENESIS'? {tx['counterpart'] == 'GENESIS'}")
+                                logging.debug(f"  Checking genesis conditions:")
+                                logging.debug(f"    - txid == 'genesis_tx'? {tx['txid'] == 'genesis_tx'}")
+                                logging.debug(f"    - direction == 'received'? {tx['direction'] == 'received'}")
+                                logging.debug(f"    - counterpart == 'GENESIS'? {tx['counterpart'] == 'GENESIS'}")
                                 
                                 # Check if this is a genesis transaction by looking at the counterpart or txid
                                 if tx["txid"] == "genesis_tx" or tx["counterpart"] == "bqs1genesis00000000000000000000000000000000":
                                     timestamp_str = "Genesis Block"
-                                    logging.info(f"  *** GENESIS BLOCK TIMESTAMP SET ***")
+                                    logging.debug(f"  *** GENESIS BLOCK TIMESTAMP SET ***")
                                 else:
                                     timestamp_str = datetime.fromtimestamp(tx["timestamp"] / 1000).isoformat() if tx["timestamp"] else "Unknown"
-                                    logging.info(f"  Regular timestamp: {timestamp_str}")
+                                    logging.debug(f"  Regular timestamp: {timestamp_str}")
                                 
                                 formatted.append({
                                     "id": tx["txid"],

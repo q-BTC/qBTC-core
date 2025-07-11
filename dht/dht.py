@@ -8,6 +8,7 @@ from state.state import validator_keys, known_validators
 from database.database import get_db,get_current_height
 from sync.sync import process_blocks_from_peer
 from log_utils import get_logger
+from blockchain.block_height_index import get_height_index
 
 logger = get_logger(__name__)
 
@@ -38,8 +39,12 @@ async def get_external_ip():
 
 async def run_kad_server(port, bootstrap_addr=None, wallet=None, gossip_node=None, ip_address=None, gossip_port=None):
     global kad_server
-    kad_server = KademliaServer()
-    await kad_server.listen(port)
+    try:
+        kad_server = KademliaServer()
+        await kad_server.listen(port)
+    except Exception as e:
+        logger.error(f"Failed to start Kademlia server: {e}")
+        raise
     
     if bootstrap_addr:
         # Resolve hostnames to IPs if needed
@@ -60,7 +65,11 @@ async def run_kad_server(port, bootstrap_addr=None, wallet=None, gossip_node=Non
                 resolved_bootstrap.append(addr)
         
         # Filter out our own address from bootstrap list
-        bootstrap_addr = [addr for addr in resolved_bootstrap if addr[1] != port]
+        # Only filter if it's actually our local address (not just same port)
+        local_addrs = [('127.0.0.1', port), ('localhost', port), ('0.0.0.0', port)]
+        if ip_address:
+            local_addrs.append((ip_address, port))
+        bootstrap_addr = [addr for addr in resolved_bootstrap if addr not in local_addrs]
         if bootstrap_addr:
             await kad_server.bootstrap(bootstrap_addr)
             logger.info(f"Bootstrapped to {bootstrap_addr}")
@@ -83,10 +92,33 @@ async def run_kad_server(port, bootstrap_addr=None, wallet=None, gossip_node=Non
         # Use the provided IP address and gossip port instead of defaults
         actual_gossip_port = gossip_port if gossip_port else DEFAULT_GOSSIP_PORT
         is_bootstrap = bootstrap_addr is None
+        logger.info(f"Node type: {'bootstrap' if is_bootstrap else 'validator'}, IP: {ip_address}, Port: {actual_gossip_port}")
         await announce_gossip_port(wallet, ip=ip_address, port=actual_gossip_port, gossip_node=gossip_node, is_bootstrap=is_bootstrap)
         
         # All nodes should discover peers
         await discover_peers_once(gossip_node)
+        
+        # For non-bootstrap nodes, always add bootstrap server as a peer to ensure we can sync
+        if not is_bootstrap:
+            logger.info("Adding bootstrap server as a gossip peer for synchronization")
+            # Resolve bootstrap hostname if needed
+            import socket
+            bootstrap_host = bootstrap_addr[0][0] if bootstrap_addr else "api.bitcoinqs.org"
+            try:
+                # Resolve hostname to IP
+                bootstrap_ip = socket.gethostbyname(bootstrap_host)
+                logger.info(f"Resolved bootstrap server {bootstrap_host} to {bootstrap_ip}")
+            except:
+                bootstrap_ip = bootstrap_host
+                logger.warning(f"Could not resolve {bootstrap_host}, using as-is")
+            
+            bootstrap_info = {
+                "ip": bootstrap_ip,
+                "port": 8002,  # Bootstrap gossip port
+                "validator_id": "bootstrap",
+                "nat_type": "direct"
+            }
+            gossip_node.add_peer(bootstrap_info["ip"], bootstrap_info["port"], peer_info=bootstrap_info)
         
         if not is_bootstrap:
             # Regular nodes: periodic peer discovery
@@ -102,10 +134,16 @@ async def run_kad_server(port, bootstrap_addr=None, wallet=None, gossip_node=Non
         while not shutdown_event.is_set():
             await asyncio.sleep(30)  # Check every 30 seconds
             # Optionally log DHT status
-            neighbors = kad_server.bootstrappable_neighbors()
-            logger.debug(f"DHT status: {len(neighbors)} neighbors")
+            try:
+                neighbors = kad_server.bootstrappable_neighbors() if kad_server else []
+                logger.debug(f"DHT status: {len(neighbors)} neighbors")
+            except Exception as e:
+                logger.error(f"Error checking DHT status: {e}")
     except asyncio.CancelledError:
         logger.info("DHT server shutting down...")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in DHT server main loop: {e}", exc_info=True)
         raise
     
     return kad_server
@@ -245,7 +283,7 @@ async def bootstrap_maintenance(gossip_node, wallet, ip_address, port):
                 await announce_gossip_port(wallet, ip=ip_address, port=port, gossip_node=gossip_node, is_bootstrap=True)
                 
         except Exception as e:
-            logger.error(f"Error in bootstrap maintenance: {e}")
+            logger.error(f"Error in bootstrap maintenance: {e}", exc_info=True)
         await asyncio.sleep(60)  # Check every minute
 
 async def periodic_peer_discovery(gossip_node):
@@ -272,12 +310,17 @@ async def periodic_peer_discovery(gossip_node):
                     # We have neighbors, try to re-announce
                     logger.debug(f"Re-announcing to {len(neighbors)} neighbors")
         except Exception as e:
-            logger.error(f"Error in periodic peer discovery: {e}")
+            logger.error(f"Error in periodic peer discovery: {e}", exc_info=True)
         await asyncio.sleep(30)  # Check every 30 seconds
 
 async def discover_peers_once(gossip_node):
     """Discover peers using a reconciliation approach"""
     discovered_validators = set()
+    
+    # Check if kad_server is initialized
+    if not kad_server:
+        logger.warning("DHT server not initialized yet, skipping peer discovery")
+        return
     
     # First, add ourselves to ensure we're always in the set
     discovered_validators.add(VALIDATOR_ID)
@@ -286,8 +329,13 @@ async def discover_peers_once(gossip_node):
     try:
         validators_json = await kad_server.get(VALIDATORS_LIST_KEY)
         if validators_json:
-            validator_ids = json.loads(validators_json)
-            discovered_validators.update(validator_ids)
+            try:
+                validator_ids = json.loads(validators_json)
+                discovered_validators.update(validator_ids)
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to parse validator list JSON: {e}")
+            except Exception as e:
+                logger.warning(f"Failed to process validator list: {e}")
     except Exception as e:
         logger.warning(f"Failed to get validator list: {e}")
     
@@ -323,14 +371,17 @@ async def discover_peers_once(gossip_node):
     # Now discover gossip endpoints for each validator
     discovered_count = 0
     
+    logger.info(f"Checking gossip info for {len(discovered_validators)} validators...")
     for vid in discovered_validators:
         if vid == VALIDATOR_ID:
+            logger.debug(f"Skipping self (validator {vid})")
             continue
         gossip_key = f"gossip_{vid}"
         try:
+            logger.debug(f"Looking up gossip info for validator {vid} with key {gossip_key}")
             gossip_info_json = await kad_server.get(gossip_key)
             if not gossip_info_json:
-                logger.debug(f"No gossip info found for validator {vid}")
+                logger.warning(f"No gossip info found for validator {vid}")
                 continue
                 
             info = json.loads(gossip_info_json)
@@ -340,19 +391,26 @@ async def discover_peers_once(gossip_node):
                 ip = info.get("ip", info.get("external_ip"))
                 port = info.get("port", info.get("external_port"))
                 
-                # Skip if it's our own external IP
+                # Skip if it's our own validator ID (dynamic check)
+                if vid == VALIDATOR_ID:
+                    logger.info(f"Skipping self-connection to {vid} at {ip}:{port}")
+                    continue
+                    
                 try:
+                    # Also check IP-based self-detection using dynamic values
                     if ip == own_ip or (nat_traversal and hasattr(nat_traversal, 'external_ip') and ip == nat_traversal.external_ip):
+                        logger.info(f"Skipping self-connection based on IP match: {ip}")
                         continue
                 except:
                     pass
                     
                 # Store full peer info for NAT traversal
+                logger.info(f"Adding peer {vid} at {ip}:{port} to gossip node")
                 gossip_node.add_peer(ip, port, peer_info=info)
                 discovered_count += 1
                 
                 nat_type = info.get("nat_type", "unknown")
-                logger.info(f"Connected to peer {vid} at {ip}:{port} (NAT type: {nat_type})")
+                logger.info(f"Successfully added peer {vid} at {ip}:{port} (NAT type: {nat_type})")
                 
                 # Also store publicKey in validator_keys for TX signature validation
                 if "publicKey" in info:
@@ -364,7 +422,7 @@ async def discover_peers_once(gossip_node):
         except Exception as e:
             logger.error(f"Error processing peer {vid}: {e}")
     
-    logger.info(f"Peer discovery complete: discovered {discovered_count}/{len(validator_ids)-1} peers")
+    logger.info(f"Peer discovery complete: discovered {discovered_count}/{len(discovered_validators)-1} peers")
 
 
 async def push_blocks(peer_ip, peer_port):
@@ -404,7 +462,7 @@ async def push_blocks(peer_ip, peer_port):
             #peer_tip = msg.get("current_tip")
             logger.info(f"*** Peer {peer_ip} responded with height {peer_height}")
 
-        # Only push if our height is greater
+        # Only push if our height is greater than peer's
         if int(peer_height) < local_height:
             print("***** WILL PUSH BLOCKS TO PEER ****")
 
@@ -412,23 +470,19 @@ async def push_blocks(peer_ip, peer_port):
             end_height = local_height
 
             blocks_to_send = []
+            height_index = get_height_index()
 
             for h in range(start_height, end_height+1):
-                found_block = None
-
-                print(f"Looking for block at height {h}")
-
-                # Search for the block at height h
-                for key in db.keys():
-                    if key.startswith(b"block:"):
-                        block = json.loads(db[key].decode())
-                        if block.get("height") == h:
-                            found_block = block
-                            break
-
+                # Use the efficient height index
+                found_block = height_index.get_block_by_height(h)
+                
                 if not found_block:
                     print(f"Block at height {h} not found!")
                     continue
+                
+                # Make a deep copy to avoid modifying the original
+                import copy
+                found_block = copy.deepcopy(found_block)
 
                 # Now fetch full transaction objects
                 full_transactions = []
@@ -437,23 +491,28 @@ async def push_blocks(peer_ip, peer_port):
                     tx_key = f"tx:{tx_id}".encode()
                     if tx_key in db:
                         tx_obj = json.loads(db[tx_key].decode())
-                        full_transactions.append({
-                            "tx_id": tx_id,
-                            "transaction": tx_obj
-                        })
+                        # Ensure the transaction has txid field
+                        tx_obj["txid"] = tx_id
+                        full_transactions.append(tx_obj)
 
-                cbase_key = f"tx:coinbase_{h}".encode()
-                if cbase_key in db:
-                    full_transactions.append(json.loads(db[cbase_key].decode()))
+                # Legacy coinbase lookup removed - coinbase is already included in regular transactions
 
                 found_block["full_transactions"] = full_transactions
 
                 blocks_to_send.append(found_block)
 
+            # Validate blocks before sending
+            validated_blocks = []
+            for block in blocks_to_send:
+                if isinstance(block.get("height"), str) and len(block.get("height")) == 64:
+                    logger.error(f"CRITICAL: About to send block with hash in height field: {block}")
+                    continue  # Skip this malformed block
+                validated_blocks.append(block)
+            
             # Now send the blocks
             blocks_message = {
                 "type": "blocks_response",
-                "blocks": blocks_to_send,
+                "blocks": validated_blocks,
                 "timestamp": int(time.time() * 1000)
             }
             message_json = json.dumps(blocks_message)
@@ -463,9 +522,18 @@ async def push_blocks(peer_ip, peer_port):
             print(f"Sent {len(blocks_to_send)} blocks to {peer_ip}")
         
         elif peer_height > local_height:
+            # We need blocks from peer
             print("***** WILL PULL BLOCKS FROM PEER *****")
-            start_height = local_height + 1
+            print(f"Decision logic: peer_height={peer_height}, local_height={local_height}")
+            
+            if local_height == -1:
+                # We have no blocks, request from genesis
+                start_height = 0
+            else:
+                start_height = local_height + 1
             end_height = peer_height
+            
+            logger.info(f"Requesting blocks from height {start_height} to {end_height}")
 
             get_blocks_request = {
                 "type": "get_blocks",
@@ -516,10 +584,28 @@ async def push_blocks(peer_ip, peer_port):
 
             blocks = sorted(response.get("blocks", []), key=lambda x: x["height"])
             logger.info(f"Received {len(blocks)} blocks from from peer")
+            
+            # Fix missing txid in transactions before processing
+            for block in blocks:
+                if "full_transactions" in block and block["full_transactions"]:
+                    tx_ids = block.get("tx_ids", [])
+                    for i, tx in enumerate(block["full_transactions"]):
+                        if tx and "txid" not in tx:
+                            # Try to get txid from tx_ids array
+                            if i < len(tx_ids):
+                                tx["txid"] = tx_ids[i]
+                            # Coinbase transactions should already have a txid from when they were mined
+                            elif tx.get("inputs") and len(tx["inputs"]) > 0 and tx["inputs"][0].get("txid") == "00" * 32:
+                                logger.error(f"Coinbase transaction missing txid in block {block.get('height', 0)}")
+                            else:
+                                logger.warning(f"Could not determine txid for transaction {i} in block {block.get('height', 'unknown')}")
+            
             process_blocks_from_peer(blocks)
 
         else:
             print("Peer up to date")
+            print(f"Decision logic: peer_height={peer_height}, local_height={local_height}")
+            logger.info(f"No sync needed: peer_height={peer_height}, local_height={local_height}")
 
         w.close()
         await w.wait_closed()
@@ -535,8 +621,18 @@ async def discover_peers_periodically(gossip_node, local_ip=None):
     current_ip = local_ip if local_ip else own_ip
     while not shutdown_event.is_set():
         try:
+            # Check if kad_server is initialized
+            if not kad_server:
+                logger.warning("DHT server not initialized, waiting...")
+                await asyncio.sleep(5)
+                continue
+                
             validators_json = await kad_server.get(VALIDATORS_LIST_KEY)
-            validator_ids = json.loads(validators_json) if validators_json else []
+            try:
+                validator_ids = json.loads(validators_json) if validators_json else []
+            except (json.JSONDecodeError, TypeError) as e:
+                logger.warning(f"Failed to parse validators JSON in discover_peers_periodically: {e}")
+                validator_ids = []
             print("*** in discover peers periodically")
             logger.info(f"Discovered {len(validator_ids)} validators in DHT")
             
@@ -578,6 +674,11 @@ async def update_heartbeat():
     heartbeat_key = f"validator_{VALIDATOR_ID}_heartbeat"
     while not shutdown_event.is_set():
         try:
+            # Check if kad_server is initialized
+            if not kad_server:
+                logger.debug("DHT server not initialized, skipping heartbeat")
+                await asyncio.sleep(HEARTBEAT_INTERVAL)
+                continue
             # Always try to update heartbeat, not just when bootstrapped
             await kad_server.set(heartbeat_key, str(time.time()))
             logger.debug(f"Updated heartbeat for {VALIDATOR_ID}")
@@ -588,6 +689,11 @@ async def update_heartbeat():
 async def maintain_validator_list(gossip_node):
     while not shutdown_event.is_set():
         try:
+            # Check if kad_server is initialized
+            if not kad_server:
+                logger.debug("DHT server not initialized, skipping validator list maintenance")
+                await asyncio.sleep(HEARTBEAT_INTERVAL)
+                continue
             dht_list_json = await kad_server.get(VALIDATORS_LIST_KEY)
             dht_set = set(json.loads(dht_list_json)) if dht_list_json else set()
         except Exception as e:
