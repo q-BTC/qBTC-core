@@ -94,15 +94,15 @@ services:
     depends_on:
       - validator
 
-  # Nginx reverse proxy - Only serves API on 8080
+  # Nginx reverse proxy - Serves both API on 8080 and Grafana on 8443 (when GRAFANA=true)
   nginx:
     image: nginx:alpine
     container_name: qbtc-nginx-validator
     ports:
-      - "8080:8080"    # API/WebSocket with SSL
+      - "8080:8080"    # API/WebSocket (HTTP)
+      - "8443:80"      # Grafana (HTTP)
     volumes:
-      - ./monitoring/nginx/nginx-validator-testing.conf:/etc/nginx/nginx.conf:ro
-      - ./monitoring/nginx/ssl:/etc/nginx/ssl:ro
+      - ./monitoring/nginx/nginx-validator-nossl.conf:/etc/nginx/nginx.conf:ro
     networks:
       - qbtc-network
     restart: unless-stopped
@@ -111,10 +111,46 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  # Grafana for visualization (only started when GRAFANA=true)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: qbtc-grafana-validator
+    environment:
+      # Grafana configuration
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_SERVER_ROOT_URL=http://${GRAFANA_DOMAIN:-localhost}:8443
+      - GF_SERVER_SERVE_FROM_SUB_PATH=false
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+      - GF_INSTALL_PLUGINS=
+      # Security settings
+      - GF_SECURITY_COOKIE_SECURE=false  # No SSL
+      - GF_SECURITY_STRICT_TRANSPORT_SECURITY=false  # No HSTS
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      - GF_AUTH_BASIC_ENABLED=true
+      - GF_SECURITY_DISABLE_GRAVATAR=true
+      - GF_SECURITY_COOKIE_SAMESITE=lax
+      - GF_SECURITY_CONTENT_SECURITY_POLICY=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./monitoring/grafana/custom.ini:/etc/grafana/grafana.ini:ro
+    networks:
+      - qbtc-network
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    security_opt:
+      - no-new-privileges:true
+
 volumes:
   validator-data:
   redis-data:
   prometheus-data:
+  grafana-data:
 
 networks:
   qbtc-network:
