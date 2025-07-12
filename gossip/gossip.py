@@ -679,11 +679,26 @@ class GossipNode:
                                 
                                 # If peer is ahead, request blocks
                                 if peer_height > local_height:
-                                    logger.info(f"[PERIODIC_SYNC] Peer {peer} is ahead by {peer_height - local_height} blocks, requesting sync")
+                                    # Check for gaps in our blockchain first
+                                    height_index = get_height_index()
+                                    gap_start = None
+                                    
+                                    # Look back up to 100 blocks for gaps
+                                    check_from = max(1, local_height - 100)
+                                    for h in range(check_from, local_height + 1):
+                                        if not height_index.get_block_by_height(h):
+                                            gap_start = h
+                                            logger.warning(f"[PERIODIC_SYNC] Found gap in blockchain at height {h}")
+                                            break
+                                    
+                                    # If gap found, sync from gap, otherwise from current height + 1
+                                    sync_start = gap_start if gap_start else local_height + 1
+                                    
+                                    logger.info(f"[PERIODIC_SYNC] Peer {peer} is ahead by {peer_height - local_height} blocks, requesting sync from height {sync_start}")
                                     blocks_request = {
                                         "type": "get_blocks",
-                                        "start_height": local_height + 1,
-                                        "end_height": min(local_height + 20, peer_height),  # Request max 20 blocks at a time for reliable ordering
+                                        "start_height": sync_start,
+                                        "end_height": min(sync_start + 19, peer_height),  # Request max 20 blocks at a time for reliable ordering
                                         "timestamp": int(time.time() * 1000)
                                     }
                                     writer.write((json.dumps(blocks_request) + "\n").encode('utf-8'))

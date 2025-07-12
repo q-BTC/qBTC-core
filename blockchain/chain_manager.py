@@ -8,7 +8,7 @@ import time
 from typing import Dict, List, Optional, Tuple, Set
 from decimal import Decimal
 from collections import defaultdict
-from database.database import get_db
+from database.database import get_db, invalidate_height_cache
 from blockchain.blockchain import Block, validate_pow, bits_to_target, sha256d
 from blockchain.difficulty import get_next_bits, validate_block_bits, validate_block_timestamp, MAX_FUTURE_TIME
 from blockchain.transaction_validator import TransactionValidator
@@ -656,10 +656,25 @@ class ChainManager:
                         if potential_new_height > current_height:
                             logger.warning(f"[REORG_CHECK] Orphan chain would reach height {potential_new_height} vs current {current_height}")
                             
-                            # We need to reorganize! But first we need the common ancestor
-                            # For now, request the missing parent blocks
+                            # We need to reorganize! 
                             logger.warning(f"[REORG_CHECK] Need to reorganize to orphan chain!")
-                            self._request_missing_parents_for_reorg(orphan_hash)
+                            
+                            # Find the fork point - where this orphan chain diverges from our main chain
+                            fork_height = self._find_fork_height_for_orphan(orphan_hash)
+                            if fork_height is not None:
+                                logger.warning(f"[REORG_CHECK] Fork detected at height {fork_height}")
+                                
+                                # Rewind to just before the fork
+                                if self._rewind_to_height(fork_height - 1):
+                                    logger.warning(f"[REORG_CHECK] Successfully rewound to height {fork_height - 1}")
+                                    # The orphan chain should now be able to connect
+                                    return True
+                                else:
+                                    logger.error(f"[REORG_CHECK] Failed to rewind to height {fork_height - 1}")
+                            else:
+                                # Can't find fork point, request missing parent blocks
+                                self._request_missing_parents_for_reorg(orphan_hash)
+                            
                             return
     
     def _get_orphan_chain_length(self, start_hash: str) -> int:
@@ -689,6 +704,86 @@ class ChainManager:
             parent_hash = orphan_data.get("previous_hash")
             height = orphan_data.get("height", 0)
             logger.warning(f"[REORG_CHECK] Need parent block {parent_hash} at height {height - 1} for reorganization")
+    
+    def _find_fork_height_for_orphan(self, orphan_hash: str) -> Optional[int]:
+        """Find where an orphan chain diverges from our main chain"""
+        orphan_data = self.orphan_blocks.get(orphan_hash)
+        if not orphan_data:
+            return None
+        
+        # Start from the orphan and work backwards to find where it connects to main chain
+        current_hash = orphan_hash
+        min_height = orphan_data.get("height", 0)
+        
+        # Traverse backwards through orphan chain
+        while current_hash:
+            block_data = self.orphan_blocks.get(current_hash)
+            if not block_data:
+                # Not in orphans, check if it's in main chain
+                if current_hash in self.block_index:
+                    # Found connection point!
+                    return block_data.get("height", min_height)
+                break
+            
+            # Update minimum height seen
+            min_height = min(min_height, block_data.get("height", min_height))
+            
+            # Check if the parent is in our main chain
+            parent_hash = block_data.get("previous_hash")
+            if parent_hash and parent_hash in self.block_index:
+                # Fork point is at the parent's height
+                parent_data = self._get_block_data(parent_hash)
+                if parent_data:
+                    return parent_data.get("height", min_height)
+            
+            # Move to parent
+            current_hash = parent_hash
+        
+        # Couldn't find connection point
+        return None
+    
+    def _rewind_to_height(self, target_height: int) -> bool:
+        """Rewind the chain to a specific height by disconnecting blocks"""
+        current_tip, current_height = self.get_best_chain_tip()
+        
+        if target_height >= current_height:
+            logger.warning(f"Cannot rewind to height {target_height} - already at {current_height}")
+            return False
+        
+        logger.warning(f"[REWIND] Rewinding chain from height {current_height} to {target_height}")
+        
+        # Disconnect blocks one by one
+        blocks_to_disconnect = []
+        height = current_height
+        block_hash = current_tip
+        
+        while height > target_height:
+            block_data = self._get_block_data(block_hash)
+            if not block_data:
+                logger.error(f"[REWIND] Cannot find block {block_hash} at height {height}")
+                return False
+            
+            blocks_to_disconnect.append((block_hash, block_data))
+            block_hash = block_data.get("previous_hash")
+            height -= 1
+        
+        # Actually disconnect the blocks
+        with WriteBatch(db=self.db) as batch:
+            for block_hash, block_data in blocks_to_disconnect:
+                logger.info(f"[REWIND] Disconnecting block {block_hash} at height {block_data.get('height')}")
+                self._disconnect_block(block_data, batch)
+            
+            # Update best block to the new tip
+            new_tip_hash = blocks_to_disconnect[-1][1].get("previous_hash")
+            if new_tip_hash:
+                batch.put(b"best_block_hash", new_tip_hash.encode())
+                self.current_tip = new_tip_hash
+                logger.warning(f"[REWIND] New chain tip: {new_tip_hash} at height {target_height}")
+        
+        # Invalidate height cache
+        invalidate_height_cache()
+        
+        return True
     
     def _evaluate_orphan_chains(self):
         """Check if any orphan chain should trigger a reorganization"""
