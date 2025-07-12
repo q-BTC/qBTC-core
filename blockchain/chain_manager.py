@@ -35,6 +35,8 @@ class ChainManager:
         self.orphan_timestamps: Dict[str, int] = {}  # hash -> timestamp when added
         self.block_index: Dict[str, dict] = {}  # hash -> block metadata
         self.chain_tips: Set[str] = set()  # Set of chain tip hashes
+        self.orphan_chains: Dict[str, List[str]] = {}  # tip_hash -> list of block hashes in chain
+        self.orphan_roots: Dict[str, str] = {}  # block_hash -> root block hash of orphan chain
         self.MAX_ORPHAN_BLOCKS = 100  # Maximum number of orphan blocks to keep
         self.MAX_ORPHAN_AGE = 3600  # Maximum age of orphan blocks in seconds (1 hour)
         self.is_syncing = False  # Flag to indicate if we're in initial sync
@@ -367,7 +369,7 @@ class ChainManager:
     def _add_orphan(self, block_data: dict):
         """Add a block to the orphan pool"""
         block_hash = block_data["block_hash"]
-        logger.info(f"Adding orphan block {block_hash}")
+        logger.info(f"Adding orphan block {block_hash} at height {block_data.get('height')}")
         
         # Clean up old orphans before adding new one
         self._cleanup_orphans()
@@ -376,13 +378,18 @@ class ChainManager:
         self.orphan_blocks[block_hash] = block_data
         self.orphan_timestamps[block_hash] = int(time.time())
         
+        # Track orphan chains
+        self._update_orphan_chains(block_data)
+        
+        # Check if this orphan completes a chain that should trigger reorganization
+        self._evaluate_orphan_chains()
+        
         # Enforce size limit (remove oldest if over limit)
         if len(self.orphan_blocks) > self.MAX_ORPHAN_BLOCKS:
             # Find oldest orphan
             oldest_hash = min(self.orphan_timestamps.items(), key=lambda x: x[1])[0]
             logger.info(f"Removing oldest orphan {oldest_hash} due to size limit")
-            del self.orphan_blocks[oldest_hash]
-            del self.orphan_timestamps[oldest_hash]
+            self._remove_orphan(oldest_hash)
     
     def _process_orphans_for_block(self, parent_hash: str):
         """Try to connect any orphans that have this block as parent"""
@@ -401,6 +408,178 @@ class ChainManager:
             del self.orphan_blocks[orphan_hash]
             if orphan_hash in self.orphan_timestamps:
                 del self.orphan_timestamps[orphan_hash]
+    
+    def _remove_orphan(self, orphan_hash: str):
+        """Remove an orphan and update chain tracking"""
+        if orphan_hash in self.orphan_blocks:
+            del self.orphan_blocks[orphan_hash]
+        if orphan_hash in self.orphan_timestamps:
+            del self.orphan_timestamps[orphan_hash]
+        if orphan_hash in self.orphan_roots:
+            del self.orphan_roots[orphan_hash]
+        
+        # Remove from orphan chains
+        chains_to_remove = []
+        for tip_hash, chain in self.orphan_chains.items():
+            if orphan_hash in chain:
+                chain.remove(orphan_hash)
+                if not chain or tip_hash == orphan_hash:
+                    chains_to_remove.append(tip_hash)
+        
+        for tip_hash in chains_to_remove:
+            del self.orphan_chains[tip_hash]
+    
+    def _update_orphan_chains(self, block_data: dict):
+        """Update orphan chain tracking when a new orphan is added"""
+        block_hash = block_data["block_hash"]
+        prev_hash = block_data["previous_hash"]
+        height = block_data.get("height", 0)
+        
+        # Check if this orphan extends an existing orphan chain
+        extended_chain = False
+        for tip_hash, chain in list(self.orphan_chains.items()):
+            if chain and chain[-1] == prev_hash:
+                # This orphan extends an existing chain
+                logger.info(f"Orphan {block_hash} extends existing orphan chain ending at {tip_hash}")
+                # Remove old tip from chains
+                del self.orphan_chains[tip_hash]
+                # Add extended chain with new tip
+                self.orphan_chains[block_hash] = chain + [block_hash]
+                # Update root tracking
+                root = self.orphan_roots.get(chain[0], chain[0])
+                self.orphan_roots[block_hash] = root
+                extended_chain = True
+                break
+        
+        if not extended_chain:
+            # Check if this orphan's parent is another orphan
+            if prev_hash in self.orphan_blocks:
+                # Find the chain containing the parent
+                parent_chain = None
+                for tip_hash, chain in self.orphan_chains.items():
+                    if prev_hash in chain:
+                        parent_chain = chain[:chain.index(prev_hash) + 1]
+                        break
+                
+                if parent_chain:
+                    # Create new chain branch
+                    self.orphan_chains[block_hash] = parent_chain + [block_hash]
+                    root = self.orphan_roots.get(parent_chain[0], parent_chain[0])
+                    self.orphan_roots[block_hash] = root
+                else:
+                    # Parent is orphan but not in a chain (shouldn't happen)
+                    self.orphan_chains[block_hash] = [prev_hash, block_hash]
+                    self.orphan_roots[block_hash] = prev_hash
+            else:
+                # This is a new orphan chain root
+                self.orphan_chains[block_hash] = [block_hash]
+                self.orphan_roots[block_hash] = block_hash
+        
+        logger.info(f"Orphan chains: {len(self.orphan_chains)} chains tracking {len(self.orphan_blocks)} orphans")
+    
+    def _evaluate_orphan_chains(self):
+        """Check if any orphan chain should trigger a reorganization"""
+        current_tip, current_height = self.get_best_chain_tip()
+        current_difficulty = self._get_cumulative_difficulty(current_tip)
+        
+        for tip_hash, chain in self.orphan_chains.items():
+            # Get the root of this orphan chain
+            root_hash = chain[0]
+            root_block = self.orphan_blocks.get(root_hash)
+            if not root_block:
+                continue
+            
+            # Check if the parent of the root exists in our main chain
+            root_parent = root_block.get("previous_hash")
+            if root_parent in self.block_index or root_parent == "00" * 32:
+                # This orphan chain can potentially connect to our chain
+                # Calculate total difficulty of the orphan chain
+                orphan_chain_difficulty = self._calculate_orphan_chain_difficulty(chain)
+                
+                # Get difficulty up to the connection point
+                if root_parent == "00" * 32:
+                    base_difficulty = Decimal(0)
+                else:
+                    base_difficulty = self._get_cumulative_difficulty(root_parent)
+                
+                total_orphan_difficulty = base_difficulty + orphan_chain_difficulty
+                
+                # Log detailed information about the potential reorganization
+                tip_block = self.orphan_blocks.get(tip_hash)
+                if tip_block:
+                    logger.warning(f"Evaluating orphan chain: tip={tip_hash}, height={tip_block.get('height')}, "
+                                 f"chain_length={len(chain)}, total_difficulty={total_orphan_difficulty}, "
+                                 f"current_difficulty={current_difficulty}")
+                
+                # Check if this orphan chain has more work
+                if total_orphan_difficulty > current_difficulty:
+                    logger.warning(f"Orphan chain has more work! Attempting reorganization to {tip_hash}")
+                    logger.warning(f"Orphan chain: {len(chain)} blocks, root={root_hash}, tip={tip_hash}")
+                    logger.warning(f"Current chain: height={current_height}, tip={current_tip}")
+                    
+                    # First, we need to connect the orphan blocks to the main chain
+                    # This requires processing them in order
+                    success = self._connect_orphan_chain(chain)
+                    if success:
+                        # Now attempt reorganization to the new tip
+                        if self._should_reorganize(tip_hash):
+                            success = self._reorganize_to_block(tip_hash)
+                            if success:
+                                logger.warning(f"Successfully reorganized to orphan chain tip {tip_hash}")
+                                # Clean up orphan data for connected blocks
+                                for block_hash in chain:
+                                    self._remove_orphan(block_hash)
+                            else:
+                                logger.error(f"Failed to reorganize to orphan chain tip {tip_hash}")
+                        else:
+                            logger.warning(f"Connected orphan chain but it's not the best chain")
+                    else:
+                        logger.error(f"Failed to connect orphan chain starting at {root_hash}")
+    
+    def _calculate_orphan_chain_difficulty(self, chain: List[str]) -> Decimal:
+        """Calculate the total difficulty of an orphan chain"""
+        total_difficulty = Decimal(0)
+        
+        for block_hash in chain:
+            block_data = self.orphan_blocks.get(block_hash)
+            if not block_data:
+                logger.warning(f"Orphan block {block_hash} not found while calculating difficulty")
+                continue
+            
+            bits = block_data.get("bits", 0x1d00ffff)
+            target = bits_to_target(bits)
+            difficulty = Decimal(2**256) / Decimal(target)
+            total_difficulty += difficulty
+        
+        return total_difficulty
+    
+    def _connect_orphan_chain(self, chain: List[str]) -> bool:
+        """Attempt to connect an orphan chain to the main chain"""
+        logger.info(f"Attempting to connect orphan chain of {len(chain)} blocks")
+        
+        # Process blocks in order
+        for block_hash in chain:
+            block_data = self.orphan_blocks.get(block_hash)
+            if not block_data:
+                logger.error(f"Orphan block {block_hash} not found during connection")
+                return False
+            
+            # Remove from orphan pool temporarily
+            self.orphan_blocks.pop(block_hash, None)
+            self.orphan_timestamps.pop(block_hash, None)
+            
+            # Try to add the block normally
+            success, error = self.add_block(block_data)
+            if not success:
+                # Re-add to orphan pool if failed
+                self.orphan_blocks[block_hash] = block_data
+                self.orphan_timestamps[block_hash] = int(time.time())
+                logger.error(f"Failed to connect orphan block {block_hash}: {error}")
+                return False
+            
+            logger.info(f"Successfully connected orphan block {block_hash}")
+        
+        return True
     
     def _should_reorganize(self, new_tip_hash: str) -> bool:
         """Check if a new block creates a better chain than current"""
@@ -1040,6 +1219,63 @@ class ChainManager:
         
         return False
     
+    def detect_fork_at_height(self, height: int) -> Optional[str]:
+        """
+        Detect if we have a different block at the given height than what's expected.
+        Returns the hash of our block at that height if it exists, None otherwise.
+        """
+        # Find our block at this height
+        best_tip, best_height = self.get_best_chain_tip()
+        
+        if height > best_height:
+            return None  # We don't have a block at this height yet
+        
+        # Walk back from best tip to find block at target height
+        current = best_tip
+        current_height = best_height
+        
+        while current and current != "00" * 32 and current_height > height:
+            if current in self.block_index:
+                current = self.block_index[current]["previous_hash"]
+                current_height -= 1
+            else:
+                break
+        
+        if current_height == height:
+            return current
+        
+        return None
+    
+    def request_missing_ancestor(self, orphan_hash: str) -> Optional[Tuple[str, int]]:
+        """
+        For an orphan block, determine what ancestor block we need to request.
+        Returns (block_hash, height) of the block we should request, or None.
+        """
+        if orphan_hash not in self.orphan_blocks:
+            return None
+        
+        orphan_data = self.orphan_blocks[orphan_hash]
+        orphan_height = orphan_data.get("height", 0)
+        
+        # Find the root of this orphan's chain
+        root_hash = self.orphan_roots.get(orphan_hash, orphan_hash)
+        root_block = self.orphan_blocks.get(root_hash)
+        
+        if not root_block:
+            # Single orphan, request its parent
+            return orphan_data.get("previous_hash"), orphan_height - 1
+        
+        # For an orphan chain, we need the parent of the root
+        root_parent = root_block.get("previous_hash")
+        root_height = root_block.get("height", 0)
+        
+        # Check if we already have this block
+        if root_parent in self.block_index or root_parent == "00" * 32:
+            # We have the connection point, no need to request
+            return None
+        
+        return root_parent, root_height - 1
+    
     def _cleanup_orphans(self):
         """Remove orphans that are too old"""
         current_time = int(time.time())
@@ -1052,8 +1288,7 @@ class ChainManager:
                 to_remove.append(orphan_hash)
         
         for orphan_hash in to_remove:
-            del self.orphan_blocks[orphan_hash]
-            del self.orphan_timestamps[orphan_hash]
+            self._remove_orphan(orphan_hash)
     
     def get_orphan_info(self) -> dict:
         """Get information about current orphan blocks"""

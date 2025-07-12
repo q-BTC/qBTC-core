@@ -13,7 +13,7 @@ import json
 import logging
 import time
 from decimal import Decimal, ROUND_DOWN
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Set
 
 def _cleanup_mempool_after_sync(blocks: list[dict]):
     """Clean up mempool after syncing blocks"""
@@ -238,6 +238,9 @@ def _process_blocks_from_peer_impl(blocks: list[dict]):
         # Check if we need to request more blocks
         best_tip, best_height = cm.get_best_chain_tip()
         logging.info("Current best chain height: %d", best_height)
+        
+        # Check for orphan chains that need ancestor blocks
+        _check_orphan_chains_for_missing_blocks()
         
         return accepted_count > 0
     
@@ -520,3 +523,66 @@ def get_blockchain_info() -> Dict:
         "orphan_count": len(cm.orphan_blocks),
         "index_size": len(cm.block_index)
     }
+
+def _check_orphan_chains_for_missing_blocks():
+    """Check if any orphan chains need ancestor blocks to be requested"""
+    cm = get_chain_manager()
+    
+    # Track blocks we need to request
+    blocks_to_request: Set[Tuple[str, int]] = set()
+    
+    # Check each orphan for missing ancestors
+    for orphan_hash in cm.orphan_blocks:
+        ancestor_info = cm.request_missing_ancestor(orphan_hash)
+        if ancestor_info:
+            blocks_to_request.add(ancestor_info)
+    
+    if blocks_to_request:
+        logging.warning(f"[SYNC] Found {len(blocks_to_request)} missing ancestor blocks needed for orphan chains")
+        for block_hash, height in blocks_to_request:
+            logging.warning(f"[SYNC] Need to request block at height {height} with hash {block_hash}")
+        
+        # TODO: Implement actual block request mechanism through gossip protocol
+        # This would require coordination with the gossip module to request specific blocks
+        # For now, we just log the need for these blocks
+
+def request_specific_blocks(block_hashes: List[str]) -> Optional[List[dict]]:
+    """
+    Request specific blocks by hash from peers.
+    This function would need to be integrated with the gossip protocol.
+    """
+    # TODO: Implement this to request specific blocks from peers
+    # This would involve:
+    # 1. Sending a new message type to peers requesting specific blocks
+    # 2. Waiting for responses
+    # 3. Processing the received blocks
+    logging.info(f"[SYNC] Need to implement request_specific_blocks for {len(block_hashes)} blocks")
+    return None
+
+def detect_and_handle_fork(blocks: List[dict]) -> bool:
+    """
+    Detect if received blocks indicate we're on a different fork.
+    Returns True if a fork was detected and handled.
+    """
+    cm = get_chain_manager()
+    fork_detected = False
+    
+    for block in blocks:
+        height = block.get("height", 0)
+        block_hash = block.get("block_hash")
+        prev_hash = block.get("previous_hash")
+        
+        # Check if we have a different block at this height
+        our_block_at_height = cm.detect_fork_at_height(height)
+        
+        if our_block_at_height and our_block_at_height != block_hash:
+            # We have a different block at this height - fork detected!
+            logging.warning(f"[SYNC] Fork detected at height {height}!")
+            logging.warning(f"[SYNC] Our block: {our_block_at_height}")
+            logging.warning(f"[SYNC] Their block: {block_hash}")
+            fork_detected = True
+            
+            # The chain manager will handle reorganization when orphan chains are evaluated
+            # We just need to ensure the blocks are added as orphans
+    
+    return fork_detected
