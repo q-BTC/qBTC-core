@@ -46,23 +46,37 @@ async def startup(args=None):
             # Check if the index has the latest block
             latest_indexed = height_index.get_highest_indexed_height()
             if latest_indexed < best_height:
-                logger.info(f"Height index is behind (indexed: {latest_indexed}, chain: {best_height}). Rebuilding...")
-                logger.info("This may take a moment for large blockchains...")
-                start_time = time.time()
-                height_index.rebuild_index()
-                elapsed = time.time() - start_time
-                logger.info(f"Height index rebuild complete in {elapsed:.2f} seconds")
+                logger.info(f"Height index is behind (indexed: {latest_indexed}, chain: {best_height}). Scheduling background rebuild...")
+                # Rebuild index in background to not block startup
+                async def rebuild_index_async():
+                    logger.info("Starting background height index rebuild...")
+                    start_time = time.time()
+                    await asyncio.to_thread(height_index.rebuild_index)
+                    elapsed = time.time() - start_time
+                    logger.info(f"Background height index rebuild complete in {elapsed:.2f} seconds")
+                
+                # Create background task for index rebuild
+                asyncio.create_task(rebuild_index_async())
             else:
                 logger.info(f"Height index is up to date (indexed: {latest_indexed}, chain: {best_height})")
         
         # Check if database is truly empty (no blocks at all)
         has_any_blocks = False
         try:
-            # Check if there are any blocks in the database
-            for key, _ in db.items():
-                if key.startswith(b"block:"):
-                    has_any_blocks = True
-                    break
+            # Quick check for genesis block instead of iterating all keys
+            genesis_key = b"block:" + ("0" * 64).encode()
+            if db.get(genesis_key) is not None:
+                has_any_blocks = True
+            else:
+                # Only check first few keys as a fallback
+                key_count = 0
+                for key, _ in db.items():
+                    if key.startswith(b"block:"):
+                        has_any_blocks = True
+                        break
+                    key_count += 1
+                    if key_count > 100:  # Limit iteration
+                        break
         except Exception as e:
             logger.warning(f"Could not check database for existing blocks: {e}")
             
@@ -221,8 +235,8 @@ async def startup(args=None):
             
             logger.info("Gossip server started")
             
-            # Allow time for networking to initialize
-            await asyncio.sleep(3)
+            # Reduced wait time - networking can initialize in parallel
+            await asyncio.sleep(0.5)
             logger.info("Networking components initialized")
         else:
             logger.error("Network configuration required but no args provided")

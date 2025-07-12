@@ -22,13 +22,7 @@ async def main(args):
     logger.info(f"Args: bootstrap={args.bootstrap}, dht_port={args.dht_port}, gossip_port={args.gossip_port}")
     logger.info(f"Bootstrap server: {args.bootstrap_server}:{args.bootstrap_port}")
     
-    try:
-        await startup(args)
-        logger.info("Node startup completed successfully")
-    except Exception as e:
-        logger.error(f"Failed to start node: {str(e)}")
-        raise
-
+    # Configure servers early (before heavy initialization)
     config_web = uvicorn.Config(
         app,
         host="0.0.0.0",
@@ -48,14 +42,26 @@ async def main(args):
     )
     server_rpc = uvicorn.Server(config_rpc)
     logger.info("RPC server configured on port 8332")
-
+    
+    # Start servers and node initialization concurrently
     try:
-        logger.info("Starting web and RPC servers")
-        await asyncio.gather(server_web.serve(), server_rpc.serve())
+        logger.info("Starting web/RPC servers and node initialization concurrently")
+        
+        # Create tasks for servers and startup
+        server_tasks = asyncio.gather(server_web.serve(), server_rpc.serve())
+        startup_task = asyncio.create_task(startup(args))
+        
+        # Wait for startup to complete
+        await startup_task
+        logger.info("Node startup completed successfully")
+        
+        # Continue running servers
+        await server_tasks
+        
     except asyncio.CancelledError:
         logger.info("Servers cancelled, shutting down gracefully")
     except Exception as e:
-        logger.error(f"Server error: {str(e)}")
+        logger.error(f"Server/startup error: {str(e)}")
         raise
     finally:
         logger.info("Initiating shutdown")
