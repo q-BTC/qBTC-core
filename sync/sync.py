@@ -240,7 +240,24 @@ def _process_blocks_from_peer_impl(blocks: list[dict]):
         logging.info("Current best chain height: %d", best_height)
         
         # Check for orphan chains that need ancestor blocks
-        _check_orphan_chains_for_missing_blocks()
+        # We need to run this in an async context
+        try:
+            # Get the gossip node reference
+            from web.web import get_gossip_node
+            gossip_client = get_gossip_node()
+            
+            if gossip_client:
+                # Create a new event loop if needed and run the async function
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(_check_orphan_chains_for_missing_blocks(gossip_client))
+                finally:
+                    loop.close()
+            else:
+                logging.warning("[SYNC] No gossip client available, skipping orphan chain check")
+        except Exception as e:
+            logging.error(f"[SYNC] Error checking orphan chains: {e}")
         
         return accepted_count > 0
     
@@ -524,7 +541,7 @@ def get_blockchain_info() -> Dict:
         "index_size": len(cm.block_index)
     }
 
-def _check_orphan_chains_for_missing_blocks():
+async def _check_orphan_chains_for_missing_blocks(gossip_client=None):
     """Check if any orphan chains need ancestor blocks to be requested"""
     cm = get_chain_manager()
     
@@ -539,25 +556,82 @@ def _check_orphan_chains_for_missing_blocks():
     
     if blocks_to_request:
         logging.warning(f"[SYNC] Found {len(blocks_to_request)} missing ancestor blocks needed for orphan chains")
+        
+        # Extract just the block hashes for the request
+        block_hashes_to_request = []
         for block_hash, height in blocks_to_request:
             logging.warning(f"[SYNC] Need to request block at height {height} with hash {block_hash}")
+            block_hashes_to_request.append(block_hash)
         
-        # TODO: Implement actual block request mechanism through gossip protocol
-        # This would require coordination with the gossip module to request specific blocks
-        # For now, we just log the need for these blocks
+        # Actually request the missing blocks
+        if gossip_client:
+            received_blocks = await request_specific_blocks(block_hashes_to_request, gossip_client)
+            if received_blocks:
+                logging.info(f"[SYNC] Successfully requested {len(received_blocks)} missing blocks")
+                # Process the received blocks
+                process_blocks_from_peer(received_blocks)
+            else:
+                logging.error(f"[SYNC] Failed to request missing blocks")
+        else:
+            logging.warning("[SYNC] No gossip client available to request missing blocks")
 
-def request_specific_blocks(block_hashes: List[str]) -> Optional[List[dict]]:
+async def request_specific_blocks(block_hashes: List[str], gossip_client=None) -> Optional[List[dict]]:
     """
     Request specific blocks by hash from peers.
-    This function would need to be integrated with the gossip protocol.
+    Returns the blocks if successful, None otherwise.
     """
-    # TODO: Implement this to request specific blocks from peers
-    # This would involve:
-    # 1. Sending a new message type to peers requesting specific blocks
-    # 2. Waiting for responses
-    # 3. Processing the received blocks
-    logging.info(f"[SYNC] Need to implement request_specific_blocks for {len(block_hashes)} blocks")
-    return None
+    if not block_hashes:
+        return None
+    
+    if not gossip_client:
+        logging.error("[SYNC] No gossip client provided for block requests")
+        return None
+    
+    logging.info(f"[SYNC] Requesting {len(block_hashes)} specific blocks from peers")
+    
+    # Create request message
+    request_msg = {
+        "type": "get_blocks_by_hash",
+        "block_hashes": block_hashes,
+        "timestamp": int(time.time() * 1000)
+    }
+    
+    # Try to request from multiple peers
+    peers = list(gossip_client.dht_peers | gossip_client.client_peers)
+    if not peers:
+        logging.warning("[SYNC] No peers available to request blocks from")
+        return None
+    
+    received_blocks = []
+    
+    # Try up to 3 different peers
+    for i, peer in enumerate(peers[:3]):
+        try:
+            logging.info(f"[SYNC] Requesting blocks from peer {peer}")
+            
+            # Send request to peer
+            response = await gossip_client.send_message(peer, request_msg)
+            
+            if response and response.get("type") == "blocks_by_hash_response":
+                blocks = response.get("blocks", [])
+                if blocks:
+                    logging.info(f"[SYNC] Received {len(blocks)} blocks from peer {peer}")
+                    received_blocks.extend(blocks)
+                    
+                    # If we got all requested blocks, return
+                    if len(received_blocks) >= len(block_hashes):
+                        return received_blocks[:len(block_hashes)]
+            
+        except Exception as e:
+            logging.warning(f"[SYNC] Failed to request blocks from peer {peer}: {e}")
+            continue
+    
+    if received_blocks:
+        logging.info(f"[SYNC] Received {len(received_blocks)} out of {len(block_hashes)} requested blocks")
+        return received_blocks
+    else:
+        logging.warning(f"[SYNC] Failed to receive any of the {len(block_hashes)} requested blocks")
+        return None
 
 def detect_and_handle_fork(blocks: List[dict]) -> bool:
     """

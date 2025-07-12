@@ -277,6 +277,22 @@ class GossipNode:
                                     logger.warning(f"Could not determine txid for transaction {i} in block {block.get('height', 'unknown')}")
                 
                 process_blocks_from_peer(blocks)
+        
+        elif msg_type == "blocks_by_hash_response":
+            logger.info(f"Received blocks_by_hash_response from {from_peer}")
+            blocks = msg.get("blocks", [])
+            if blocks:
+                logger.info(f"Processing {len(blocks)} blocks received by hash request")
+                # Fix missing txid in transactions before processing
+                for block in blocks:
+                    if "full_transactions" in block and block["full_transactions"]:
+                        tx_ids = block.get("tx_ids", [])
+                        for i, tx in enumerate(block["full_transactions"]):
+                            if tx and "txid" not in tx:
+                                if i < len(tx_ids):
+                                    tx["txid"] = tx_ids[i]
+                
+                process_blocks_from_peer(blocks)
             else:
                 logger.warning("Received empty blocks_response")
                 
@@ -385,6 +401,44 @@ class GossipNode:
                 writer.write((response_json + "\n").encode('utf-8'))
                 await writer.drain()
 
+        elif msg_type == "get_blocks_by_hash":
+            # Request specific blocks by their hashes
+            block_hashes = msg.get("block_hashes", [])
+            if not block_hashes:
+                logger.warning("Received get_blocks_by_hash with no hashes")
+                return
+            
+            logger.info(f"Received request for {len(block_hashes)} specific blocks")
+            blocks = []
+            
+            for block_hash in block_hashes[:100]:  # Limit to 100 blocks per request
+                block_key = f"block:{block_hash}".encode()
+                if block_key in db:
+                    block_data = json.loads(db[block_key].decode())
+                    
+                    # Add full transactions if not present
+                    if "full_transactions" not in block_data or not block_data["full_transactions"]:
+                        expanded_txs = []
+                        for txid in block_data.get("tx_ids", []):
+                            tx_key = f"tx:{txid}".encode()
+                            if tx_key in db:
+                                tx_data = json.loads(db[tx_key].decode())
+                                if "txid" not in tx_data:
+                                    tx_data["txid"] = txid
+                                expanded_txs.append(tx_data)
+                            else:
+                                logger.warning(f"Transaction {txid} not found in DB for block {block_hash}")
+                        block_data["full_transactions"] = expanded_txs
+                    
+                    blocks.append(block_data)
+                else:
+                    logger.info(f"Block {block_hash} not found in database")
+            
+            response = {"type": "blocks_by_hash_response", "blocks": blocks}
+            writer.write((json.dumps(response) + "\n").encode('utf-8'))
+            await writer.drain()
+            logger.info(f"Sent {len(blocks)} blocks by hash")
+
   
 
     async def randomized_broadcast(self, msg_dict):
@@ -428,6 +482,41 @@ class GossipNode:
                 logger.warning(f"broadcast {peer} failed: {result}")
             else:
                 logger.info(f"Successfully broadcast {msg_type} to {peer}")
+
+    async def send_message(self, peer, msg_dict, wait_for_response=True, timeout=10):
+        """Send a message to a peer and optionally wait for response"""
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(peer[0], peer[1], limit=MAX_LINE_BYTES),
+                timeout=5
+            )
+            
+            # Send the message
+            payload = (json.dumps(msg_dict) + "\n").encode('utf-8')
+            writer.write(payload)
+            await writer.drain()
+            
+            if wait_for_response:
+                # Wait for response
+                try:
+                    data = await asyncio.wait_for(reader.readline(), timeout=timeout)
+                    if data:
+                        response = json.loads(data.decode('utf-8').strip())
+                        writer.close()
+                        await writer.wait_closed()
+                        return response
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout waiting for response from {peer}")
+                except Exception as e:
+                    logger.warning(f"Error reading response from {peer}: {e}")
+            
+            writer.close()
+            await writer.wait_closed()
+            return None
+            
+        except Exception as e:
+            logger.warning(f"Failed to send message to {peer}: {e}")
+            return None
 
     async def _send_message(self, peer, payload):
         # Try direct connection with more retries and exponential backoff
@@ -627,6 +716,13 @@ class GossipNode:
                 
             except Exception as e:
                 logger.error(f"[PERIODIC_SYNC] Error in periodic sync: {e}", exc_info=True)
+            
+            # Also check for orphan chains that need missing blocks
+            try:
+                from sync.sync import _check_orphan_chains_for_missing_blocks
+                await _check_orphan_chains_for_missing_blocks(self)
+            except Exception as e:
+                logger.debug(f"[PERIODIC_SYNC] Error checking orphan chains: {e}")
             
             # Check every 30 seconds
             await asyncio.sleep(30)
