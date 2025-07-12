@@ -351,6 +351,11 @@ class GossipNode:
                         block["full_transactions"] = expanded_txs
                     else:
                         logger.info(f"Block at height {h} already has {len(block['full_transactions'])} full transactions")
+                        # IMPORTANT: Ensure all transactions have txid field even if block already has full_transactions
+                        tx_ids = block.get("tx_ids", [])
+                        for i, tx in enumerate(block.get("full_transactions", [])):
+                            if tx and "txid" not in tx and i < len(tx_ids):
+                                tx["txid"] = tx_ids[i]
                     
                     # Make a deep copy to avoid modifying the original
                     import copy
@@ -429,6 +434,12 @@ class GossipNode:
                             else:
                                 logger.warning(f"Transaction {txid} not found in DB for block {block_hash}")
                         block_data["full_transactions"] = expanded_txs
+                    else:
+                        # IMPORTANT: Ensure all transactions have txid field even if block already has full_transactions
+                        tx_ids = block_data.get("tx_ids", [])
+                        for i, tx in enumerate(block_data.get("full_transactions", [])):
+                            if tx and "txid" not in tx and i < len(tx_ids):
+                                tx["txid"] = tx_ids[i]
                     
                     blocks.append(block_data)
                 else:
