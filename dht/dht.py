@@ -127,6 +127,10 @@ async def run_kad_server(port, bootstrap_addr=None, wallet=None, gossip_node=Non
             # Bootstrap nodes: both peer discovery and maintenance
             asyncio.create_task(periodic_peer_discovery(gossip_node))
             asyncio.create_task(bootstrap_maintenance(gossip_node, wallet, ip_address, actual_gossip_port))
+        
+        # Start heartbeat and validator list maintenance for all nodes
+        asyncio.create_task(update_heartbeat())
+        asyncio.create_task(maintain_validator_list(gossip_node))
     
     # Keep DHT server running continuously
     logger.info("DHT server is running and will continue serving...")
