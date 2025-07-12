@@ -118,3 +118,42 @@ class WebSocketSubscription(BaseModel):
             if v not in allowed_networks:
                 raise ValueError(f'Network must be one of: {", ".join(allowed_networks)}')
         return v
+
+class CommitRequest(BaseModel):
+    btcAddress: str = Field(..., description="Bitcoin address")
+    qbtcAddress: str = Field(..., description="qBTC address")
+    message: str = Field(..., description="Signed message with timestamp")
+    signature: str = Field(..., description="Bitcoin signature")
+    
+    @validator('btcAddress')
+    def validate_btc_address(cls, v):
+        # Basic Bitcoin address validation (P2PKH, P2SH, Bech32)
+        if not re.match(r'^(1|3|bc1)[a-zA-HJ-NP-Z0-9]{25,62}$', v):
+            raise ValueError('Invalid Bitcoin address format')
+        return v
+    
+    @validator('qbtcAddress')
+    def validate_qbtc_address(cls, v):
+        if not v.startswith('bqs') or len(v) < 20:
+            raise ValueError('Invalid qBTC address format')
+        if not re.match(r'^bqs[A-Za-z0-9]+$', v):
+            raise ValueError('qBTC address contains invalid characters')
+        return v
+    
+    @validator('message')
+    def validate_message_format(cls, v):
+        # Check if message contains expected format
+        if 'Bitcoin address is:' not in v or 'qBTC address is:' not in v or 'Timestamp:' not in v:
+            raise ValueError('Message must contain Bitcoin address, qBTC address, and timestamp')
+        return v
+    
+    @validator('signature')
+    def validate_signature_format(cls, v):
+        # Bitcoin signatures are base64 encoded and typically 88-90 chars
+        if len(v) < 80 or len(v) > 100:
+            raise ValueError('Invalid signature length')
+        try:
+            base64.b64decode(v)
+            return v
+        except Exception:
+            raise ValueError('Signature must be valid base64')

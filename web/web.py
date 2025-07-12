@@ -3,6 +3,7 @@ import json
 import base64
 import time
 import asyncio
+import hashlib
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Dict, Set, Optional
@@ -18,7 +19,7 @@ from config.config import CHAIN_ID
 
 # Import security components
 from models.validation import (
-    TransactionRequest, WebSocketSubscription
+    TransactionRequest, WebSocketSubscription, CommitRequest
 )
 from errors.exceptions import (
     ValidationError, InsufficientFundsError, InvalidSignatureError
@@ -31,6 +32,20 @@ from security.integrated_security import get_security_status, unblock_client, ge
 # Import event system
 from events.event_bus import event_bus, EventTypes
 from web.websocket_handlers import WebSocketEventHandlers
+
+# Import Bitcoin utilities
+from utils.bitcoin_utils import verify_bitcoin_signature
+
+# Import OpenTimestamps
+try:
+    import opentimestamps
+    from opentimestamps.core.timestamp import Timestamp
+    from opentimestamps.core.serialize import BytesSerializationContext, BytesDeserializationContext
+    from opentimestamps.calendar import RemoteCalendar
+    OTS_AVAILABLE = True
+except ImportError:
+    logger.warning("OpenTimestamps not available - commitments will not be timestamped")
+    OTS_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -214,6 +229,51 @@ class WebSocketManager:
         return None
 
 websocket_manager = WebSocketManager()
+
+
+async def create_opentimestamp(data: bytes) -> Optional[str]:
+    """
+    Create an OpenTimestamp for the given data.
+    
+    Args:
+        data: The data to timestamp
+        
+    Returns:
+        Optional[str]: The OTS proof in hex format, or None if OTS is not available
+    """
+    if not OTS_AVAILABLE:
+        return None
+        
+    try:
+        # Create timestamp
+        timestamp = Timestamp(data)
+        
+        # Create calendar submissions
+        calendars = [
+            "https://alice.btc.calendar.opentimestamps.org",
+            "https://bob.btc.calendar.opentimestamps.org",
+            "https://finney.calendar.eternitywall.com"
+        ]
+        
+        for calendar_url in calendars:
+            try:
+                calendar = RemoteCalendar(calendar_url)
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None, calendar.submit, timestamp.msg
+                )
+                if result:
+                    timestamp.merge(result)
+            except Exception as e:
+                logger.warning(f"Failed to submit to calendar {calendar_url}: {e}")
+        
+        # Serialize the timestamp proof
+        ctx = BytesSerializationContext()
+        timestamp.serialize(ctx)
+        return ctx.getbytes().hex()
+        
+    except Exception as e:
+        logger.error(f"Failed to create OpenTimestamp: {e}")
+        return None
 
 def get_balance(wallet_address: str) -> Decimal:
     db = get_db()
@@ -1206,3 +1266,154 @@ async def get_client_info_endpoint(client_ip: str):
     except Exception as e:
         logger.error(f"Failed to get client info for {client_ip}: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to retrieve client information")
+
+@app.post("/commit")
+async def commit_btc_to_qbtc(request: CommitRequest):
+    """
+    Commit a Bitcoin address to a qBTC address.
+    This creates a binding between BTC and qBTC addresses without spending funds.
+    """
+    try:
+        # Validate the request using Pydantic model (already done)
+        
+        # Extract addresses from the message
+        btc_address = request.btcAddress
+        qbtc_address = request.qbtcAddress
+        message = request.message
+        signature = request.signature
+        
+        # Verify that the message contains the correct addresses
+        if btc_address not in message or qbtc_address not in message:
+            raise ValidationError("Message does not contain the specified addresses")
+        
+        # Verify Bitcoin signature
+        if not verify_bitcoin_signature(message, signature, btc_address):
+            raise ValidationError("Invalid Bitcoin signature")
+        
+        # Get database connection
+        db = get_db()
+        
+        # Check if this Bitcoin address has already been committed
+        commitment_key = f"commitment:{btc_address}".encode()
+        existing = db.get(commitment_key)
+        
+        if existing:
+            # Bitcoin address already committed
+            existing_data = json.loads(existing.decode())
+            if existing_data.get("qbtc_address") == qbtc_address:
+                # Same commitment, return success
+                return {
+                    "result": "success",
+                    "message": "This commitment already exists",
+                    "btc_address": btc_address,
+                    "qbtc_address": qbtc_address,
+                    "timestamp": existing_data.get("timestamp")
+                }
+            else:
+                # Different qBTC address - not allowed
+                return {
+                    "result": "error",
+                    "detail": "alradycommitted",  # Match the typo from BlueWallet
+                    "message": f"Bitcoin address {btc_address} is already committed to a different qBTC address"
+                }
+        
+        # Create commitment record
+        timestamp = datetime.utcnow().isoformat()
+        
+        # Create a hash of the commitment for OpenTimestamps
+        commitment_string = f"{btc_address}:{qbtc_address}:{message}:{signature}:{timestamp}"
+        commitment_hash = hashlib.sha256(commitment_string.encode()).digest()
+        
+        # Create OpenTimestamp proof
+        ots_proof = await create_opentimestamp(commitment_hash)
+        
+        commitment_data = {
+            "btc_address": btc_address,
+            "qbtc_address": qbtc_address,
+            "message": message,
+            "signature": signature,
+            "timestamp": timestamp,
+            "block_height": get_current_height(),
+            "commitment_hash": commitment_hash.hex(),
+            "ots_proof": ots_proof
+        }
+        
+        # Store commitment in database
+        db.put(commitment_key, json.dumps(commitment_data).encode())
+        
+        # Also store reverse lookup (qBTC -> BTC)
+        reverse_key = f"commitment_reverse:{qbtc_address}".encode()
+        db.put(reverse_key, btc_address.encode())
+        
+        # Log the commitment
+        logger.info(f"BTC commitment created: {btc_address} -> {qbtc_address}")
+        
+        # Emit event for potential future use
+        await event_bus.emit(EventTypes.CUSTOM, {
+            'type': 'btc_commitment',
+            'btc_address': btc_address,
+            'qbtc_address': qbtc_address,
+            'timestamp': timestamp
+        }, source='commit_endpoint')
+        
+        return {
+            "result": "success",
+            "message": "BTC to qBTC commitment created successfully",
+            "btc_address": btc_address,
+            "qbtc_address": qbtc_address,
+            "timestamp": timestamp,
+            "commitment_hash": commitment_hash.hex(),
+            "ots_proof": ots_proof if ots_proof else None,
+            "ots_available": OTS_AVAILABLE
+        }
+        
+    except ValidationError as e:
+        logger.warning(f"Validation error in commit endpoint: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error in commit endpoint: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/commitment/{btc_address}")
+async def get_commitment(btc_address: str):
+    """Get commitment details for a Bitcoin address"""
+    try:
+        # Basic validation
+        if not btc_address or len(btc_address) < 26:
+            raise ValidationError("Invalid Bitcoin address")
+        
+        db = get_db()
+        commitment_key = f"commitment:{btc_address}".encode()
+        commitment_data = db.get(commitment_key)
+        
+        if not commitment_data:
+            raise HTTPException(status_code=404, detail="No commitment found for this Bitcoin address")
+        
+        data = json.loads(commitment_data.decode())
+        return {
+            "btc_address": data.get("btc_address"),
+            "qbtc_address": data.get("qbtc_address"),
+            "timestamp": data.get("timestamp"),
+            "block_height": data.get("block_height"),
+            "commitment_hash": data.get("commitment_hash"),
+            "ots_proof": data.get("ots_proof"),
+            "has_ots": data.get("ots_proof") is not None
+        }
+        
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error retrieving commitment: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/commit/status")
+async def get_commit_status():
+    """Get the status of Bitcoin commitment verification capabilities"""
+    return {
+        "bitcoin_verification_available": True,
+        "opentimestamps_available": OTS_AVAILABLE,
+        "supported_address_types": ["P2PKH", "P2SH", "Bech32", "Testnet"],
+        "message": "Bitcoin signature verification enabled using python-bitcoinlib"
+    }

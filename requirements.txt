@@ -20,7 +20,6 @@ coverage==7.9.0
 crcmod==1.7
 cryptography==45.0.3
 dill==0.4.0
-ecdsa==0.19.1
 ed25519-blake2b==1.4.1
 fastapi==0.115.12
 freezegun==1.5.2
@@ -73,3 +72,5 @@ urllib3==2.5.0
 uvicorn==0.34.2
 wsproto==1.2.0
 yarl==1.20.0
+opentimestamps==0.4.2
+python-bitcoinlib==0.9.0
