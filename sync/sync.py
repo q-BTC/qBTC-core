@@ -235,6 +235,14 @@ def _process_blocks_from_peer_impl(blocks: list[dict]):
         if accepted_count > 0:
             _cleanup_mempool_after_sync(blocks)
         
+        # Try to connect orphan blocks that may now be connectable
+        if rejected_count > 0:
+            logging.info("[SYNC] Attempting to connect orphan blocks...")
+            orphans_connected = cm.try_connect_orphan_chain()
+            if orphans_connected:
+                logging.info("[SYNC] Successfully connected some orphan blocks")
+                accepted_count += 1  # Mark that we made progress
+        
         # Check if we need to request more blocks
         best_tip, best_height = cm.get_best_chain_tip()
         logging.info("Current best chain height: %d", best_height)
@@ -247,13 +255,21 @@ def _process_blocks_from_peer_impl(blocks: list[dict]):
             gossip_client = get_gossip_node()
             
             if gossip_client:
-                # Create a new event loop if needed and run the async function
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
+                # Check if we're already in an async context
                 try:
-                    loop.run_until_complete(_check_orphan_chains_for_missing_blocks(gossip_client))
-                finally:
-                    loop.close()
+                    loop = asyncio.get_running_loop()
+                    # We're in an async context, create a task
+                    task = asyncio.create_task(_check_orphan_chains_for_missing_blocks(gossip_client))
+                    # Don't wait for it to complete - let it run in background
+                    logging.info("[SYNC] Scheduled orphan chain check in background")
+                except RuntimeError:
+                    # No running loop, create a new one
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    try:
+                        loop.run_until_complete(_check_orphan_chains_for_missing_blocks(gossip_client))
+                    finally:
+                        loop.close()
             else:
                 logging.warning("[SYNC] No gossip client available, skipping orphan chain check")
         except Exception as e:

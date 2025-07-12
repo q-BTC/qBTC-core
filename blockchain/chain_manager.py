@@ -477,6 +477,115 @@ class ChainManager:
         
         logger.info(f"Orphan chains: {len(self.orphan_chains)} chains tracking {len(self.orphan_blocks)} orphans")
     
+    def try_connect_orphan_chain(self):
+        """Actively try to connect orphan blocks starting from current chain tip"""
+        current_tip, current_height = self.get_best_chain_tip()
+        logger.info(f"[ORPHAN_CONNECT] Trying to connect orphans from height {current_height}")
+        
+        # First, check if we should reorganize to a better orphan chain
+        self._check_orphan_chains_for_reorg()
+        
+        blocks_connected = 0
+        next_height = current_height + 1
+        
+        # Keep trying to connect blocks as long as we find matches
+        while True:
+            found_block = False
+            
+            # Look for an orphan block at the next height that connects to our chain
+            for orphan_hash, orphan_data in list(self.orphan_blocks.items()):
+                if orphan_data.get("height") == next_height:
+                    # Check if this orphan connects to our current tip
+                    if orphan_data.get("previous_hash") == current_tip:
+                        logger.info(f"[ORPHAN_CONNECT] Found matching orphan {orphan_hash} at height {next_height}")
+                        
+                        # Try to add this block
+                        success, error = self.add_block(orphan_data)
+                        if success:
+                            logger.info(f"[ORPHAN_CONNECT] Successfully connected orphan {orphan_hash} at height {next_height}")
+                            blocks_connected += 1
+                            
+                            # Update for next iteration
+                            current_tip = orphan_hash
+                            next_height += 1
+                            found_block = True
+                            
+                            # Remove from orphan tracking
+                            if orphan_hash in self.orphan_blocks:
+                                del self.orphan_blocks[orphan_hash]
+                            if orphan_hash in self.orphan_timestamps:
+                                del self.orphan_timestamps[orphan_hash]
+                            self._remove_orphan_from_chains(orphan_hash)
+                            
+                            break
+                        else:
+                            logger.warning(f"[ORPHAN_CONNECT] Failed to connect orphan {orphan_hash}: {error}")
+            
+            if not found_block:
+                # No more blocks to connect
+                break
+        
+        if blocks_connected > 0:
+            logger.info(f"[ORPHAN_CONNECT] Connected {blocks_connected} orphan blocks")
+            return True
+        else:
+            logger.debug(f"[ORPHAN_CONNECT] No orphan blocks could be connected")
+            return False
+    
+    def _check_orphan_chains_for_reorg(self):
+        """Check if any orphan chain represents a better chain we should reorganize to"""
+        current_tip, current_height = self.get_best_chain_tip()
+        logger.info(f"[REORG_CHECK] Checking orphan chains for potential reorganization")
+        
+        # Look for orphan blocks at or near our current height that might be on a better chain
+        for height in range(max(0, current_height - 10), current_height + 1):
+            for orphan_hash, orphan_data in self.orphan_blocks.items():
+                if orphan_data.get("height") == height:
+                    # This orphan is at a height we care about
+                    # Check if it's part of a longer chain
+                    chain_length = self._get_orphan_chain_length(orphan_hash)
+                    if chain_length > 0:
+                        logger.info(f"[REORG_CHECK] Found orphan chain starting at height {height} with {chain_length} blocks")
+                        
+                        # Check if this chain would give us a higher height
+                        potential_new_height = height + chain_length - 1
+                        if potential_new_height > current_height:
+                            logger.warning(f"[REORG_CHECK] Orphan chain would reach height {potential_new_height} vs current {current_height}")
+                            
+                            # We need to reorganize! But first we need the common ancestor
+                            # For now, request the missing parent blocks
+                            logger.warning(f"[REORG_CHECK] Need to reorganize to orphan chain!")
+                            self._request_missing_parents_for_reorg(orphan_hash)
+                            return
+    
+    def _get_orphan_chain_length(self, start_hash: str) -> int:
+        """Get the length of an orphan chain starting from a given block"""
+        length = 1
+        current_hash = start_hash
+        
+        # Follow the chain forward
+        while True:
+            found_next = False
+            for orphan_hash, orphan_data in self.orphan_blocks.items():
+                if orphan_data.get("previous_hash") == current_hash:
+                    length += 1
+                    current_hash = orphan_hash
+                    found_next = True
+                    break
+            
+            if not found_next:
+                break
+        
+        return length
+    
+    def _request_missing_parents_for_reorg(self, orphan_hash: str):
+        """Log that we need parent blocks for reorganization"""
+        orphan_data = self.orphan_blocks.get(orphan_hash)
+        if orphan_data:
+            parent_hash = orphan_data.get("previous_hash")
+            height = orphan_data.get("height", 0)
+            logger.warning(f"[REORG_CHECK] Need parent block {parent_hash} at height {height - 1} for reorganization")
+    
     def _evaluate_orphan_chains(self):
         """Check if any orphan chain should trigger a reorganization"""
         current_tip, current_height = self.get_best_chain_tip()

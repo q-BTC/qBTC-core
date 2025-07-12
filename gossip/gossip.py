@@ -683,7 +683,7 @@ class GossipNode:
                                     blocks_request = {
                                         "type": "get_blocks",
                                         "start_height": local_height + 1,
-                                        "end_height": min(local_height + 100, peer_height),  # Request max 100 blocks at a time
+                                        "end_height": min(local_height + 20, peer_height),  # Request max 20 blocks at a time for reliable ordering
                                         "timestamp": int(time.time() * 1000)
                                     }
                                     writer.write((json.dumps(blocks_request) + "\n").encode('utf-8'))
@@ -697,6 +697,37 @@ class GossipNode:
                                             blocks = blocks_msg.get("blocks", [])
                                             if blocks:
                                                 logger.info(f"[PERIODIC_SYNC] Received {len(blocks)} blocks from {peer}")
+                                                process_blocks_from_peer(blocks)
+                                        elif blocks_msg.get("type") == "blocks_response_chunked":
+                                            # Handle chunked response
+                                            total_chunks = blocks_msg.get("total_chunks", 0)
+                                            total_blocks = blocks_msg.get("total_blocks", 0)
+                                            blocks = []
+                                            
+                                            logger.info(f"[PERIODIC_SYNC] Receiving chunked response with {total_chunks} chunks, {total_blocks} total blocks")
+                                            
+                                            for chunk_num in range(total_chunks):
+                                                chunk_line = await asyncio.wait_for(reader.readline(), timeout=30)
+                                                if not chunk_line:
+                                                    logger.error(f"[PERIODIC_SYNC] Connection closed while reading chunk {chunk_num}")
+                                                    break
+                                                
+                                                try:
+                                                    chunk_data = json.loads(chunk_line.decode('utf-8').strip())
+                                                    if chunk_data.get("chunk_num") != chunk_num:
+                                                        logger.error(f"[PERIODIC_SYNC] Expected chunk {chunk_num}, got {chunk_data.get('chunk_num')}")
+                                                        break
+                                                    
+                                                    chunk_blocks = chunk_data.get("blocks", [])
+                                                    blocks.extend(chunk_blocks)
+                                                    logger.info(f"[PERIODIC_SYNC] Received chunk {chunk_num + 1}/{total_chunks} with {len(chunk_blocks)} blocks")
+                                                    
+                                                except json.JSONDecodeError as e:
+                                                    logger.error(f"[PERIODIC_SYNC] Failed to decode chunk {chunk_num}: {e}")
+                                                    break
+                                            
+                                            if blocks:
+                                                logger.info(f"[PERIODIC_SYNC] Received total of {len(blocks)} blocks from {peer}")
                                                 process_blocks_from_peer(blocks)
                                 
                                 # If we're ahead, push blocks to peer
