@@ -15,6 +15,9 @@ from blockchain.transaction_validator import TransactionValidator
 from rocksdict import WriteBatch
 from state.state import mempool_manager
 from blockchain.block_height_index import get_height_index
+from blockchain.redis_cache import BlockchainRedisCache
+import os
+import asyncio
 
 logger = logging.getLogger(__name__)
 
@@ -40,28 +43,91 @@ class ChainManager:
         self.MAX_ORPHAN_BLOCKS = 100  # Maximum number of orphan blocks to keep
         self.MAX_ORPHAN_AGE = 3600  # Maximum age of orphan blocks in seconds (1 hour)
         self.is_syncing = False  # Flag to indicate if we're in initial sync
+        
+        # Initialize Redis cache if available
+        redis_url = os.getenv("REDIS_URL", None)
+        self.redis_cache = BlockchainRedisCache(redis_url) if redis_url and os.getenv("USE_REDIS", "false").lower() == "true" else None
+        
         self._initialize_index()
     
     def _initialize_index(self):
         """Build in-memory index of all blocks in database"""
         logger.info("Initializing chain index...")
+        start_time = time.time()
+        
+        # Try to load from Redis cache first
+        if self.redis_cache:
+            try:
+                cached_index = asyncio.run(self.redis_cache.get_chain_index())
+                if cached_index:
+                    self.block_index = cached_index.get("block_index", {})
+                    self.chain_tips = set(cached_index.get("chain_tips", []))
+                    elapsed = time.time() - start_time
+                    logger.info(f"Chain index loaded from Redis cache in {elapsed:.2f}s with {len(self.block_index)} blocks and {len(self.chain_tips)} tips")
+                    return
+            except Exception as e:
+                logger.warning(f"Failed to load chain index from Redis: {e}")
+        
+        # Build index from database
+        logger.info("Building chain index from database (this may take a while)...")
+        block_count = 0
+        cumulative_difficulties = {}
         
         # Load all blocks into index
         for key, value in self.db.items():
             if key.startswith(b"block:"):
                 block_data = json.loads(value.decode())
                 block_hash = block_data["block_hash"]
+                
+                # Try to get cumulative difficulty from cache
+                cached_difficulty = None
+                if self.redis_cache:
+                    try:
+                        cached_difficulty = asyncio.run(self.redis_cache.get_cumulative_difficulty(block_hash))
+                    except:
+                        pass
+                
+                if cached_difficulty:
+                    cumulative_difficulty = Decimal(cached_difficulty)
+                else:
+                    cumulative_difficulty = self._get_cumulative_difficulty(block_hash)
+                    cumulative_difficulties[block_hash] = cumulative_difficulty
+                
                 self.block_index[block_hash] = {
                     "height": block_data["height"],
                     "previous_hash": block_data["previous_hash"],
                     "timestamp": block_data["timestamp"],
                     "bits": block_data["bits"],
-                    "cumulative_difficulty": self._get_cumulative_difficulty(block_hash)
+                    "cumulative_difficulty": cumulative_difficulty
                 }
+                
+                block_count += 1
+                if block_count % 1000 == 0:
+                    logger.info(f"Processed {block_count} blocks...")
         
         # Find all chain tips (blocks with no children)
         self._update_chain_tips()
-        logger.info(f"Chain index initialized with {len(self.block_index)} blocks and {len(self.chain_tips)} tips")
+        
+        # Cache the results
+        if self.redis_cache:
+            try:
+                # Cache the chain index
+                cache_data = {
+                    "block_index": self.block_index,
+                    "chain_tips": list(self.chain_tips)
+                }
+                asyncio.run(self.redis_cache.set_chain_index(cache_data))
+                
+                # Batch cache cumulative difficulties
+                if cumulative_difficulties:
+                    asyncio.run(self.redis_cache.batch_set_cumulative_difficulties(cumulative_difficulties))
+                    
+                logger.info("Chain index cached to Redis")
+            except Exception as e:
+                logger.warning(f"Failed to cache chain index: {e}")
+        
+        elapsed = time.time() - start_time
+        logger.info(f"Chain index initialized in {elapsed:.2f}s with {len(self.block_index)} blocks and {len(self.chain_tips)} tips")
     
     def _update_chain_tips(self):
         """Update the set of chain tips"""
@@ -109,6 +175,16 @@ class ChainManager:
         Get the best chain tip (highest cumulative difficulty)
         Returns (block_hash, height)
         """
+        # Try Redis cache first
+        if self.redis_cache:
+            try:
+                cached_best = asyncio.run(self.redis_cache.get_best_chain_info())
+                if cached_best:
+                    return cached_best["block_hash"], cached_best["height"]
+            except Exception as e:
+                logger.debug(f"Failed to get best chain from Redis: {e}")
+        
+        # Calculate best chain tip
         best_tip = None
         best_difficulty = Decimal(0)
         best_height = 0
@@ -118,8 +194,8 @@ class ChainManager:
             if not tip_info:
                 continue
                 
-            difficulty = self._get_cumulative_difficulty(tip_hash)
-            if difficulty > best_difficulty:
+            difficulty = tip_info.get("cumulative_difficulty")
+            if difficulty and difficulty > best_difficulty:
                 best_difficulty = difficulty
                 best_tip = tip_hash
                 best_height = tip_info["height"]
@@ -127,6 +203,17 @@ class ChainManager:
         if not best_tip:
             # No tips found, return -1 for empty blockchain
             return "00" * 32, -1
+        
+        # Cache the result
+        if self.redis_cache:
+            try:
+                asyncio.run(self.redis_cache.set_best_chain_info({
+                    "block_hash": best_tip,
+                    "height": best_height,
+                    "difficulty": str(best_difficulty)
+                }))
+            except Exception as e:
+                logger.debug(f"Failed to cache best chain: {e}")
             
         return best_tip, best_height
     
@@ -327,14 +414,24 @@ class ChainManager:
                             self.db.put(tx_key, json.dumps(tx).encode())
                             logger.debug(f"Stored transaction {tx['txid']} from block {block_hash}")
         
+        # Calculate cumulative difficulty
+        cumulative_difficulty = self._get_cumulative_difficulty(block_hash)
+        
         # Add block to index
         self.block_index[block_hash] = {
             "height": height,
             "previous_hash": prev_hash,
             "timestamp": block_data["timestamp"],
             "bits": block_data["bits"],
-            "cumulative_difficulty": self._get_cumulative_difficulty(block_hash)
+            "cumulative_difficulty": cumulative_difficulty
         }
+        
+        # Cache cumulative difficulty to Redis
+        if self.redis_cache:
+            try:
+                asyncio.run(self.redis_cache.set_cumulative_difficulty(block_hash, cumulative_difficulty))
+            except Exception as e:
+                logger.debug(f"Failed to cache cumulative difficulty: {e}")
         
         # Check if this creates a new chain tip or extends existing one
         self._update_chain_tips()
@@ -345,6 +442,13 @@ class ChainManager:
         if block_hash == current_tip:
             # This block became the new best tip
             logger.info(f"New best chain tip: {block_hash} at height {height}")
+            
+            # Invalidate best chain cache since we have a new tip
+            if self.redis_cache:
+                try:
+                    asyncio.run(self.redis_cache.invalidate_chain_caches())
+                except Exception as e:
+                    logger.debug(f"Failed to invalidate caches: {e}")
             
             # Connect the block to process its transactions and create UTXOs
             # Need to create a WriteBatch for the transaction

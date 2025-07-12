@@ -3,8 +3,12 @@ Block Height Index - Provides efficient block lookups by height
 """
 import json
 import logging
+import os
+import asyncio
+import time
 from typing import Optional, Dict
 from database.database import get_db
+from blockchain.redis_cache import BlockchainRedisCache
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +22,10 @@ class BlockHeightIndex:
         self.db = db if db is not None else get_db()
         self._memory_cache: Dict[int, str] = {}  # height -> block_hash cache
         self._cache_size_limit = 1000  # Keep last 1000 blocks in memory
+        
+        # Initialize Redis cache if available
+        redis_url = os.getenv("REDIS_URL", None)
+        self.redis_cache = BlockchainRedisCache(redis_url) if redis_url and os.getenv("USE_REDIS", "false").lower() == "true" else None
         
     def get_block_hash_by_height(self, height: int) -> Optional[str]:
         """Get block hash for a given height"""
@@ -87,8 +95,30 @@ class BlockHeightIndex:
     def rebuild_index(self):
         """Rebuild the entire height index from existing blocks"""
         logger.info("Rebuilding block height index...")
+        start_time = time.time()
         
+        # Try to load from Redis cache first
+        if self.redis_cache:
+            try:
+                cached_index = asyncio.run(self.redis_cache.get_height_index())
+                if cached_index:
+                    # Restore index to database
+                    for height, block_hash in cached_index.items():
+                        height_key = f"height:{height:08d}".encode()
+                        self.db.put(height_key, block_hash.encode())
+                        self._add_to_cache(height, block_hash)
+                    
+                    elapsed = time.time() - start_time
+                    logger.info(f"Block height index restored from Redis cache in {elapsed:.2f}s with {len(cached_index)} blocks")
+                    return
+            except Exception as e:
+                logger.warning(f"Failed to load height index from Redis: {e}")
+        
+        # Build index from database
+        logger.info("Building height index from database (this may take a while)...")
         count = 0
+        height_index = {}
+        
         for key, value in self.db.items():
             if key.startswith(b"block:"):
                 block_data = json.loads(value.decode())
@@ -97,15 +127,35 @@ class BlockHeightIndex:
                 
                 if height is not None and block_hash:
                     self.add_block_to_index(height, block_hash)
+                    height_index[height] = block_hash
                     count += 1
                     
                     if count % 1000 == 0:
                         logger.info(f"Indexed {count} blocks...")
         
-        logger.info(f"Block height index rebuilt with {count} blocks")
+        # Cache the height index to Redis
+        if self.redis_cache and height_index:
+            try:
+                asyncio.run(self.redis_cache.set_height_index(height_index))
+                logger.info("Height index cached to Redis")
+            except Exception as e:
+                logger.warning(f"Failed to cache height index: {e}")
+        
+        elapsed = time.time() - start_time
+        logger.info(f"Block height index rebuilt in {elapsed:.2f}s with {count} blocks")
     
     def get_highest_indexed_height(self) -> int:
         """Get the highest block height in the index"""
+        # Try Redis cache first
+        if self.redis_cache:
+            try:
+                height_index = asyncio.run(self.redis_cache.get_height_index())
+                if height_index:
+                    return max(height_index.keys()) if height_index else -1
+            except:
+                pass
+        
+        # Fall back to database scan
         highest = -1
         
         # Check database for height keys
