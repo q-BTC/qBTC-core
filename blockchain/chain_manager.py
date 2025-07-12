@@ -58,7 +58,7 @@ class ChainManager:
         # Try to load from Redis cache first
         if self.redis_cache:
             try:
-                cached_index = asyncio.run(self.redis_cache.get_chain_index())
+                cached_index = self.redis_cache.get_chain_index_sync()
                 if cached_index:
                     self.block_index = cached_index.get("block_index", {})
                     self.chain_tips = set(cached_index.get("chain_tips", []))
@@ -83,7 +83,7 @@ class ChainManager:
                 cached_difficulty = None
                 if self.redis_cache:
                     try:
-                        cached_difficulty = asyncio.run(self.redis_cache.get_cumulative_difficulty(block_hash))
+                        cached_difficulty = self.redis_cache.get_cumulative_difficulty_sync(block_hash)
                     except:
                         pass
                 
@@ -116,11 +116,11 @@ class ChainManager:
                     "block_index": self.block_index,
                     "chain_tips": list(self.chain_tips)
                 }
-                asyncio.run(self.redis_cache.set_chain_index(cache_data))
+                self.redis_cache.set_chain_index_sync(cache_data)
                 
                 # Batch cache cumulative difficulties
                 if cumulative_difficulties:
-                    asyncio.run(self.redis_cache.batch_set_cumulative_difficulties(cumulative_difficulties))
+                    self.redis_cache.batch_set_cumulative_difficulties_sync(cumulative_difficulties)
                     
                 logger.info("Chain index cached to Redis")
             except Exception as e:

@@ -226,3 +226,60 @@ class BlockchainRedisCache:
             return True
         except Exception:
             return False
+    
+    # Synchronous wrapper methods for use in non-async contexts
+    def get_chain_index_sync(self) -> Optional[Dict[str, Any]]:
+        """Synchronous wrapper for get_chain_index"""
+        if not self.enabled:
+            return None
+            
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            result = loop.run_until_complete(self.get_chain_index())
+            loop.close()
+            return result
+        except Exception as e:
+            logger.error(f"Failed to get chain index (sync): {e}")
+            return None
+    
+    def set_chain_index_sync(self, index: Dict[str, Any], ttl: int = 3600):
+        """Synchronous wrapper for set_chain_index"""
+        if not self.enabled:
+            return
+            
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(self.set_chain_index(index, ttl))
+            loop.close()
+        except Exception as e:
+            logger.error(f"Failed to set chain index (sync): {e}")
+    
+    def get_cumulative_difficulty_sync(self, block_hash: str) -> Optional[str]:
+        """Synchronous wrapper for get_cumulative_difficulty"""
+        if not self.enabled:
+            return None
+            
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            result = loop.run_until_complete(self.get_cumulative_difficulty(block_hash))
+            loop.close()
+            return result
+        except Exception as e:
+            logger.error(f"Failed to get cumulative difficulty (sync): {e}")
+            return None
+    
+    def batch_set_cumulative_difficulties_sync(self, difficulties: Dict[str, Decimal], ttl: int = 86400):
+        """Synchronous wrapper for batch_set_cumulative_difficulties"""
+        if not self.enabled:
+            return
+            
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(self.batch_set_cumulative_difficulties(difficulties, ttl))
+            loop.close()
+        except Exception as e:
+            logger.error(f"Failed to batch set difficulties (sync): {e}")
