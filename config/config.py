@@ -10,6 +10,12 @@ HEARTBEAT_INTERVAL = 30
 VALIDATOR_TIMEOUT = 90 * 3
 BOOTSTRAP_NODES = [("api.bitcoinqs.org", 8001)]
 VALIDATORS_LIST_KEY = "validators_list"
+
+# CRITICAL: Known validators that should NEVER be removed
+KNOWN_VALIDATORS = {
+    "18.156.69.79": {"port": 8002, "name": "v1.qb.tc"},
+    "3.120.176.166": {"port": 8002, "name": "v2.qb.tc"}
+}
 shutdown_event = asyncio.Event()
 MAX_CHECKPOINTS = 1000
 MAX_TX_HISTORY = 10000

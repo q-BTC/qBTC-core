@@ -55,6 +55,8 @@ class GossipNode:
         self.bootstrap_peer = None
         self.ip_to_peer = {}  # Track IP -> (port, validator_id, timestamp) mapping
         self.peer_timestamps = {}  # Track (ip, port) -> timestamp
+        # CRITICAL: Protected peers that must NEVER be removed
+        self.protected_peers = set()  # Peers that are critical for network operation
 
     async def start_server(self, host="0.0.0.0", port=DEFAULT_GOSSIP_PORT):
         self.gossip_port = port  # Store for NAT traversal
@@ -469,8 +471,26 @@ class GossipNode:
                 logger.warning(f"Failed to discover new peers: {e}")
         
         if not peers:
-            logger.warning("No peers available for broadcast")
-            return
+            # CRITICAL: This should NEVER happen for blocks!
+            if msg_type == "block":
+                logger.error("CRITICAL: No peers available for BLOCK broadcast! This will cause validators to fall behind!")
+                # Try to recover by re-discovering peers
+                logger.info("Attempting emergency peer discovery...")
+                from dht.dht import discover_peers_once
+                try:
+                    await discover_peers_once(self)
+                    peers = self.dht_peers | self.client_peers
+                    if peers:
+                        logger.info(f"Emergency discovery found {len(peers)} peers")
+                    else:
+                        logger.error("Emergency discovery failed - validators will not receive blocks!")
+                except Exception as e:
+                    logger.error(f"Emergency discovery failed: {e}")
+            else:
+                logger.warning(f"No peers available for {msg_type} broadcast")
+            
+            if not peers:
+                return
             
         # For transactions, broadcast to ALL peers, not just a subset
         if msg_type == "transaction":
@@ -784,9 +804,14 @@ class GossipNode:
             # Check every 30 seconds
             await asyncio.sleep(30)
 
-    def add_peer(self, ip: str, port: int, peer_info=None):
+    def add_peer(self, ip: str, port: int, peer_info=None, protected=False):
         peer = (ip, port)
         current_time = time.time()
+        
+        # CRITICAL: Mark important peers as protected
+        if protected or (peer_info and peer_info.get('protected', False)):
+            self.protected_peers.add(peer)
+            logger.info(f"Added PROTECTED peer {peer} - this peer will NEVER be removed")
         
         # Don't add ourselves as a peer - check using dynamic validator ID
         if peer_info and 'validator_id' in peer_info:
@@ -882,6 +907,11 @@ class GossipNode:
 
     def remove_peer(self, ip: str, port: int):
         peer = (ip, port)
+        
+        # CRITICAL: NEVER remove protected peers
+        if peer in self.protected_peers:
+            logger.error(f"REFUSING to remove PROTECTED peer {peer}! This peer is critical for network operation.")
+            return
         
         # Clean up IP mapping
         if ip in self.ip_to_peer and self.ip_to_peer[ip][0] == port:
