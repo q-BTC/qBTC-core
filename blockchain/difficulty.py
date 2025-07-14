@@ -146,11 +146,48 @@ def get_next_bits(db, current_height: int) -> int:
     # Only adjust at interval boundaries
     if next_height % DIFFICULTY_ADJUSTMENT_INTERVAL != 0:
         # Use the same difficulty as the last block
+        # First try height index (fast path)
         height_index = get_height_index()
         last_block = height_index.get_block_by_height(current_height)
-        if last_block:
-            return last_block.get("bits", MAX_TARGET_BITS)
-        return MAX_TARGET_BITS
+        if last_block and last_block.get("bits") is not None:
+            return last_block["bits"]
+        
+        # Fallback: scan the blockchain to find the block at this height
+        # This is slower but ensures we can always find the correct difficulty
+        logger.warning(f"Height index miss for height {current_height}, scanning blockchain")
+        
+        # Get the current chain tip and work backwards
+        tip_key = b"chain:tip"
+        tip_hash = db.get(tip_key)
+        if not tip_hash:
+            logger.error("No chain tip found")
+            raise ValueError("Cannot determine difficulty: no chain tip")
+        
+        # Walk back from tip to find the block at current_height
+        block_hash = tip_hash.decode()
+        while block_hash:
+            block_key = f"block:{block_hash}".encode()
+            block_data = db.get(block_key)
+            if not block_data:
+                logger.error(f"Block {block_hash} not found in database")
+                raise ValueError(f"Cannot determine difficulty: block {block_hash} not found")
+            
+            block = json.loads(block_data.decode())
+            if block["height"] == current_height:
+                if block.get("bits") is None:
+                    logger.error(f"Block at height {current_height} has no bits field")
+                    raise ValueError(f"Cannot determine difficulty: block at height {current_height} missing bits field")
+                return block["bits"]
+            elif block["height"] < current_height:
+                # We've gone too far back
+                logger.error(f"Could not find block at height {current_height}")
+                raise ValueError(f"Cannot determine difficulty: block at height {current_height} not found")
+            
+            # Continue to previous block
+            block_hash = block.get("previous_hash")
+        
+        logger.error(f"Reached genesis without finding height {current_height}")
+        raise ValueError(f"Cannot determine difficulty: block at height {current_height} not found")
     
     # Find the first and last block of the interval
     interval_start_height = current_height - DIFFICULTY_ADJUSTMENT_INTERVAL + 1
@@ -159,15 +196,58 @@ def get_next_bits(db, current_height: int) -> int:
     first_block = height_index.get_block_by_height(interval_start_height)
     last_block = height_index.get_block_by_height(current_height)
     
+    # If height index fails, try direct lookup
     if not first_block or not last_block:
-        logger.error(f"Could not find blocks for difficulty adjustment at height {current_height}")
-        return MAX_TARGET_BITS
+        logger.warning(f"Height index miss for difficulty adjustment, using direct lookup")
+        
+        # Get chain tip and walk back
+        tip_key = b"chain:tip"
+        tip_hash = db.get(tip_key)
+        if not tip_hash:
+            raise ValueError("Cannot calculate difficulty: no chain tip")
+        
+        # Find blocks by walking the chain
+        blocks_needed = {interval_start_height: None, current_height: None}
+        block_hash = tip_hash.decode()
+        
+        while block_hash and (blocks_needed[interval_start_height] is None or blocks_needed[current_height] is None):
+            block_key = f"block:{block_hash}".encode()
+            block_data = db.get(block_key)
+            if not block_data:
+                raise ValueError(f"Cannot calculate difficulty: block {block_hash} not found")
+            
+            block = json.loads(block_data.decode())
+            height = block["height"]
+            
+            if height in blocks_needed:
+                blocks_needed[height] = block
+            
+            if height < interval_start_height:
+                # Gone too far
+                break
+                
+            block_hash = block.get("previous_hash")
+        
+        first_block = blocks_needed[interval_start_height]
+        last_block = blocks_needed[current_height]
+        
+        if not first_block or not last_block:
+            raise ValueError(f"Cannot calculate difficulty adjustment: missing blocks at heights {interval_start_height} or {current_height}")
     
     # Calculate new difficulty
+    last_bits = last_block.get("bits")
+    if last_bits is None:
+        raise ValueError(f"Block at height {current_height} missing bits field for difficulty adjustment")
+    
+    first_timestamp = first_block.get("timestamp")
+    last_timestamp = last_block.get("timestamp")
+    if first_timestamp is None or last_timestamp is None:
+        raise ValueError(f"Blocks missing timestamp fields for difficulty adjustment")
+    
     return calculate_next_bits(
-        last_block.get("bits", MAX_TARGET_BITS),
-        first_block.get("timestamp"),
-        last_block.get("timestamp"),
+        last_bits,
+        first_timestamp,
+        last_timestamp,
         DIFFICULTY_ADJUSTMENT_INTERVAL
     )
 

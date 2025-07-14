@@ -348,7 +348,13 @@ class ChainManager:
                 # Parent exists, we can validate difficulty
                 parent_block = json.loads(parent_block_data.decode())
                 parent_height = parent_block["height"]
-                expected_bits = get_next_bits(self.db, parent_height)
+                
+                try:
+                    expected_bits = get_next_bits(self.db, parent_height)
+                except ValueError as e:
+                    # Can't determine expected difficulty - reject block
+                    logger.error(f"Cannot validate block {block_hash}: {str(e)}")
+                    return False, f"Cannot determine expected difficulty: {str(e)}"
                 
                 if not validate_block_bits(block_data["bits"], expected_bits):
                     return False, f"Invalid difficulty bits at height {height}: expected {expected_bits:#x}, got {block_data['bits']:#x}"
