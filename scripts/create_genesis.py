@@ -103,6 +103,13 @@ def main():
     }
     db[utxo_key] = json.dumps(utxo_data).encode()
     
+    # Set chain:best_tip to genesis block
+    tip_key = b"chain:best_tip"
+    db[tip_key] = json.dumps({
+        "hash": genesis_hash,
+        "height": 0
+    }).encode()
+    
     db.close()
     print("Genesis block created successfully!")
 

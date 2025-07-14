@@ -146,6 +146,18 @@ class ChainManager:
         
         elapsed = time.time() - start_time
         logger.info(f"Chain index initialized in {elapsed:.2f}s with {len(self.block_index)} blocks and {len(self.chain_tips)} tips")
+        
+        # Initialize chain:best_tip if not already set
+        tip_key = b"chain:best_tip"
+        if not self.db.get(tip_key):
+            # Find and set the best chain tip
+            best_tip, best_height = await self.get_best_chain_tip()
+            if best_tip:
+                self.db.put(tip_key, json.dumps({
+                    "hash": best_tip,
+                    "height": best_height
+                }).encode())
+                logger.info(f"Initialized chain:best_tip to {best_tip} at height {best_height}")
     
     def _update_chain_tips(self):
         """Update the set of chain tips"""
@@ -559,6 +571,13 @@ class ChainManager:
             batch = WriteBatch()
             self._connect_block(block_data, batch)
             self.db.write(batch)
+            
+            # Update chain:best_tip in database
+            tip_key = b"chain:best_tip"
+            self.db.put(tip_key, json.dumps({
+                "hash": block_hash,
+                "height": height
+            }).encode())
             
             # Process any orphans that can now be connected
             await self._process_orphans_for_block(block_hash)

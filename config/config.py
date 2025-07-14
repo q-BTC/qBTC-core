@@ -8,7 +8,7 @@ DEFAULT_GOSSIP_PORT = 7002
 DHT_PORT = 8001
 HEARTBEAT_INTERVAL = 30
 VALIDATOR_TIMEOUT = 90 * 3
-BOOTSTRAP_NODES = [("api.bitcoinqs.org", 8001)]
+BOOTSTRAP_NODES = [("localhost", 8001)]
 VALIDATORS_LIST_KEY = "validators_list"
 
 # CRITICAL: Known validators that should NEVER be removed

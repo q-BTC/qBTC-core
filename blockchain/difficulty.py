@@ -157,7 +157,7 @@ def get_next_bits(db, current_height: int) -> int:
         logger.warning(f"Height index miss for height {current_height}, scanning blockchain")
         
         # Get the current chain tip and work backwards
-        tip_key = b"chain:tip"
+        tip_key = b"chain:best_tip"
         tip_hash = db.get(tip_key)
         if not tip_hash:
             logger.error("No chain tip found")
@@ -201,7 +201,7 @@ def get_next_bits(db, current_height: int) -> int:
         logger.warning(f"Height index miss for difficulty adjustment, using direct lookup")
         
         # Get chain tip and walk back
-        tip_key = b"chain:tip"
+        tip_key = b"chain:best_tip"
         tip_hash = db.get(tip_key)
         if not tip_hash:
             raise ValueError("Cannot calculate difficulty: no chain tip")
