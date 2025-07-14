@@ -752,34 +752,34 @@ async def maintain_validator_list(gossip_node):
             
             # Check heartbeats for all validators
             for v in dht_set:
-            try:
-                # Skip heartbeat check for actively connected validators
-                if v in active_validators:
-                    alive.add(v)
-                    continue
-                    
-                last_seen_raw = await kad_server.get(f"validator_{v}_heartbeat")
-                last_seen_str = b2s(last_seen_raw)
-                last_seen = float(last_seen_str) if last_seen_str else None
-                if last_seen and (current_time - last_seen) <= VALIDATOR_TIMEOUT:
-                    alive.add(v)
-                    # Reset failure count on successful heartbeat
-                    if v in validator_heartbeat_failures:
-                        del validator_heartbeat_failures[v]
-                else:
-                    # Heartbeat is stale, but check if validator is in gossip peer list
-                    # before marking as dead
-                    if v in known_validators:
-                        logger.warning(f"Validator {v} heartbeat is stale ({current_time - last_seen:.1f}s old) but keeping in list")
-                        alive.add(v)  # Keep validator alive if it's in our known list
-            except Exception as e:
-                logger.warning(f"Failed to fetch heartbeat for {v}: {e}")
-                # On DHT lookup failure, keep the validator if it's known
-                if v in known_validators or v in active_validators:
-                    logger.info(f"Keeping validator {v} despite DHT lookup failure (known or active)")
-                    alive.add(v)
+                try:
+                    # Skip heartbeat check for actively connected validators
+                    if v in active_validators:
+                        alive.add(v)
+                        continue
+                        
+                    last_seen_raw = await kad_server.get(f"validator_{v}_heartbeat")
+                    last_seen_str = b2s(last_seen_raw)
+                    last_seen = float(last_seen_str) if last_seen_str else None
+                    if last_seen and (current_time - last_seen) <= VALIDATOR_TIMEOUT:
+                        alive.add(v)
+                        # Reset failure count on successful heartbeat
+                        if v in validator_heartbeat_failures:
+                            del validator_heartbeat_failures[v]
+                    else:
+                        # Heartbeat is stale, but check if validator is in gossip peer list
+                        # before marking as dead
+                        if v in known_validators:
+                            logger.warning(f"Validator {v} heartbeat is stale ({current_time - last_seen:.1f}s old) but keeping in list")
+                            alive.add(v)  # Keep validator alive if it's in our known list
+                except Exception as e:
+                    logger.warning(f"Failed to fetch heartbeat for {v}: {e}")
+                    # On DHT lookup failure, keep the validator if it's known
+                    if v in known_validators or v in active_validators:
+                        logger.info(f"Keeping validator {v} despite DHT lookup failure (known or active)")
+                        alive.add(v)
 
-        alive.add(VALIDATOR_ID)
+            alive.add(VALIDATOR_ID)
 
             if alive != dht_set:
                 try:
@@ -793,28 +793,28 @@ async def maintain_validator_list(gossip_node):
                 if v == VALIDATOR_ID:
                     continue
                 try:
-                gossip_info_json = await kad_server.get(f"gossip_{v}")
-                if gossip_info_json:
-                    info = json.loads(gossip_info_json)
-                    # Handle both old and new format
-                    ip = info.get("ip", info.get("external_ip"))
-                    port = info.get("port", info.get("external_port"))
-                    public_key = info.get("publicKey", "")
-                    
-                    if ip and port and ip != own_ip:
-                        logger.info(f"Adding new validator {v} at {ip}:{port} to gossip peers")
-                        # CRITICAL: Mark all validators as protected on bootstrap servers
-                        is_protected = True  # All validators are protected!
-                        gossip_node.add_peer(ip, port, peer_info=info, protected=is_protected)
-                        # Store the mapping for this validator
-                        validator_peer_mapping[v] = {'ip': ip, 'port': port}
-                        #await push_blocks(ip, port)
-                        if public_key:
-                            validator_keys[v] = public_key
-                        logger.info(f"New validator joined: {v} at {ip}:{port}")
-                        # Reset any failure tracking for this validator
-                        if v in validator_heartbeat_failures:
-                            del validator_heartbeat_failures[v]
+                    gossip_info_json = await kad_server.get(f"gossip_{v}")
+                    if gossip_info_json:
+                        info = json.loads(gossip_info_json)
+                        # Handle both old and new format
+                        ip = info.get("ip", info.get("external_ip"))
+                        port = info.get("port", info.get("external_port"))
+                        public_key = info.get("publicKey", "")
+                        
+                        if ip and port and ip != own_ip:
+                            logger.info(f"Adding new validator {v} at {ip}:{port} to gossip peers")
+                            # CRITICAL: Mark all validators as protected on bootstrap servers
+                            is_protected = True  # All validators are protected!
+                            gossip_node.add_peer(ip, port, peer_info=info, protected=is_protected)
+                            # Store the mapping for this validator
+                            validator_peer_mapping[v] = {'ip': ip, 'port': port}
+                            #await push_blocks(ip, port)
+                            if public_key:
+                                validator_keys[v] = public_key
+                            logger.info(f"New validator joined: {v} at {ip}:{port}")
+                            # Reset any failure tracking for this validator
+                            if v in validator_heartbeat_failures:
+                                del validator_heartbeat_failures[v]
                 except Exception as e:
                     logger.warning(f"Failed to process new validator {v}: {e}")
 
@@ -822,55 +822,55 @@ async def maintain_validator_list(gossip_node):
             just_left = known_validators - alive
             for v in just_left:
                 try:
-                # CRITICAL: Never remove actively connected validators
-                if v in active_validators:
-                    logger.warning(f"REFUSING to remove validator {v} - it has an active gossip connection!")
-                    alive.add(v)  # Force it back into alive set
-                    continue
-                
-                # Check if validator is still in gossip peer list
-                validator_info = validator_peer_mapping.get(v, {})
-                if validator_info:
-                    peer = (validator_info.get('ip'), validator_info.get('port'))
-                    if gossip_node and hasattr(gossip_node, 'dht_peers') and peer in gossip_node.dht_peers:
-                        logger.warning(f"REFUSING to remove validator {v} at {peer} - still in gossip peer list!")
+                    # CRITICAL: Never remove actively connected validators
+                    if v in active_validators:
+                        logger.warning(f"REFUSING to remove validator {v} - it has an active gossip connection!")
                         alive.add(v)  # Force it back into alive set
                         continue
-                
-                # Only remove if DHT is actually working
-                if not kad_server:
-                    logger.warning(f"REFUSING to remove validator {v} - DHT is not initialized")
+                    
+                    # Check if validator is still in gossip peer list
+                    validator_info = validator_peer_mapping.get(v, {})
+                    if validator_info:
+                        peer = (validator_info.get('ip'), validator_info.get('port'))
+                        if gossip_node and hasattr(gossip_node, 'dht_peers') and peer in gossip_node.dht_peers:
+                            logger.warning(f"REFUSING to remove validator {v} at {peer} - still in gossip peer list!")
+                            alive.add(v)  # Force it back into alive set
+                            continue
+                    
+                    # Only remove if DHT is actually working
+                    if not kad_server:
+                        logger.warning(f"REFUSING to remove validator {v} - DHT is not initialized")
+                        alive.add(v)
+                        continue
+                        
+                    # Check if this validator has exceeded failure threshold
+                    if validator_heartbeat_failures.get(v, 0) < 10:  # Increased from 3 to 10
+                        logger.info(f"Validator {v} marked as left but hasn't exceeded failure threshold ({validator_heartbeat_failures.get(v, 0)}/10), skipping removal")
+                        alive.add(v)  # Keep it alive
+                        continue
+                        
+                    # Only proceed with removal if we're ABSOLUTELY SURE
+                    logger.error(f"Removing validator {v} after {validator_heartbeat_failures.get(v, 0)} failures - this should be rare!")
+                    
+                    gossip_info_json = await kad_server.get(f"gossip_{v}")
+                    if gossip_info_json:
+                        info = json.loads(gossip_info_json)
+                        # Handle both old and new format
+                        ip = info.get("ip", info.get("external_ip"))
+                        port = info.get("port", info.get("external_port"))
+                        if ip and port:
+                            logger.warning(f"Removing validator {v} at {ip}:{port} after {validator_heartbeat_failures.get(v, 0)} failures")
+                            gossip_node.remove_peer(ip, port)
+                    validator_keys.pop(v, None)
+                    validator_peer_mapping.pop(v, None)
+                    # Clear failure tracking
+                    if v in validator_heartbeat_failures:
+                        del validator_heartbeat_failures[v]
+                    logger.info(f"Validator left: {v}")
+                except Exception as e:
+                    logger.warning(f"Failed to remove validator {v}: {e}")
+                    # On error, keep the validator
                     alive.add(v)
-                    continue
-                    
-                # Check if this validator has exceeded failure threshold
-                if validator_heartbeat_failures.get(v, 0) < 10:  # Increased from 3 to 10
-                    logger.info(f"Validator {v} marked as left but hasn't exceeded failure threshold ({validator_heartbeat_failures.get(v, 0)}/10), skipping removal")
-                    alive.add(v)  # Keep it alive
-                    continue
-                    
-                # Only proceed with removal if we're ABSOLUTELY SURE
-                logger.error(f"Removing validator {v} after {validator_heartbeat_failures.get(v, 0)} failures - this should be rare!")
-                
-                gossip_info_json = await kad_server.get(f"gossip_{v}")
-                if gossip_info_json:
-                    info = json.loads(gossip_info_json)
-                    # Handle both old and new format
-                    ip = info.get("ip", info.get("external_ip"))
-                    port = info.get("port", info.get("external_port"))
-                    if ip and port:
-                        logger.warning(f"Removing validator {v} at {ip}:{port} after {validator_heartbeat_failures.get(v, 0)} failures")
-                        gossip_node.remove_peer(ip, port)
-                validator_keys.pop(v, None)
-                validator_peer_mapping.pop(v, None)
-                # Clear failure tracking
-                if v in validator_heartbeat_failures:
-                    del validator_heartbeat_failures[v]
-                logger.info(f"Validator left: {v}")
-            except Exception as e:
-                logger.warning(f"Failed to remove validator {v}: {e}")
-                # On error, keep the validator
-                alive.add(v)
 
             # Update known validators
             known_validators.clear()

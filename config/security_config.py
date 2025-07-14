@@ -12,7 +12,7 @@ class SecurityConfig:
         # Rate limiting configuration
         self.RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
         self.REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-        self.USE_REDIS = os.getenv("USE_REDIS", "false").lower() == "true"
+        self.USE_REDIS = os.getenv("USE_REDIS", "true").lower() == "true"
         
         # Rate limit rules (requests per minute)
         self.RATE_LIMITS = {

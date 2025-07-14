@@ -25,7 +25,7 @@ class BlockHeightIndex:
         
         # Initialize Redis cache if available
         redis_url = os.getenv("REDIS_URL", None)
-        self.redis_cache = BlockchainRedisCache(redis_url) if redis_url and os.getenv("USE_REDIS", "false").lower() == "true" else None
+        self.redis_cache = BlockchainRedisCache(redis_url) if redis_url and os.getenv("USE_REDIS", "true").lower() == "true" else None
         
     def get_block_hash_by_height(self, height: int) -> Optional[str]:
         """Get block hash for a given height"""
@@ -67,6 +67,13 @@ class BlockHeightIndex:
         # Add to cache
         self._add_to_cache(height, block_hash)
         
+        # Update Redis cache incrementally
+        if self.redis_cache:
+            try:
+                self.redis_cache.update_height_index_entry_sync(height, block_hash)
+            except Exception as e:
+                logger.debug(f"Failed to update Redis height index: {e}")
+        
         logger.debug(f"Added block {block_hash} at height {height} to index")
     
     def remove_block_from_index(self, height: int):
@@ -78,6 +85,13 @@ class BlockHeightIndex:
         # Remove from cache
         if height in self._memory_cache:
             del self._memory_cache[height]
+            
+        # Update Redis cache incrementally
+        if self.redis_cache:
+            try:
+                self.redis_cache.remove_height_index_entry_sync(height)
+            except Exception as e:
+                logger.debug(f"Failed to update Redis height index: {e}")
             
         logger.debug(f"Removed block at height {height} from index")
     

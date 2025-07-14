@@ -18,6 +18,7 @@ from blockchain.block_height_index import get_height_index
 from blockchain.redis_cache import BlockchainRedisCache
 import os
 import asyncio
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,7 @@ class ChainManager:
         
         # Initialize Redis cache if available
         redis_url = os.getenv("REDIS_URL", None)
-        self.redis_cache = BlockchainRedisCache(redis_url) if redis_url and os.getenv("USE_REDIS", "false").lower() == "true" else None
+        self.redis_cache = BlockchainRedisCache(redis_url) if redis_url and os.getenv("USE_REDIS", "true").lower() == "true" else None
         
         self._initialize_index()
     
@@ -59,12 +60,19 @@ class ChainManager:
         if self.redis_cache:
             try:
                 cached_index = self.redis_cache.get_chain_index_sync()
-                if cached_index:
-                    self.block_index = cached_index.get("block_index", {})
-                    self.chain_tips = set(cached_index.get("chain_tips", []))
-                    elapsed = time.time() - start_time
-                    logger.info(f"Chain index loaded from Redis cache in {elapsed:.2f}s with {len(self.block_index)} blocks and {len(self.chain_tips)} tips")
-                    return
+                if cached_index and isinstance(cached_index, dict):
+                    # Validate cache structure
+                    block_index = cached_index.get("block_index", {})
+                    chain_tips = cached_index.get("chain_tips", [])
+                    
+                    if isinstance(block_index, dict) and isinstance(chain_tips, list):
+                        self.block_index = block_index
+                        self.chain_tips = set(chain_tips)
+                        elapsed = time.time() - start_time
+                        logger.info(f"Chain index loaded from Redis cache in {elapsed:.2f}s with {len(self.block_index)} blocks and {len(self.chain_tips)} tips")
+                        return
+                    else:
+                        logger.warning("Invalid cache structure, rebuilding from database")
             except Exception as e:
                 logger.warning(f"Failed to load chain index from Redis: {e}")
         
@@ -79,19 +87,24 @@ class ChainManager:
                 block_data = json.loads(value.decode())
                 block_hash = block_data["block_hash"]
                 
-                # Try to get cumulative difficulty from cache
-                cached_difficulty = None
-                if self.redis_cache:
-                    try:
-                        cached_difficulty = self.redis_cache.get_cumulative_difficulty_sync(block_hash)
-                    except:
-                        pass
-                
-                if cached_difficulty:
-                    cumulative_difficulty = Decimal(cached_difficulty)
+                # Try to get cumulative difficulty from block data first
+                if "cumulative_difficulty" in block_data:
+                    cumulative_difficulty = Decimal(block_data["cumulative_difficulty"])
                 else:
-                    cumulative_difficulty = self._get_cumulative_difficulty(block_hash)
-                    cumulative_difficulties[block_hash] = cumulative_difficulty
+                    # Try Redis cache
+                    cached_difficulty = None
+                    if self.redis_cache:
+                        try:
+                            cached_difficulty = self.redis_cache.get_cumulative_difficulty_sync(block_hash)
+                        except:
+                            pass
+                    
+                    if cached_difficulty:
+                        cumulative_difficulty = Decimal(cached_difficulty)
+                    else:
+                        # Fall back to calculating (for old blocks without stored difficulty)
+                        cumulative_difficulty = self._get_cumulative_difficulty(block_hash)
+                        cumulative_difficulties[block_hash] = cumulative_difficulty
                 
                 self.block_index[block_hash] = {
                     "height": block_data["height"],
@@ -145,6 +158,15 @@ class ChainManager:
     
     def _get_cumulative_difficulty(self, block_hash: str) -> Decimal:
         """Calculate cumulative difficulty from genesis to this block"""
+        # First check if the block itself has stored cumulative difficulty
+        block_key = f"block:{block_hash}".encode()
+        block_data = self.db.get(block_key)
+        if block_data:
+            block_info = json.loads(block_data.decode())
+            if "cumulative_difficulty" in block_info:
+                return Decimal(block_info["cumulative_difficulty"])
+        
+        # Fall back to calculating it by traversing the chain
         cumulative = Decimal(0)
         current_hash = block_hash
         
@@ -160,6 +182,11 @@ class ChainManager:
             else:
                 block_info = self.block_index[current_hash]
             
+            # Check if this block has stored cumulative difficulty
+            if "cumulative_difficulty" in block_info:
+                # We found a block with stored difficulty, use it and stop
+                return Decimal(block_info["cumulative_difficulty"])
+            
             # Add this block's difficulty
             bits = block_info.get("bits", 0x1d00ffff)  # Default to min difficulty
             target = bits_to_target(bits)
@@ -169,6 +196,44 @@ class ChainManager:
             current_hash = block_info.get("previous_hash")
         
         return cumulative
+    
+    def _get_cumulative_difficulty_for_new_block(self, parent_hash: str, bits: int) -> Decimal:
+        """Calculate cumulative difficulty for a new block based on its parent"""
+        # Get parent's cumulative difficulty
+        parent_cumulative = Decimal(0)
+        
+        if parent_hash and parent_hash != "00" * 32:  # Not genesis
+            # First check if parent is in our index
+            if parent_hash in self.block_index:
+                parent_cumulative = self.block_index[parent_hash]["cumulative_difficulty"]
+            else:
+                # Load parent from database
+                parent_key = f"block:{parent_hash}".encode()
+                parent_data = self.db.get(parent_key)
+                if not parent_data:
+                    # This can happen in race conditions where parent is in index but not yet in DB
+                    # Fall back to calculating from scratch
+                    logger.warning(f"Parent block {parent_hash} not in database, calculating cumulative difficulty from scratch")
+                    # Calculate parent's cumulative difficulty first
+                    parent_cumulative = self._get_cumulative_difficulty(parent_hash)
+                    # Then add this block's difficulty
+                    target = bits_to_target(bits)
+                    block_difficulty = Decimal(2**256) / Decimal(target)
+                    return parent_cumulative + block_difficulty
+                
+                parent_block = json.loads(parent_data.decode())
+                # Check if parent has stored cumulative difficulty
+                if "cumulative_difficulty" in parent_block:
+                    parent_cumulative = Decimal(parent_block["cumulative_difficulty"])
+                else:
+                    # Fall back to calculating it (for old blocks)
+                    parent_cumulative = self._get_cumulative_difficulty(parent_hash)
+        
+        # Calculate this block's difficulty contribution
+        target = bits_to_target(bits)
+        block_difficulty = Decimal(2**256) / Decimal(target)
+        
+        return parent_cumulative + block_difficulty
     
     async def get_best_chain_tip(self) -> Tuple[str, int]:
         """
@@ -402,10 +467,17 @@ class ChainManager:
                     logger.error(f"Block {block_hash} rejected: invalid coinbase - {error_msg}")
                     return False, f"Invalid coinbase transaction: {error_msg}"
         
-        # Now that validation has passed and we have the parent, store the block
+        # Now that validation has passed and we have the parent, calculate cumulative difficulty
+        # We know parent exists because orphan blocks are handled above
+        cumulative_difficulty = self._get_cumulative_difficulty_for_new_block(prev_hash, block_data["bits"])
+        
+        # Add cumulative difficulty to block data before storing
+        block_data["cumulative_difficulty"] = str(cumulative_difficulty)
+        
+        # Store the block with cumulative difficulty
         block_key = f"block:{block_hash}".encode()
         if block_key not in self.db:
-            logger.info(f"Storing new block {block_hash} at height {height}")
+            logger.info(f"Storing new block {block_hash} at height {height} with cumulative difficulty {cumulative_difficulty}")
             self.db.put(block_key, json.dumps(block_data).encode())
             
             # Also store transactions separately for fork blocks
@@ -418,8 +490,8 @@ class ChainManager:
                             self.db.put(tx_key, json.dumps(tx).encode())
                             logger.debug(f"Stored transaction {tx['txid']} from block {block_hash}")
         
-        # Calculate cumulative difficulty
-        cumulative_difficulty = self._get_cumulative_difficulty(block_hash)
+        # Use the cumulative difficulty we already calculated and stored
+        # cumulative_difficulty is already calculated above
         
         # Add block to index
         self.block_index[block_hash] = {
@@ -447,12 +519,31 @@ class ChainManager:
             # This block became the new best tip
             logger.info(f"New best chain tip: {block_hash} at height {height}")
             
-            # Invalidate best chain cache since we have a new tip
+            # Update caches incrementally for the new tip
             if self.redis_cache:
                 try:
-                    asyncio.run(self.redis_cache.invalidate_chain_caches())
+                    # Update chain index entry for new block
+                    self.redis_cache.update_chain_index_entry_sync(block_hash, {
+                        "height": height,
+                        "previous_hash": block_data["previous_hash"],
+                        "timestamp": block_data["timestamp"],
+                        "bits": block_data["bits"],
+                        "cumulative_difficulty": self.block_index[block_hash]["cumulative_difficulty"],
+                        "is_tip": True
+                    })
+                    
+                    # Update height index
+                    self.redis_cache.update_height_index_entry_sync(height, block_hash)
+                    
+                    # Update best chain info
+                    asyncio.run(self.redis_cache.set_best_chain_info({
+                        "block_hash": block_hash,
+                        "height": height,
+                        "timestamp": block_data["timestamp"],
+                        "cumulative_difficulty": str(self.block_index[block_hash]["cumulative_difficulty"])
+                    }))
                 except Exception as e:
-                    logger.debug(f"Failed to invalidate caches: {e}")
+                    logger.debug(f"Failed to update caches: {e}")
             
             # Connect the block to process its transactions and create UTXOs
             # Need to create a WriteBatch for the transaction
@@ -1005,6 +1096,34 @@ class ChainManager:
             }).encode())
             
             logger.info(f"Chain reorganization complete. New tip: {new_tip_hash}")
+            
+            # Update caches after reorganization
+            if self.redis_cache:
+                try:
+                    # Update cache for disconnected blocks
+                    for block_hash in blocks_to_disconnect:
+                        self.redis_cache.remove_chain_index_entry_sync(block_hash)
+                        if block_hash in self.block_index:
+                            height = self.block_index[block_hash]["height"]
+                            self.redis_cache.remove_height_index_entry_sync(height)
+                    
+                    # Update cache for connected blocks
+                    for block_hash in blocks_to_connect:
+                        if block_hash in self.block_index:
+                            block_info = self.block_index[block_hash]
+                            self.redis_cache.update_chain_index_entry_sync(block_hash, block_info)
+                            self.redis_cache.update_height_index_entry_sync(block_info["height"], block_hash)
+                    
+                    # Update best chain info
+                    asyncio.run(self.redis_cache.set_best_chain_info({
+                        "block_hash": new_tip_hash,
+                        "height": self.block_index[new_tip_hash]["height"],
+                        "timestamp": self.block_index[new_tip_hash]["timestamp"],
+                        "cumulative_difficulty": str(self.block_index[new_tip_hash]["cumulative_difficulty"])
+                    }))
+                except Exception as e:
+                    logger.debug(f"Failed to update caches after reorg: {e}")
+            
             return True
             
         except Exception as e:
