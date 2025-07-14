@@ -3,6 +3,7 @@ import json
 import rocksdict
 import time
 import threading
+import asyncio
 from typing import Tuple, Optional
 
 
@@ -48,7 +49,7 @@ class HeightCache:
 # Global height cache instance
 height_cache = HeightCache(ttl_seconds=1.0)
 
-def get_current_height(db, max_retries: int = 3) -> Tuple[int, str]:
+async def get_current_height(db, max_retries: int = 3) -> Tuple[int, str]:
     """
     Return (height, block_hash) of the chain tip with robust error handling.
     Returns (-1, GENESIS_PREVHASH) if the DB has no blocks yet.
@@ -65,28 +66,19 @@ def get_current_height(db, max_retries: int = 3) -> Tuple[int, str]:
     for retry in range(max_retries):
         if retry > 0:
             # Brief delay between retries with exponential backoff
-            time.sleep(0.1 * (2 ** (retry - 1)))
+            await asyncio.sleep(0.1 * (2 ** (retry - 1)))
             
         try:
             # Method 1: Try ChainManager (preferred)
             try:
-                from blockchain.chain_singleton import get_chain_manager_sync
-                cm = get_chain_manager_sync()
-                # Since this is a sync context, we'll fallback to using the block index directly
-                # rather than the async get_best_chain_tip method
-                best_tip = None
-                best_difficulty = 0
-                best_height = -1
-                
-                for tip_hash in cm.chain_tips:
-                    tip_info = cm.block_index.get(tip_hash)
-                    if tip_info and tip_info.get("cumulative_difficulty", 0) > best_difficulty:
-                        best_difficulty = tip_info["cumulative_difficulty"]
-                        best_tip = tip_hash
-                        best_height = tip_info["height"]
-                
-                if best_tip:
-                    best_hash = best_tip
+                from blockchain.chain_singleton import get_chain_manager
+                cm = await get_chain_manager()
+                # Use the async get_best_chain_tip method
+                # Get the best chain tip using async method
+                tip_info = await cm.get_best_chain_tip()
+                if tip_info:
+                    best_hash = tip_info["block_hash"]
+                    best_height = tip_info["height"]
                 else:
                     best_hash = "00" * 32
                     best_height = -1
@@ -115,7 +107,7 @@ def get_current_height(db, max_retries: int = 3) -> Tuple[int, str]:
                 from blockchain.block_height_index import get_height_index
                 height_index = get_height_index()
                 
-                highest_height = height_index.get_highest_indexed_height_sync()
+                highest_height = await height_index.get_highest_indexed_height()
                 
                 if highest_height >= 0:
                     block_hash = height_index.get_block_hash_by_height(highest_height)

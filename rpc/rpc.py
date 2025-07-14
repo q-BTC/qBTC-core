@@ -124,7 +124,7 @@ async def get_mining_info(data):
     """Handle getmininginfo RPC call - required for cpuminer"""
     try:
         db = get_db()
-        height, _ = get_current_height(db)
+        height, _ = await get_current_height(db)
         
         # Calculate current difficulty from bits
         from blockchain.difficulty import get_next_bits, compact_to_target
@@ -270,7 +270,7 @@ async def get_block_template(data):
     logger.info(f"Longpoll ID from request: {longpollid}")
     
     # Get current blockchain state
-    height, previous_block_hash = get_current_height(db)
+    height, previous_block_hash = await get_current_height(db)
     
     # If longpoll is requested and the tip hasn't changed, wait for a new block
     if longpollid and longpollid == previous_block_hash:
@@ -288,7 +288,7 @@ async def get_block_template(data):
             await asyncio.wait_for(future, timeout=60.0)
             logger.info("Longpoll triggered by new block")
             # Re-fetch the current state after new block
-            height, previous_block_hash = get_current_height(db)
+            height, previous_block_hash = await get_current_height(db)
         except asyncio.TimeoutError:
             logger.info("Longpoll timed out after 60 seconds")
             # Remove from waiters if still there
@@ -473,7 +473,7 @@ async def submit_block(request: Request, data: dict) -> dict:
         else:
             logger.info(f"Block PoW validation successful: {block.hash()}")
 
-        height_temp = get_current_height(db)
+        height_temp = await get_current_height(db)
         local_height = height_temp[0]
         local_tip = height_temp[1]
 
@@ -699,30 +699,7 @@ async def submit_block(request: Request, data: dict) -> dict:
 
         logger.info("Block merkle root validation successful")
         
-        # Use ChainManager singleton to add the block
-        from blockchain.chain_singleton import get_chain_manager
-        cm = await get_chain_manager()
-        
-        block_data = {
-            "version": version,
-            "bits": bits,
-            "height": get_current_height(db)[0] + 1,
-            "block_hash": block.hash(),
-            "previous_hash": prev_block,
-            "tx_ids": txids,
-            "nonce": nonce,
-            "timestamp": timestamp,
-            "merkle_root": calculated_merkle,
-            "miner_address": coinbase_miner_address, 
-        }
-        
-        # Add block using ChainManager
-        success, error_msg = await cm.add_block(block_data)
-        if not success:
-            logger.error(f"ChainManager rejected block: {error_msg}")
-            return rpc_error(-1, f"Block rejected: {error_msg}", data["id"])
-        
-        # Store transactions first
+        # Store transactions first before adding block
         full_transactions = []
         
         # Store coinbase transaction with proper format and txid
@@ -751,12 +728,35 @@ async def submit_block(request: Request, data: dict) -> dict:
             if tx:  # Only add non-None transactions
                 full_transactions.append(tx)
         
+        # Use ChainManager singleton to add the block
+        from blockchain.chain_singleton import get_chain_manager
+        cm = await get_chain_manager()
+        
+        block_data = {
+            "version": version,
+            "bits": bits,
+            "height": (await get_current_height(db))[0] + 1,
+            "block_hash": block.hash(),
+            "previous_hash": prev_block,
+            "tx_ids": txids,
+            "nonce": nonce,
+            "timestamp": timestamp,
+            "merkle_root": calculated_merkle,
+            "miner_address": coinbase_miner_address, 
+        }
+        
         # Add full_transactions to block_data
         block_data["full_transactions"] = full_transactions
         
-        # Store block and transactions in database
+        # Store block and transactions in database BEFORE adding block to chain
         batch.put(b"block:" + block.hash().encode(), json.dumps(block_data).encode())
         db.write(batch)
+        
+        # Now add block using ChainManager (transactions are already in DB)
+        success, error_msg = await cm.add_block(block_data)
+        if not success:
+            logger.error(f"ChainManager rejected block: {error_msg}")
+            return rpc_error(-1, f"Block rejected: {error_msg}", data["id"])
         
         # Invalidate height cache since we added a new block
         invalidate_height_cache()

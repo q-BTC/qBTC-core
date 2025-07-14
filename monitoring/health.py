@@ -62,7 +62,7 @@ class HealthMonitor:
             db = get_db()
             
             # Test read operation
-            height, tip = get_current_height(db)
+            height, tip = await get_current_height(db)
             
             # Test performance
             check_duration = time.time() - start_time
@@ -101,7 +101,7 @@ class HealthMonitor:
         """Check blockchain sync status"""
         try:
             db = get_db()
-            height, tip = get_current_height(db)
+            height, tip = await get_current_height(db)
             
             # Check if we're receiving new blocks
             current_time = time.time()

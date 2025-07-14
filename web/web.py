@@ -1333,7 +1333,7 @@ async def commit_btc_to_qbtc(request: CommitRequest):
             "message": message,
             "signature": signature,
             "timestamp": timestamp,
-            "block_height": get_current_height(),
+            "block_height": await get_current_height(get_db()),
             "commitment_hash": commitment_hash.hex(),
             "ots_proof": ots_proof
         }

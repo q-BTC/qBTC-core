@@ -51,7 +51,7 @@ async def startup(args=None):
                 async def rebuild_index_async():
                     logger.info("Starting background height index rebuild...")
                     start_time = time.time()
-                    await asyncio.to_thread(height_index.rebuild_index)
+                    await height_index.rebuild_index()
                     elapsed = time.time() - start_time
                     logger.info(f"Background height index rebuild complete in {elapsed:.2f} seconds")
                 

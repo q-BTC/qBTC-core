@@ -106,7 +106,7 @@ class BlockHeightIndex:
             for h in heights_to_remove:
                 del self._memory_cache[h]
     
-    def rebuild_index(self):
+    async def rebuild_index(self):
         """Rebuild the entire height index from existing blocks"""
         logger.info("Rebuilding block height index...")
         start_time = time.time()
@@ -114,7 +114,7 @@ class BlockHeightIndex:
         # Try to load from Redis cache first
         if self.redis_cache:
             try:
-                cached_index = asyncio.run(self.redis_cache.get_height_index())
+                cached_index = await self.redis_cache.get_height_index()
                 if cached_index:
                     # Restore index to database
                     for height, block_hash in cached_index.items():
@@ -150,7 +150,7 @@ class BlockHeightIndex:
         # Cache the height index to Redis
         if self.redis_cache and height_index:
             try:
-                asyncio.run(self.redis_cache.set_height_index(height_index))
+                await self.redis_cache.set_height_index(height_index)
                 logger.info("Height index cached to Redis")
             except Exception as e:
                 logger.warning(f"Failed to cache height index: {e}")
@@ -185,9 +185,6 @@ class BlockHeightIndex:
                     
         return highest
     
-    def get_highest_indexed_height_sync(self) -> int:
-        """Synchronous wrapper for get_highest_indexed_height"""
-        return asyncio.run(self.get_highest_indexed_height())
 
 # Global singleton instance
 _height_index_instance = None

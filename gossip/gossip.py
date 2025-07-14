@@ -305,7 +305,7 @@ class GossipNode:
    
 
         elif msg_type == "get_height":
-            height, tip_hash = get_current_height(db)
+            height, tip_hash = await get_current_height(db)
 
             response = {"type": "height_response", "height": height, "current_tip": tip_hash}
             writer.write((json.dumps(response) + "\n").encode('utf-8'))
@@ -684,7 +684,7 @@ class GossipNode:
                 
                 # Get our current height
                 db = get_db()
-                local_height, local_tip = get_current_height(db)
+                local_height, local_tip = await get_current_height(db)
                 logger.info(f"[PERIODIC_SYNC] Starting sync check - local height: {local_height}")
                 
                 # Check height of each peer

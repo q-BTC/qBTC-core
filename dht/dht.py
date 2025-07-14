@@ -457,7 +457,7 @@ async def push_blocks(peer_ip, peer_port):
         "timestamp": int(time.time() * 1000)
     }
 
-    height_temp = get_current_height(db)
+    height_temp = await get_current_height(db)
     local_height = height_temp[0]
     local_tip = height_temp[1]
 
