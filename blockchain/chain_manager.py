@@ -170,7 +170,7 @@ class ChainManager:
         
         return cumulative
     
-    def get_best_chain_tip(self) -> Tuple[str, int]:
+    async def get_best_chain_tip(self) -> Tuple[str, int]:
         """
         Get the best chain tip (highest cumulative difficulty)
         Returns (block_hash, height)
@@ -178,7 +178,7 @@ class ChainManager:
         # Try Redis cache first
         if self.redis_cache:
             try:
-                cached_best = asyncio.run(self.redis_cache.get_best_chain_info())
+                cached_best = await self.redis_cache.get_best_chain_info()
                 if cached_best:
                     return cached_best["block_hash"], cached_best["height"]
             except Exception as e:
@@ -207,15 +207,19 @@ class ChainManager:
         # Cache the result
         if self.redis_cache:
             try:
-                asyncio.run(self.redis_cache.set_best_chain_info({
+                await self.redis_cache.set_best_chain_info({
                     "block_hash": best_tip,
                     "height": best_height,
                     "difficulty": str(best_difficulty)
-                }))
+                })
             except Exception as e:
                 logger.debug(f"Failed to cache best chain: {e}")
             
         return best_tip, best_height
+    
+    def get_best_chain_tip_sync(self) -> Tuple[str, int]:
+        """Synchronous wrapper for get_best_chain_tip"""
+        return asyncio.run(self.get_best_chain_tip())
     
     def set_sync_mode(self, syncing: bool):
         """Set whether we're in initial sync mode"""
@@ -437,7 +441,7 @@ class ChainManager:
         self._update_chain_tips()
         
         # Check if we need to reorganize
-        current_tip, current_height = self.get_best_chain_tip()
+        current_tip, current_height = self.get_best_chain_tip_sync()
         
         if block_hash == current_tip:
             # This block became the new best tip
@@ -583,7 +587,7 @@ class ChainManager:
     
     def try_connect_orphan_chain(self):
         """Actively try to connect orphan blocks starting from current chain tip"""
-        current_tip, current_height = self.get_best_chain_tip()
+        current_tip, current_height = self.get_best_chain_tip_sync()
         logger.info(f"[ORPHAN_CONNECT] Trying to connect orphans from height {current_height}")
         
         # First, check if we should reorganize to a better orphan chain
@@ -638,7 +642,7 @@ class ChainManager:
     
     def _check_orphan_chains_for_reorg(self):
         """Check if any orphan chain represents a better chain we should reorganize to"""
-        current_tip, current_height = self.get_best_chain_tip()
+        current_tip, current_height = self.get_best_chain_tip_sync()
         logger.info(f"[REORG_CHECK] Checking orphan chains for potential reorganization")
         
         # Look for orphan blocks at or near our current height that might be on a better chain
@@ -744,7 +748,7 @@ class ChainManager:
     
     def _rewind_to_height(self, target_height: int) -> bool:
         """Rewind the chain to a specific height by disconnecting blocks"""
-        current_tip, current_height = self.get_best_chain_tip()
+        current_tip, current_height = self.get_best_chain_tip_sync()
         
         if target_height >= current_height:
             logger.warning(f"Cannot rewind to height {target_height} - already at {current_height}")
@@ -787,7 +791,7 @@ class ChainManager:
     
     def _evaluate_orphan_chains(self):
         """Check if any orphan chain should trigger a reorganization"""
-        current_tip, current_height = self.get_best_chain_tip()
+        current_tip, current_height = self.get_best_chain_tip_sync()
         current_difficulty = self._get_cumulative_difficulty(current_tip)
         
         for tip_hash, chain in self.orphan_chains.items():
@@ -891,7 +895,7 @@ class ChainManager:
     
     def _should_reorganize(self, new_tip_hash: str) -> bool:
         """Check if a new block creates a better chain than current"""
-        current_tip, _ = self.get_best_chain_tip()
+        current_tip, _ = self.get_best_chain_tip_sync()
         
         current_difficulty = self._get_cumulative_difficulty(current_tip)
         new_difficulty = self._get_cumulative_difficulty(new_tip_hash)
@@ -905,7 +909,7 @@ class ChainManager:
         """
         logger.warning(f"Starting chain reorganization to {new_tip_hash}")
         
-        current_tip, _ = self.get_best_chain_tip()
+        current_tip, _ = self.get_best_chain_tip_sync()
         
         # Find common ancestor
         common_ancestor = self._find_common_ancestor(current_tip, new_tip_hash)
@@ -1513,7 +1517,7 @@ class ChainManager:
     
     def is_block_in_main_chain(self, block_hash: str) -> bool:
         """Check if a block is in the main chain"""
-        current_tip, _ = self.get_best_chain_tip()
+        current_tip, _ = self.get_best_chain_tip_sync()
         
         # Walk back from tip to see if we find this block
         current = current_tip
@@ -1533,7 +1537,7 @@ class ChainManager:
         Returns the hash of our block at that height if it exists, None otherwise.
         """
         # Find our block at this height
-        best_tip, best_height = self.get_best_chain_tip()
+        best_tip, best_height = self.get_best_chain_tip_sync()
         
         if height > best_height:
             return None  # We don't have a block at this height yet

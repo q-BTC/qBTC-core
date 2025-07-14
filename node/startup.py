@@ -35,7 +35,7 @@ async def startup(args=None):
         
         # Check current blockchain state
         cm = get_chain_manager()
-        best_hash, best_height = cm.get_best_chain_tip()
+        best_hash, best_height = cm.get_best_chain_tip_sync()
         
         # Initialize height index
         from blockchain.block_height_index import get_height_index
@@ -44,7 +44,7 @@ async def startup(args=None):
         # Check if index needs to be rebuilt
         if best_height > 0:
             # Check if the index has the latest block
-            latest_indexed = height_index.get_highest_indexed_height()
+            latest_indexed = height_index.get_highest_indexed_height_sync()
             if latest_indexed < best_height:
                 logger.info(f"Height index is behind (indexed: {latest_indexed}, chain: {best_height}). Scheduling background rebuild...")
                 # Rebuild index in background to not block startup

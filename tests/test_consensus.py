@@ -83,7 +83,7 @@ class TestConsensus:
         assert success
         
         # Verify chain state
-        best_hash, best_height = chain_manager.get_best_chain_tip()
+        best_hash, best_height = chain_manager.get_best_chain_tip_sync()
         assert best_height == 1
         assert best_hash == block1["block_hash"]
     
@@ -108,7 +108,7 @@ class TestConsensus:
         assert block2["block_hash"] not in chain_manager.orphan_blocks
         
         # Verify final chain
-        best_hash, best_height = chain_manager.get_best_chain_tip()
+        best_hash, best_height = chain_manager.get_best_chain_tip_sync()
         assert best_height == 2
         assert best_hash == block2["block_hash"]
     
@@ -134,7 +134,7 @@ class TestConsensus:
         assert success
         
         # At this point, both chains have equal height
-        best_hash, best_height = chain_manager.get_best_chain_tip()
+        best_hash, best_height = chain_manager.get_best_chain_tip_sync()
         assert best_height == 2
         # Either chain could be active (tie-breaking behavior)
         
@@ -143,7 +143,7 @@ class TestConsensus:
         assert success
         
         # Verify new chain is active
-        best_hash, best_height = chain_manager.get_best_chain_tip()
+        best_hash, best_height = chain_manager.get_best_chain_tip_sync()
         assert best_height == 3
         assert best_hash == block3_alt["block_hash"]
         
@@ -180,7 +180,7 @@ class TestConsensus:
             assert success
         
         # Verify reorganization happened
-        best_hash, best_height = chain_manager.get_best_chain_tip()
+        best_hash, best_height = chain_manager.get_best_chain_tip_sync()
         assert best_height == 4
         assert best_hash == blocks_alt[-1]["block_hash"]
         

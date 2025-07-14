@@ -36,12 +36,12 @@ def rebuild_height_index():
     
     # Get current state
     cm = get_chain_manager()
-    best_hash, best_height = cm.get_best_chain_tip()
+    best_hash, best_height = cm.get_best_chain_tip_sync()
     
     logger.info(f"Current blockchain height: {best_height}")
     
     # Check current index state
-    highest_indexed = height_index.get_highest_indexed_height()
+    highest_indexed = height_index.get_highest_indexed_height_sync()
     logger.info(f"Highest indexed block: {highest_indexed}")
     
     if highest_indexed >= best_height:
@@ -61,7 +61,7 @@ def rebuild_height_index():
     height_index.rebuild_index()
     
     # Verify the rebuild
-    new_highest = height_index.get_highest_indexed_height()
+    new_highest = height_index.get_highest_indexed_height_sync()
     elapsed = time.time() - start_time
     
     logger.info(f"Index rebuild complete in {elapsed:.2f} seconds")

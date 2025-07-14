@@ -144,12 +144,12 @@ class BlockHeightIndex:
         elapsed = time.time() - start_time
         logger.info(f"Block height index rebuilt in {elapsed:.2f}s with {count} blocks")
     
-    def get_highest_indexed_height(self) -> int:
+    async def get_highest_indexed_height(self) -> int:
         """Get the highest block height in the index"""
         # Try Redis cache first
         if self.redis_cache:
             try:
-                height_index = asyncio.run(self.redis_cache.get_height_index())
+                height_index = await self.redis_cache.get_height_index()
                 if height_index:
                     return max(height_index.keys()) if height_index else -1
             except:
@@ -170,6 +170,10 @@ class BlockHeightIndex:
                     continue
                     
         return highest
+    
+    def get_highest_indexed_height_sync(self) -> int:
+        """Synchronous wrapper for get_highest_indexed_height"""
+        return asyncio.run(self.get_highest_indexed_height())
 
 # Global singleton instance
 _height_index_instance = None

@@ -72,7 +72,7 @@ def get_current_height(db, max_retries: int = 3) -> Tuple[int, str]:
             try:
                 from blockchain.chain_singleton import get_chain_manager
                 cm = get_chain_manager()
-                best_hash, best_height = cm.get_best_chain_tip()
+                best_hash, best_height = cm.get_best_chain_tip_sync()
                 
                 # Validate the result
                 if best_hash and best_hash != "00" * 32 and best_height >= 0:
@@ -98,7 +98,7 @@ def get_current_height(db, max_retries: int = 3) -> Tuple[int, str]:
                 from blockchain.block_height_index import get_height_index
                 height_index = get_height_index()
                 
-                highest_height = height_index.get_highest_indexed_height()
+                highest_height = height_index.get_highest_indexed_height_sync()
                 
                 if highest_height >= 0:
                     block_hash = height_index.get_block_hash_by_height(highest_height)

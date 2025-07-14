@@ -244,7 +244,7 @@ def _process_blocks_from_peer_impl(blocks: list[dict]):
                 accepted_count += 1  # Mark that we made progress
         
         # Check if we need to request more blocks
-        best_tip, best_height = cm.get_best_chain_tip()
+        best_tip, best_height = cm.get_best_chain_tip_sync()
         logging.info("Current best chain height: %d", best_height)
         
         # Check for orphan chains that need ancestor blocks
@@ -547,7 +547,7 @@ def _process_block_in_chain(block: dict):
 def get_blockchain_info() -> Dict:
     """Get current blockchain information"""
     cm = get_chain_manager()
-    best_hash, best_height = cm.get_best_chain_tip()
+    best_hash, best_height = cm.get_best_chain_tip_sync()
     
     return {
         "best_block_hash": best_hash,

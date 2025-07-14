@@ -744,14 +744,14 @@ async def maintain_validator_list(gossip_node):
                 await asyncio.sleep(HEARTBEAT_INTERVAL)
                 continue
 
-        current_time = time.time()
-        alive = set()
+            current_time = time.time()
+            alive = set()
 
-        # Always keep actively connected validators
-        alive.update(active_validators)
-        
-        # Check heartbeats for all validators
-        for v in dht_set:
+            # Always keep actively connected validators
+            alive.update(active_validators)
+            
+            # Check heartbeats for all validators
+            for v in dht_set:
             try:
                 # Skip heartbeat check for actively connected validators
                 if v in active_validators:
@@ -781,18 +781,18 @@ async def maintain_validator_list(gossip_node):
 
         alive.add(VALIDATOR_ID)
 
-        if alive != dht_set:
-            try:
-                await kad_server.set(VALIDATORS_LIST_KEY, json.dumps(list(alive)))
-            except Exception as e:
-                logger.error(f"Failed to update validator list in DHT: {e}")
+            if alive != dht_set:
+                try:
+                    await kad_server.set(VALIDATORS_LIST_KEY, json.dumps(list(alive)))
+                except Exception as e:
+                    logger.error(f"Failed to update validator list in DHT: {e}")
 
-        # Process newly joined validators
-        newly_joined = alive - known_validators
-        for v in newly_joined:
-            if v == VALIDATOR_ID:
-                continue
-            try:
+            # Process newly joined validators
+            newly_joined = alive - known_validators
+            for v in newly_joined:
+                if v == VALIDATOR_ID:
+                    continue
+                try:
                 gossip_info_json = await kad_server.get(f"gossip_{v}")
                 if gossip_info_json:
                     info = json.loads(gossip_info_json)
@@ -815,13 +815,13 @@ async def maintain_validator_list(gossip_node):
                         # Reset any failure tracking for this validator
                         if v in validator_heartbeat_failures:
                             del validator_heartbeat_failures[v]
-            except Exception as e:
-                logger.warning(f"Failed to process new validator {v}: {e}")
+                except Exception as e:
+                    logger.warning(f"Failed to process new validator {v}: {e}")
 
-        # Process validators that have left
-        just_left = known_validators - alive
-        for v in just_left:
-            try:
+            # Process validators that have left
+            just_left = known_validators - alive
+            for v in just_left:
+                try:
                 # CRITICAL: Never remove actively connected validators
                 if v in active_validators:
                     logger.warning(f"REFUSING to remove validator {v} - it has an active gossip connection!")
@@ -872,8 +872,11 @@ async def maintain_validator_list(gossip_node):
                 # On error, keep the validator
                 alive.add(v)
 
-        # Update known validators
-        known_validators.clear()
-        known_validators.update(alive)
+            # Update known validators
+            known_validators.clear()
+            known_validators.update(alive)
 
-        await asyncio.sleep(HEARTBEAT_INTERVAL)
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+        except Exception as e:
+            logger.error(f"Error in maintain_validator_list: {e}")
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
