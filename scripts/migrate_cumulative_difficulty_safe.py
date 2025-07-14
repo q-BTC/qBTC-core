@@ -24,46 +24,65 @@ logger = logging.getLogger(__name__)
 
 
 def calculate_cumulative_difficulty(db, block_hash: str, cache: Dict[str, Decimal]) -> Decimal:
-    """Calculate cumulative difficulty for a block, using cache for efficiency"""
+    """Calculate cumulative difficulty for a block, using cache for efficiency (iterative approach)"""
     if block_hash in cache:
         return cache[block_hash]
     
     if not block_hash or block_hash == "00" * 32:
         return Decimal(0)
     
-    # Get block data
-    block_key = f"block:{block_hash}".encode()
-    block_data = db.get(block_key)
-    if not block_data:
-        logger.warning(f"Block {block_hash} not found")
-        return Decimal(0)
+    # Collect blocks from current to genesis
+    blocks_to_process = []
+    current_hash = block_hash
     
-    block_info = json.loads(block_data.decode())
+    while current_hash and current_hash != "00" * 32:
+        if current_hash in cache:
+            # Found a cached entry, we can stop here
+            break
+            
+        block_key = f"block:{current_hash}".encode()
+        block_data = db.get(block_key)
+        if not block_data:
+            logger.warning(f"Block {current_hash} not found")
+            break
+            
+        try:
+            block_info = json.loads(block_data.decode())
+        except json.JSONDecodeError as e:
+            logger.error(f"Error decoding block {current_hash}: {e}")
+            break
+            
+        # Check if already has cumulative difficulty
+        if "cumulative_difficulty" in block_info:
+            difficulty = Decimal(block_info["cumulative_difficulty"])
+            cache[current_hash] = difficulty
+            break
+            
+        blocks_to_process.append((current_hash, block_info))
+        current_hash = block_info.get("previous_hash")
     
-    # Check if already has cumulative difficulty
-    if "cumulative_difficulty" in block_info:
-        difficulty = Decimal(block_info["cumulative_difficulty"])
-        cache[block_hash] = difficulty
-        return difficulty
+    # Start with the cumulative difficulty of the oldest processed block
+    cumulative = Decimal(0)
+    if current_hash and current_hash in cache:
+        cumulative = cache[current_hash]
     
-    # Calculate parent's cumulative difficulty
-    parent_hash = block_info.get("previous_hash")
-    parent_cumulative = calculate_cumulative_difficulty(db, parent_hash, cache)
-    
-    # Calculate this block's difficulty with safety check
-    bits = block_info.get("bits", 0x1d00ffff)
-    try:
-        target = bits_to_target(bits)
-        if target == 0:
-            logger.error(f"Invalid target (0) for block {block_hash} with bits {bits:#x}")
-            return parent_cumulative
-        block_difficulty = Decimal(2**256) / Decimal(target)
-    except Exception as e:
-        logger.error(f"Error calculating difficulty for block {block_hash}: {e}")
-        return parent_cumulative
-    
-    cumulative = parent_cumulative + block_difficulty
-    cache[block_hash] = cumulative
+    # Process blocks in reverse order (from oldest to newest)
+    for hash_to_process, block_info in reversed(blocks_to_process):
+        # Calculate this block's difficulty with safety check
+        bits = block_info.get("bits", 0x1d00ffff)
+        try:
+            target = bits_to_target(bits)
+            if target == 0:
+                logger.error(f"Invalid target (0) for block {hash_to_process} with bits {bits:#x}")
+                block_difficulty = Decimal(0)
+            else:
+                block_difficulty = Decimal(2**256) / Decimal(target)
+        except Exception as e:
+            logger.error(f"Error calculating difficulty for block {hash_to_process}: {e}")
+            block_difficulty = Decimal(0)
+        
+        cumulative = cumulative + block_difficulty
+        cache[hash_to_process] = cumulative
     
     return cumulative
 
@@ -118,10 +137,16 @@ def migrate_blocks(dry_run=False):
     for key, value in db.items():
         if key.startswith(b"block:"):
             total_blocks += 1
-            block_data = json.loads(value.decode())
-            if "cumulative_difficulty" not in block_data:
-                block_hash = block_data["block_hash"]
-                blocks_to_migrate.append(block_hash)
+            try:
+                block_data = json.loads(value.decode())
+                if "cumulative_difficulty" not in block_data:
+                    block_hash = block_data["block_hash"]
+                    blocks_to_migrate.append(block_hash)
+            except json.JSONDecodeError as e:
+                block_hash = key.decode().replace("block:", "")
+                logger.error(f"Error decoding block {block_hash} during scan: {e}")
+                logger.error(f"Raw data preview: {value[:200]}...")
+                continue
     
     if not blocks_to_migrate:
         logger.info("No blocks need migration. All blocks already have cumulative difficulty.")
@@ -156,7 +181,13 @@ def migrate_blocks(dry_run=False):
                 errors += 1
                 continue
             
-            block_info = json.loads(block_data.decode())
+            try:
+                block_info = json.loads(block_data.decode())
+            except json.JSONDecodeError as e:
+                logger.error(f"Error decoding JSON for block {block_hash}: {e}")
+                logger.error(f"Raw data preview: {block_data[:200]}...")
+                errors += 1
+                continue
             
             # Calculate cumulative difficulty
             cumulative_difficulty = calculate_cumulative_difficulty(db, block_hash, difficulty_cache)
@@ -175,6 +206,9 @@ def migrate_blocks(dry_run=False):
             
         except Exception as e:
             logger.error(f"Error processing block {block_hash}: {e}")
+            logger.error(f"Error type: {type(e).__name__}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             errors += 1
     
     elapsed = time.time() - start_time
