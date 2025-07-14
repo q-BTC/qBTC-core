@@ -621,7 +621,7 @@ async def push_blocks(peer_ip, peer_port):
                             else:
                                 logger.warning(f"Could not determine txid for transaction {i} in block {block.get('height', 'unknown')}")
             
-            process_blocks_from_peer(blocks)
+            await process_blocks_from_peer(blocks)
 
         else:
             print("Peer up to date")

@@ -278,7 +278,7 @@ class GossipNode:
                                 else:
                                     logger.warning(f"Could not determine txid for transaction {i} in block {block.get('height', 'unknown')}")
                 
-                process_blocks_from_peer(blocks)
+                await process_blocks_from_peer(blocks)
         
         elif msg_type == "blocks_by_hash_response":
             logger.info(f"Received blocks_by_hash_response from {from_peer}")
@@ -294,7 +294,7 @@ class GossipNode:
                                 if i < len(tx_ids):
                                     tx["txid"] = tx_ids[i]
                 
-                process_blocks_from_peer(blocks)
+                await process_blocks_from_peer(blocks)
             else:
                 logger.warning("Received empty blocks_response")
                 
@@ -743,7 +743,7 @@ class GossipNode:
                                             blocks = blocks_msg.get("blocks", [])
                                             if blocks:
                                                 logger.info(f"[PERIODIC_SYNC] Received {len(blocks)} blocks from {peer}")
-                                                process_blocks_from_peer(blocks)
+                                                await process_blocks_from_peer(blocks)
                                         elif blocks_msg.get("type") == "blocks_response_chunked":
                                             # Handle chunked response
                                             total_chunks = blocks_msg.get("total_chunks", 0)
@@ -774,7 +774,7 @@ class GossipNode:
                                             
                                             if blocks:
                                                 logger.info(f"[PERIODIC_SYNC] Received total of {len(blocks)} blocks from {peer}")
-                                                process_blocks_from_peer(blocks)
+                                                await process_blocks_from_peer(blocks)
                                 
                                 # If we're ahead, push blocks to peer
                                 elif peer_height < local_height:
