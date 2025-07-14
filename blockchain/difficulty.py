@@ -11,10 +11,12 @@ from blockchain.block_height_index import get_height_index
 logger = logging.getLogger(__name__)
 
 # Constants
+# Constants
 MAX_TARGET_BITS = 0x1f7fffff  # Minimum difficulty bits (very easy)
 MIN_TARGET_BITS = 0x1900ffff  # Maximum difficulty bits we'll allow
 MAX_ADJUSTMENT_FACTOR = 4  # Maximum 4x increase
 MIN_ADJUSTMENT_FACTOR = 0.25  # Maximum 4x decrease (1/4)
+
 
 # Time constraints
 MAX_FUTURE_TIME = 2 * 60 * 60  # 2 hours in the future

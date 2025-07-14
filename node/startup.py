@@ -109,13 +109,16 @@ async def startup(args=None):
                     "txid": sha256d(f"genesis_tx_{ADMIN_ADDRESS}".encode()).hex()
                 }
                 
+                # Import MAX_TARGET_BITS to ensure genesis uses same difficulty as subsequent blocks
+                from blockchain.difficulty import MAX_TARGET_BITS
+                
                 # Create genesis block
                 genesis_block = Block(
                     version=1,
                     prev_block_hash="00" * 32,
                     merkle_root=calculate_merkle_root([genesis_tx["txid"]]),
                     timestamp=int(time.time()),
-                    bits=0x1d00ffff,  # Initial difficulty
+                    bits=MAX_TARGET_BITS,  # Use same difficulty as subsequent blocks
                     nonce=0
                 )
                 

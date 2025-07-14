@@ -7,7 +7,7 @@ import asyncio
 from decimal import Decimal
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from database.database import get_db, get_current_height, invalidate_height_cache
+from database.database import get_db, get_current_height
 from config.config import ADMIN_ADDRESS
 from wallet.wallet import verify_transaction
 from blockchain.blockchain import derive_qsafe_address,Block, bits_to_target, serialize_transaction,scriptpubkey_to_address, read_varint, parse_tx, validate_pow, sha256d, calculate_merkle_root
@@ -477,7 +477,13 @@ async def submit_block(request: Request, data: dict) -> dict:
         local_height = height_temp[0]
         local_tip = height_temp[1]
 
-        print(f"Local height: {local_height}, Local tip: {local_tip}")
+        logger.info(f"Block submission check - Local height: {local_height}, Local tip: {local_tip}, Previous block in submission: {prev_block}")
+        
+        # Special check for genesis block submission
+        if local_height == -1 and prev_block == "0" * 64:
+            logger.info("Detected genesis block submission (first block in chain)")
+            local_height = -1  # Genesis will be at height 0
+            local_tip = "0" * 64  # Genesis has no previous block
 
         if prev_block != local_tip:
             if db.get(f"block:{prev_block}".encode()):      # we do know that block
@@ -732,10 +738,14 @@ async def submit_block(request: Request, data: dict) -> dict:
         from blockchain.chain_singleton import get_chain_manager
         cm = await get_chain_manager()
         
+        # Use the height we already got earlier
+        new_height = local_height + 1
+        logger.info(f"Current height: {local_height}, new block height will be: {new_height}")
+        
         block_data = {
             "version": version,
             "bits": bits,
-            "height": (await get_current_height(db))[0] + 1,
+            "height": new_height,
             "block_hash": block.hash(),
             "previous_hash": prev_block,
             "tx_ids": txids,
@@ -758,8 +768,7 @@ async def submit_block(request: Request, data: dict) -> dict:
             logger.error(f"ChainManager rejected block: {error_msg}")
             return rpc_error(-1, f"Block rejected: {error_msg}", data["id"])
         
-        # Invalidate height cache since we added a new block
-        invalidate_height_cache()
+        # No need to invalidate cache - we removed caching
 
         # Remove all non-coinbase transactions from mempool
         for tid in txids[1:]:

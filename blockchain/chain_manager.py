@@ -10,7 +10,7 @@ from decimal import Decimal
 from collections import defaultdict
 from database.database import get_db, invalidate_height_cache
 from blockchain.blockchain import Block, validate_pow, bits_to_target, sha256d
-from blockchain.difficulty import get_next_bits, validate_block_bits, validate_block_timestamp, MAX_FUTURE_TIME
+from blockchain.difficulty import get_next_bits, validate_block_bits, validate_block_timestamp, MAX_FUTURE_TIME, MAX_TARGET_BITS
 from blockchain.transaction_validator import TransactionValidator
 from rocksdict import WriteBatch
 from state.state import mempool_manager
@@ -171,7 +171,16 @@ class ChainManager:
             if prev_hash in potential_tips and prev_hash != "0" * 64:
                 potential_tips.discard(prev_hash)
         
+        old_tips = self.chain_tips.copy() if hasattr(self, 'chain_tips') else set()
         self.chain_tips = potential_tips
+        
+        # Log changes in chain tips
+        if old_tips != self.chain_tips:
+            logger.info(f"Chain tips updated: {len(self.chain_tips)} tips")
+            for tip in self.chain_tips:
+                if tip in self.block_index:
+                    info = self.block_index[tip]
+                    logger.info(f"  Tip: {tip[:16]}... height={info['height']} difficulty={info.get('cumulative_difficulty', 'unknown')}")
     
     async def _get_cumulative_difficulty(self, block_hash: str) -> Decimal:
         """Calculate cumulative difficulty from genesis to this block"""
@@ -205,7 +214,7 @@ class ChainManager:
                 return Decimal(block_info["cumulative_difficulty"])
             
             # Add this block's difficulty
-            bits = block_info.get("bits", 0x1d00ffff)  # Default to min difficulty
+            bits = block_info.get("bits", MAX_TARGET_BITS)  # Default to min difficulty
             target = bits_to_target(bits)
             difficulty = Decimal(2**256) / Decimal(target)
             cumulative += difficulty
@@ -271,12 +280,17 @@ class ChainManager:
         best_difficulty = Decimal(0)
         best_height = 0
         
+        logger.debug(f"Calculating best chain tip from {len(self.chain_tips)} tips")
+        
         for tip_hash in self.chain_tips:
             tip_info = self.block_index.get(tip_hash)
             if not tip_info:
+                logger.warning(f"Tip {tip_hash} not found in block index!")
                 continue
                 
             difficulty = tip_info.get("cumulative_difficulty")
+            logger.debug(f"Tip {tip_hash[:16]}... height={tip_info['height']} difficulty={difficulty}")
+            
             if difficulty and difficulty > best_difficulty:
                 best_difficulty = difficulty
                 best_tip = tip_hash
@@ -284,7 +298,10 @@ class ChainManager:
         
         if not best_tip:
             # No tips found, return -1 for empty blockchain
+            logger.warning("No valid chain tips found, returning empty blockchain state")
             return "00" * 32, -1
+        
+        logger.debug(f"Best chain tip: {best_tip[:16]}... at height {best_height} with difficulty {best_difficulty}")
         
         # Cache the result
         if self.redis_cache:
@@ -523,6 +540,8 @@ class ChainManager:
             "cumulative_difficulty": cumulative_difficulty
         }
         
+        logger.info(f"Added block {block_hash[:16]}... to index at height {height} with cumulative difficulty {cumulative_difficulty}")
+        
         # Cache cumulative difficulty to Redis
         if self.redis_cache:
             try:
@@ -532,6 +551,14 @@ class ChainManager:
         
         # Check if this creates a new chain tip or extends existing one
         self._update_chain_tips()
+        
+        # Force recalculation of best chain tip after adding new block
+        # Clear any cached best tip to ensure fresh calculation
+        if self.redis_cache:
+            try:
+                await self.redis_cache.delete_best_chain_info()
+            except:
+                pass
         
         # Check if we need to reorganize
         current_tip, current_height = await self.get_best_chain_tip()
@@ -578,6 +605,10 @@ class ChainManager:
                 "hash": block_hash,
                 "height": height
             }).encode())
+            
+            # CRITICAL: Invalidate height cache so next call gets fresh data
+            invalidate_height_cache()
+            logger.info(f"Height cache invalidated after new block at height {height}")
             
             # Process any orphans that can now be connected
             await self._process_orphans_for_block(block_hash)
@@ -991,7 +1022,7 @@ class ChainManager:
                 logger.warning(f"Orphan block {block_hash} not found while calculating difficulty")
                 continue
             
-            bits = block_data.get("bits", 0x1d00ffff)
+            bits = block_data.get("bits", MAX_TARGET_BITS)
             target = bits_to_target(bits)
             difficulty = Decimal(2**256) / Decimal(target)
             total_difficulty += difficulty

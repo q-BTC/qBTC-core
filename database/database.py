@@ -53,12 +53,9 @@ async def get_current_height(db, max_retries: int = 3) -> Tuple[int, str]:
     """
     Return (height, block_hash) of the chain tip with robust error handling.
     Returns (-1, GENESIS_PREVHASH) if the DB has no blocks yet.
-    Uses caching and retry logic to handle transient failures.
+    Uses retry logic to handle transient failures.
     """
-    # Check cache first
-    cached = height_cache.get()
-    if cached:
-        return cached
+    # NO CACHING - always get fresh data from database
     
     # Try multiple times to get the height
     last_error = None
@@ -77,8 +74,8 @@ async def get_current_height(db, max_retries: int = 3) -> Tuple[int, str]:
                 # Get the best chain tip using async method
                 tip_info = await cm.get_best_chain_tip()
                 if tip_info:
-                    best_hash = tip_info["block_hash"]
-                    best_height = tip_info["height"]
+                    # get_best_chain_tip returns a tuple (block_hash, height)
+                    best_hash, best_height = tip_info
                 else:
                     best_hash = "00" * 32
                     best_height = -1
@@ -86,13 +83,10 @@ async def get_current_height(db, max_retries: int = 3) -> Tuple[int, str]:
                 # Validate the result
                 if best_hash and best_hash != "00" * 32 and best_height >= 0:
                     logging.debug(f"ChainManager returned: hash={best_hash}, height={best_height}")
-                    height_cache.set(best_height, best_hash)
                     return best_height, best_hash
                 elif best_height == -1 and best_hash == "00" * 32:
                     # This is a valid "no blocks" response, not an error
                     logging.info("ChainManager indicates empty blockchain")
-                    # Cache this as it's a valid state
-                    height_cache.set(-1, GENESIS_PREVHASH)
                     return -1, GENESIS_PREVHASH
                     
             except ImportError:
@@ -113,7 +107,6 @@ async def get_current_height(db, max_retries: int = 3) -> Tuple[int, str]:
                     block_hash = height_index.get_block_hash_by_height(highest_height)
                     if block_hash:
                         logging.debug(f"Height index method: Best block height={highest_height}")
-                        height_cache.set(highest_height, block_hash)
                         return highest_height, block_hash
                 
                 # If height is -1, check if this is genuinely empty or an error
@@ -122,7 +115,6 @@ async def get_current_height(db, max_retries: int = 3) -> Tuple[int, str]:
                     has_blocks = any(k.startswith(b"block:") for k in db.keys())
                     if not has_blocks:
                         logging.info("Height index confirms empty blockchain")
-                        height_cache.set(-1, GENESIS_PREVHASH)
                         return -1, GENESIS_PREVHASH
                     else:
                         # This is suspicious - we have blocks but index says -1
@@ -158,12 +150,10 @@ async def get_current_height(db, max_retries: int = 3) -> Tuple[int, str]:
                     block_hash = tip_block.get("block_hash", "")
                     if height >= 0 and block_hash:
                         logging.info(f"Scan method found tip at height {height}")
-                        height_cache.set(height, block_hash)
                         return height, block_hash
                 
                 if block_count == 0:
                     logging.info("Scan method confirms empty blockchain")
-                    height_cache.set(-1, GENESIS_PREVHASH)
                     return -1, GENESIS_PREVHASH
                 else:
                     raise ValueError(f"Found {block_count} blocks but couldn't determine tip")
@@ -210,7 +200,6 @@ async def get_current_height(db, max_retries: int = 3) -> Tuple[int, str]:
         if not has_any_blocks:
             # Confirmed: database is empty
             logging.info("Final check confirms empty blockchain")
-            height_cache.set(-1, GENESIS_PREVHASH)
             return -1, GENESIS_PREVHASH
         else:
             # We have blocks but can't determine height - this is an error condition
