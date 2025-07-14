@@ -701,7 +701,7 @@ async def submit_block(request: Request, data: dict) -> dict:
         
         # Use ChainManager singleton to add the block
         from blockchain.chain_singleton import get_chain_manager
-        cm = get_chain_manager()
+        cm = await get_chain_manager()
         
         block_data = {
             "version": version,
@@ -717,7 +717,7 @@ async def submit_block(request: Request, data: dict) -> dict:
         }
         
         # Add block using ChainManager
-        success, error_msg = cm.add_block(block_data)
+        success, error_msg = await cm.add_block(block_data)
         if not success:
             logger.error(f"ChainManager rejected block: {error_msg}")
             return rpc_error(-1, f"Block rejected: {error_msg}", data["id"])

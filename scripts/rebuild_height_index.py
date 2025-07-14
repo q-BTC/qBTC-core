@@ -14,7 +14,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from database.database import set_db, get_db
 from blockchain.block_height_index import get_height_index
-from blockchain.chain_singleton import get_chain_manager
+from blockchain.chain_singleton import get_chain_manager_sync
+from blockchain.chain_init import init_chain_manager_sync
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,9 +35,24 @@ def rebuild_height_index():
     # Get the height index
     height_index = get_height_index()
     
+    # Initialize ChainManager
+    init_chain_manager_sync()
+    
     # Get current state
-    cm = get_chain_manager()
-    best_hash, best_height = cm.get_best_chain_tip_sync()
+    cm = get_chain_manager_sync()
+    # Get best chain tip using direct access to block index
+    best_tip = None
+    best_difficulty = 0
+    best_height = -1
+    
+    for tip_hash in cm.chain_tips:
+        tip_info = cm.block_index.get(tip_hash)
+        if tip_info and tip_info.get("cumulative_difficulty", 0) > best_difficulty:
+            best_difficulty = tip_info["cumulative_difficulty"]
+            best_tip = tip_hash
+            best_height = tip_info["height"]
+    
+    best_hash = best_tip if best_tip else "00" * 32
     
     logger.info(f"Current blockchain height: {best_height}")
     

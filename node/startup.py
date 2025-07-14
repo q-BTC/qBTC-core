@@ -34,7 +34,7 @@ async def startup(args=None):
         import time
         
         # Check current blockchain state
-        cm = get_chain_manager()
+        cm = await get_chain_manager()
         best_hash, best_height = await cm.get_best_chain_tip()
         
         # Initialize height index
@@ -137,7 +137,7 @@ async def startup(args=None):
                 }
                 
                 # Add genesis block to chain
-                success, error = cm.add_block(genesis_block_data)
+                success, error = await cm.add_block(genesis_block_data)
                 if success:
                     logger.info("Genesis block created successfully")
                     logger.info(f"Genesis block added with 21M coins to {ADMIN_ADDRESS}")

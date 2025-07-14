@@ -49,9 +49,14 @@ class ChainManager:
         redis_url = os.getenv("REDIS_URL", None)
         self.redis_cache = BlockchainRedisCache(redis_url) if redis_url and os.getenv("USE_REDIS", "true").lower() == "true" else None
         
-        self._initialize_index()
+        # Note: _initialize_index() must be called separately after initialization
+        # as it's now an async method. Call await chain_manager.initialize() after creating instance.
     
-    def _initialize_index(self):
+    async def initialize(self):
+        """Initialize the chain manager - must be called after __init__"""
+        await self._initialize_index()
+    
+    async def _initialize_index(self):
         """Build in-memory index of all blocks in database"""
         logger.info("Initializing chain index...")
         start_time = time.time()
@@ -59,7 +64,7 @@ class ChainManager:
         # Try to load from Redis cache first
         if self.redis_cache:
             try:
-                cached_index = self.redis_cache.get_chain_index_sync()
+                cached_index = await self.redis_cache.get_chain_index()
                 if cached_index and isinstance(cached_index, dict):
                     # Validate cache structure
                     block_index = cached_index.get("block_index", {})
@@ -95,7 +100,7 @@ class ChainManager:
                     cached_difficulty = None
                     if self.redis_cache:
                         try:
-                            cached_difficulty = self.redis_cache.get_cumulative_difficulty_sync(block_hash)
+                            cached_difficulty = await self.redis_cache.get_cumulative_difficulty(block_hash)
                         except:
                             pass
                     
@@ -103,7 +108,7 @@ class ChainManager:
                         cumulative_difficulty = Decimal(cached_difficulty)
                     else:
                         # Fall back to calculating (for old blocks without stored difficulty)
-                        cumulative_difficulty = self._get_cumulative_difficulty(block_hash)
+                        cumulative_difficulty = await self._get_cumulative_difficulty(block_hash)
                         cumulative_difficulties[block_hash] = cumulative_difficulty
                 
                 self.block_index[block_hash] = {
@@ -129,11 +134,11 @@ class ChainManager:
                     "block_index": self.block_index,
                     "chain_tips": list(self.chain_tips)
                 }
-                self.redis_cache.set_chain_index_sync(cache_data)
+                await self.redis_cache.set_chain_index(cache_data)
                 
                 # Batch cache cumulative difficulties
                 if cumulative_difficulties:
-                    self.redis_cache.batch_set_cumulative_difficulties_sync(cumulative_difficulties)
+                    await self.redis_cache.batch_set_cumulative_difficulties(cumulative_difficulties)
                     
                 logger.info("Chain index cached to Redis")
             except Exception as e:
@@ -156,7 +161,7 @@ class ChainManager:
         
         self.chain_tips = potential_tips
     
-    def _get_cumulative_difficulty(self, block_hash: str) -> Decimal:
+    async def _get_cumulative_difficulty(self, block_hash: str) -> Decimal:
         """Calculate cumulative difficulty from genesis to this block"""
         # First check if the block itself has stored cumulative difficulty
         block_key = f"block:{block_hash}".encode()
@@ -197,7 +202,7 @@ class ChainManager:
         
         return cumulative
     
-    def _get_cumulative_difficulty_for_new_block(self, parent_hash: str, bits: int) -> Decimal:
+    async def _get_cumulative_difficulty_for_new_block(self, parent_hash: str, bits: int) -> Decimal:
         """Calculate cumulative difficulty for a new block based on its parent"""
         # Get parent's cumulative difficulty
         parent_cumulative = Decimal(0)
@@ -215,7 +220,7 @@ class ChainManager:
                     # Fall back to calculating from scratch
                     logger.warning(f"Parent block {parent_hash} not in database, calculating cumulative difficulty from scratch")
                     # Calculate parent's cumulative difficulty first
-                    parent_cumulative = self._get_cumulative_difficulty(parent_hash)
+                    parent_cumulative = await self._get_cumulative_difficulty(parent_hash)
                     # Then add this block's difficulty
                     target = bits_to_target(bits)
                     block_difficulty = Decimal(2**256) / Decimal(target)
@@ -227,7 +232,7 @@ class ChainManager:
                     parent_cumulative = Decimal(parent_block["cumulative_difficulty"])
                 else:
                     # Fall back to calculating it (for old blocks)
-                    parent_cumulative = self._get_cumulative_difficulty(parent_hash)
+                    parent_cumulative = await self._get_cumulative_difficulty(parent_hash)
         
         # Calculate this block's difficulty contribution
         target = bits_to_target(bits)
@@ -282,16 +287,14 @@ class ChainManager:
             
         return best_tip, best_height
     
-    def get_best_chain_tip_sync(self) -> Tuple[str, int]:
-        """Synchronous wrapper for get_best_chain_tip"""
-        return asyncio.run(self.get_best_chain_tip())
+    # Removed get_best_chain_tip_sync - everyone should use the async version
     
     def set_sync_mode(self, syncing: bool):
         """Set whether we're in initial sync mode"""
         self.is_syncing = syncing
         logger.info(f"Sync mode set to: {syncing}")
     
-    def add_block(self, block_data: dict) -> Tuple[bool, Optional[str]]:
+    async def add_block(self, block_data: dict) -> Tuple[bool, Optional[str]]:
         """
         Add a new block to the chain
         Returns (success, error_message)
@@ -406,7 +409,7 @@ class ChainManager:
         # Check if we have the parent block
         if prev_hash not in self.block_index and prev_hash != "00" * 32:
             # Parent not found - this is an orphan
-            self._add_orphan(block_data)
+            await self._add_orphan(block_data)
             return True, None
         
         # CRITICAL: Validate all transactions before accepting the block
@@ -469,7 +472,7 @@ class ChainManager:
         
         # Now that validation has passed and we have the parent, calculate cumulative difficulty
         # We know parent exists because orphan blocks are handled above
-        cumulative_difficulty = self._get_cumulative_difficulty_for_new_block(prev_hash, block_data["bits"])
+        cumulative_difficulty = await self._get_cumulative_difficulty_for_new_block(prev_hash, block_data["bits"])
         
         # Add cumulative difficulty to block data before storing
         block_data["cumulative_difficulty"] = str(cumulative_difficulty)
@@ -505,7 +508,7 @@ class ChainManager:
         # Cache cumulative difficulty to Redis
         if self.redis_cache:
             try:
-                asyncio.run(self.redis_cache.set_cumulative_difficulty(block_hash, cumulative_difficulty))
+                await self.redis_cache.set_cumulative_difficulty(block_hash, cumulative_difficulty)
             except Exception as e:
                 logger.debug(f"Failed to cache cumulative difficulty: {e}")
         
@@ -513,7 +516,7 @@ class ChainManager:
         self._update_chain_tips()
         
         # Check if we need to reorganize
-        current_tip, current_height = self.get_best_chain_tip_sync()
+        current_tip, current_height = await self.get_best_chain_tip()
         
         if block_hash == current_tip:
             # This block became the new best tip
@@ -523,7 +526,7 @@ class ChainManager:
             if self.redis_cache:
                 try:
                     # Update chain index entry for new block
-                    self.redis_cache.update_chain_index_entry_sync(block_hash, {
+                    await self.redis_cache.update_chain_index_entry(block_hash, {
                         "height": height,
                         "previous_hash": block_data["previous_hash"],
                         "timestamp": block_data["timestamp"],
@@ -533,15 +536,15 @@ class ChainManager:
                     })
                     
                     # Update height index
-                    self.redis_cache.update_height_index_entry_sync(height, block_hash)
+                    await self.redis_cache.update_height_index_entry(height, block_hash)
                     
                     # Update best chain info
-                    asyncio.run(self.redis_cache.set_best_chain_info({
+                    await self.redis_cache.set_best_chain_info({
                         "block_hash": block_hash,
                         "height": height,
                         "timestamp": block_data["timestamp"],
                         "cumulative_difficulty": str(self.block_index[block_hash]["cumulative_difficulty"])
-                    }))
+                    })
                 except Exception as e:
                     logger.debug(f"Failed to update caches: {e}")
             
@@ -552,20 +555,20 @@ class ChainManager:
             self.db.write(batch)
             
             # Process any orphans that can now be connected
-            self._process_orphans_for_block(block_hash)
+            await self._process_orphans_for_block(block_hash)
             
             return True, None
         
         # Check if this block creates a better chain
-        if self._should_reorganize(block_hash):
+        if await self._should_reorganize(block_hash):
             logger.warning(f"Chain reorganization needed! New tip: {block_hash}")
-            success = self._reorganize_to_block(block_hash)
+            success = await self._reorganize_to_block(block_hash)
             if not success:
                 return False, "Reorganization failed"
         
         return True, None
     
-    def _add_orphan(self, block_data: dict):
+    async def _add_orphan(self, block_data: dict):
         """Add a block to the orphan pool"""
         block_hash = block_data["block_hash"]
         logger.info(f"Adding orphan block {block_hash} at height {block_data.get('height')}")
@@ -581,7 +584,7 @@ class ChainManager:
         self._update_orphan_chains(block_data)
         
         # Check if this orphan completes a chain that should trigger reorganization
-        self._evaluate_orphan_chains()
+        await self._evaluate_orphan_chains()
         
         # Enforce size limit (remove oldest if over limit)
         if len(self.orphan_blocks) > self.MAX_ORPHAN_BLOCKS:
@@ -590,7 +593,7 @@ class ChainManager:
             logger.info(f"Removing oldest orphan {oldest_hash} due to size limit")
             self._remove_orphan(oldest_hash)
     
-    def _process_orphans_for_block(self, parent_hash: str):
+    async def _process_orphans_for_block(self, parent_hash: str):
         """Try to connect any orphans that have this block as parent"""
         connected = []
         
@@ -598,7 +601,7 @@ class ChainManager:
             if orphan_data["previous_hash"] == parent_hash:
                 # This orphan can now be connected
                 logger.info(f"Connecting orphan {orphan_hash} to parent {parent_hash}")
-                success, _ = self.add_block(orphan_data)
+                success, _ = await self.add_block(orphan_data)
                 if success:
                     connected.append(orphan_hash)
         
@@ -676,13 +679,13 @@ class ChainManager:
         
         logger.info(f"Orphan chains: {len(self.orphan_chains)} chains tracking {len(self.orphan_blocks)} orphans")
     
-    def try_connect_orphan_chain(self):
+    async def try_connect_orphan_chain(self):
         """Actively try to connect orphan blocks starting from current chain tip"""
-        current_tip, current_height = self.get_best_chain_tip_sync()
+        current_tip, current_height = await self.get_best_chain_tip()
         logger.info(f"[ORPHAN_CONNECT] Trying to connect orphans from height {current_height}")
         
         # First, check if we should reorganize to a better orphan chain
-        self._check_orphan_chains_for_reorg()
+        await self._check_orphan_chains_for_reorg()
         
         blocks_connected = 0
         next_height = current_height + 1
@@ -699,7 +702,7 @@ class ChainManager:
                         logger.info(f"[ORPHAN_CONNECT] Found matching orphan {orphan_hash} at height {next_height}")
                         
                         # Try to add this block
-                        success, error = self.add_block(orphan_data)
+                        success, error = await self.add_block(orphan_data)
                         if success:
                             logger.info(f"[ORPHAN_CONNECT] Successfully connected orphan {orphan_hash} at height {next_height}")
                             blocks_connected += 1
@@ -714,7 +717,16 @@ class ChainManager:
                                 del self.orphan_blocks[orphan_hash]
                             if orphan_hash in self.orphan_timestamps:
                                 del self.orphan_timestamps[orphan_hash]
-                            self._remove_orphan_from_chains(orphan_hash)
+                            # Remove from orphan chains
+                            chains_to_remove = []
+                            for tip_hash, chain in self.orphan_chains.items():
+                                if orphan_hash in chain:
+                                    chain.remove(orphan_hash)
+                                    if not chain or tip_hash == orphan_hash:
+                                        chains_to_remove.append(tip_hash)
+                            
+                            for tip_hash in chains_to_remove:
+                                del self.orphan_chains[tip_hash]
                             
                             break
                         else:
@@ -731,9 +743,9 @@ class ChainManager:
             logger.debug(f"[ORPHAN_CONNECT] No orphan blocks could be connected")
             return False
     
-    def _check_orphan_chains_for_reorg(self):
+    async def _check_orphan_chains_for_reorg(self):
         """Check if any orphan chain represents a better chain we should reorganize to"""
-        current_tip, current_height = self.get_best_chain_tip_sync()
+        current_tip, current_height = await self.get_best_chain_tip()
         logger.info(f"[REORG_CHECK] Checking orphan chains for potential reorganization")
         
         # Look for orphan blocks at or near our current height that might be on a better chain
@@ -760,7 +772,7 @@ class ChainManager:
                                 logger.warning(f"[REORG_CHECK] Fork detected at height {fork_height}")
                                 
                                 # Rewind to just before the fork
-                                if self._rewind_to_height(fork_height - 1):
+                                if await self._rewind_to_height(fork_height - 1):
                                     logger.warning(f"[REORG_CHECK] Successfully rewound to height {fork_height - 1}")
                                     # The orphan chain should now be able to connect
                                     return True
@@ -827,9 +839,11 @@ class ChainManager:
             parent_hash = block_data.get("previous_hash")
             if parent_hash and parent_hash in self.block_index:
                 # Fork point is at the parent's height
-                parent_data = self._get_block_data(parent_hash)
+                parent_key = f"block:{parent_hash}".encode()
+                parent_data = self.db.get(parent_key)
                 if parent_data:
-                    return parent_data.get("height", min_height)
+                    parent_block = json.loads(parent_data.decode())
+                    return parent_block.get("height", min_height)
             
             # Move to parent
             current_hash = parent_hash
@@ -837,9 +851,9 @@ class ChainManager:
         # Couldn't find connection point
         return None
     
-    def _rewind_to_height(self, target_height: int) -> bool:
+    async def _rewind_to_height(self, target_height: int) -> bool:
         """Rewind the chain to a specific height by disconnecting blocks"""
-        current_tip, current_height = self.get_best_chain_tip_sync()
+        current_tip, current_height = await self.get_best_chain_tip()
         
         if target_height >= current_height:
             logger.warning(f"Cannot rewind to height {target_height} - already at {current_height}")
@@ -853,10 +867,13 @@ class ChainManager:
         block_hash = current_tip
         
         while height > target_height:
-            block_data = self._get_block_data(block_hash)
-            if not block_data:
+            block_key = f"block:{block_hash}".encode()
+            block_data_raw = self.db.get(block_key)
+            if not block_data_raw:
                 logger.error(f"[REWIND] Cannot find block {block_hash} at height {height}")
                 return False
+            
+            block_data = json.loads(block_data_raw.decode())
             
             blocks_to_disconnect.append((block_hash, block_data))
             block_hash = block_data.get("previous_hash")
@@ -880,10 +897,10 @@ class ChainManager:
         
         return True
     
-    def _evaluate_orphan_chains(self):
+    async def _evaluate_orphan_chains(self):
         """Check if any orphan chain should trigger a reorganization"""
-        current_tip, current_height = self.get_best_chain_tip_sync()
-        current_difficulty = self._get_cumulative_difficulty(current_tip)
+        current_tip, current_height = await self.get_best_chain_tip()
+        current_difficulty = await self._get_cumulative_difficulty(current_tip)
         
         for tip_hash, chain in self.orphan_chains.items():
             # Get the root of this orphan chain
@@ -903,7 +920,7 @@ class ChainManager:
                 if root_parent == "00" * 32:
                     base_difficulty = Decimal(0)
                 else:
-                    base_difficulty = self._get_cumulative_difficulty(root_parent)
+                    base_difficulty = await self._get_cumulative_difficulty(root_parent)
                 
                 total_orphan_difficulty = base_difficulty + orphan_chain_difficulty
                 
@@ -922,11 +939,11 @@ class ChainManager:
                     
                     # First, we need to connect the orphan blocks to the main chain
                     # This requires processing them in order
-                    success = self._connect_orphan_chain(chain)
+                    success = await self._connect_orphan_chain(chain)
                     if success:
                         # Now attempt reorganization to the new tip
-                        if self._should_reorganize(tip_hash):
-                            success = self._reorganize_to_block(tip_hash)
+                        if await self._should_reorganize(tip_hash):
+                            success = await self._reorganize_to_block(tip_hash)
                             if success:
                                 logger.warning(f"Successfully reorganized to orphan chain tip {tip_hash}")
                                 # Clean up orphan data for connected blocks
@@ -956,7 +973,7 @@ class ChainManager:
         
         return total_difficulty
     
-    def _connect_orphan_chain(self, chain: List[str]) -> bool:
+    async def _connect_orphan_chain(self, chain: List[str]) -> bool:
         """Attempt to connect an orphan chain to the main chain"""
         logger.info(f"Attempting to connect orphan chain of {len(chain)} blocks")
         
@@ -972,7 +989,7 @@ class ChainManager:
             self.orphan_timestamps.pop(block_hash, None)
             
             # Try to add the block normally
-            success, error = self.add_block(block_data)
+            success, error = await self.add_block(block_data)
             if not success:
                 # Re-add to orphan pool if failed
                 self.orphan_blocks[block_hash] = block_data
@@ -984,23 +1001,23 @@ class ChainManager:
         
         return True
     
-    def _should_reorganize(self, new_tip_hash: str) -> bool:
+    async def _should_reorganize(self, new_tip_hash: str) -> bool:
         """Check if a new block creates a better chain than current"""
-        current_tip, _ = self.get_best_chain_tip_sync()
+        current_tip, _ = await self.get_best_chain_tip()
         
-        current_difficulty = self._get_cumulative_difficulty(current_tip)
-        new_difficulty = self._get_cumulative_difficulty(new_tip_hash)
+        current_difficulty = await self._get_cumulative_difficulty(current_tip)
+        new_difficulty = await self._get_cumulative_difficulty(new_tip_hash)
         
         return new_difficulty > current_difficulty
     
-    def _reorganize_to_block(self, new_tip_hash: str) -> bool:
+    async def _reorganize_to_block(self, new_tip_hash: str) -> bool:
         """
         Perform chain reorganization to make new_tip_hash the best chain
         This is the critical function for consensus
         """
         logger.warning(f"Starting chain reorganization to {new_tip_hash}")
         
-        current_tip, _ = self.get_best_chain_tip_sync()
+        current_tip, _ = await self.get_best_chain_tip()
         
         # Find common ancestor
         common_ancestor = self._find_common_ancestor(current_tip, new_tip_hash)
@@ -1102,25 +1119,25 @@ class ChainManager:
                 try:
                     # Update cache for disconnected blocks
                     for block_hash in blocks_to_disconnect:
-                        self.redis_cache.remove_chain_index_entry_sync(block_hash)
+                        await self.redis_cache.remove_chain_index_entry(block_hash)
                         if block_hash in self.block_index:
                             height = self.block_index[block_hash]["height"]
-                            self.redis_cache.remove_height_index_entry_sync(height)
+                            await self.redis_cache.remove_height_index_entry(height)
                     
                     # Update cache for connected blocks
                     for block_hash in blocks_to_connect:
                         if block_hash in self.block_index:
                             block_info = self.block_index[block_hash]
-                            self.redis_cache.update_chain_index_entry_sync(block_hash, block_info)
-                            self.redis_cache.update_height_index_entry_sync(block_info["height"], block_hash)
+                            await self.redis_cache.update_chain_index_entry(block_hash, block_info)
+                            await self.redis_cache.update_height_index_entry(block_info["height"], block_hash)
                     
                     # Update best chain info
-                    asyncio.run(self.redis_cache.set_best_chain_info({
+                    await self.redis_cache.set_best_chain_info({
                         "block_hash": new_tip_hash,
                         "height": self.block_index[new_tip_hash]["height"],
                         "timestamp": self.block_index[new_tip_hash]["timestamp"],
                         "cumulative_difficulty": str(self.block_index[new_tip_hash]["cumulative_difficulty"])
-                    }))
+                    })
                 except Exception as e:
                     logger.debug(f"Failed to update caches after reorg: {e}")
             
@@ -1626,7 +1643,7 @@ class ChainManager:
         # Store transaction
         batch.put(f"tx:{txid}".encode(), json.dumps(tx).encode())
     
-    def get_block_by_hash(self, block_hash: str) -> Optional[dict]:
+    async def get_block_by_hash(self, block_hash: str) -> Optional[dict]:
         """Get a block by its hash"""
         block_key = f"block:{block_hash}".encode()
         block_data = self.db.get(block_key)
@@ -1634,9 +1651,9 @@ class ChainManager:
             return json.loads(block_data.decode())
         return None
     
-    def is_block_in_main_chain(self, block_hash: str) -> bool:
+    async def is_block_in_main_chain(self, block_hash: str) -> bool:
         """Check if a block is in the main chain"""
-        current_tip, _ = self.get_best_chain_tip_sync()
+        current_tip, _ = await self.get_best_chain_tip()
         
         # Walk back from tip to see if we find this block
         current = current_tip
@@ -1650,13 +1667,13 @@ class ChainManager:
         
         return False
     
-    def detect_fork_at_height(self, height: int) -> Optional[str]:
+    async def detect_fork_at_height(self, height: int) -> Optional[str]:
         """
         Detect if we have a different block at the given height than what's expected.
         Returns the hash of our block at that height if it exists, None otherwise.
         """
         # Find our block at this height
-        best_tip, best_height = self.get_best_chain_tip_sync()
+        best_tip, best_height = await self.get_best_chain_tip()
         
         if height > best_height:
             return None  # We don't have a block at this height yet
@@ -1677,7 +1694,7 @@ class ChainManager:
         
         return None
     
-    def request_missing_ancestor(self, orphan_hash: str) -> Optional[Tuple[str, int]]:
+    async def request_missing_ancestor(self, orphan_hash: str) -> Optional[Tuple[str, int]]:
         """
         For an orphan block, determine what ancestor block we need to request.
         Returns (block_hash, height) of the block we should request, or None.
@@ -1721,7 +1738,7 @@ class ChainManager:
         for orphan_hash in to_remove:
             self._remove_orphan(orphan_hash)
     
-    def get_orphan_info(self) -> dict:
+    async def get_orphan_info(self) -> dict:
         """Get information about current orphan blocks"""
         current_time = int(time.time())
         orphans = []

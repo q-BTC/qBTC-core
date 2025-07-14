@@ -44,7 +44,7 @@ def _cleanup_mempool_after_sync(blocks: list[dict]):
 _processing_lock = asyncio.Lock()
 _processing_count = 0
 
-def process_blocks_from_peer(blocks: list[dict]):
+async def process_blocks_from_peer(blocks: list[dict]):
     global _processing_count
     _processing_count += 1
     call_id = _processing_count
@@ -54,7 +54,7 @@ def process_blocks_from_peer(blocks: list[dict]):
     
     # Wrap entire function to catch any error
     try:
-        result = _process_blocks_from_peer_impl(blocks)
+        result = await _process_blocks_from_peer_impl(blocks)
         logging.info(f"Call #{call_id}: Completed successfully")
         return result
     except Exception as e:
@@ -62,7 +62,7 @@ def process_blocks_from_peer(blocks: list[dict]):
         # Re-raise to maintain original behavior
         raise
 
-def _process_blocks_from_peer_impl(blocks: list[dict]):
+async def _process_blocks_from_peer_impl(blocks: list[dict]):
     """Actual implementation of process_blocks_from_peer"""
     
     # Debug logging to understand block structure
@@ -84,7 +84,7 @@ def _process_blocks_from_peer_impl(blocks: list[dict]):
     
     try:
         db = get_db()
-        cm = get_chain_manager()
+        cm = await get_chain_manager()
         raw_blocks = blocks
 
         logging.debug(f"[SYNC] Processing {len(raw_blocks)} blocks from peer")
@@ -188,14 +188,14 @@ def _process_blocks_from_peer_impl(blocks: list[dict]):
                 
                 # Let ChainManager handle consensus
                 logging.debug(f"Calling add_block with height={block.get('height')} (type: {type(block.get('height'))})")
-                success, error = cm.add_block(block)
+                success, error = await cm.add_block(block)
                 
                 if success:
                     accepted_count += 1
                     # Only process if block is in main chain
-                    if cm.is_block_in_main_chain(block_hash):
+                    if await cm.is_block_in_main_chain(block_hash):
                         # Process the block transactions
-                        _process_block_in_chain(block)
+                        await _process_block_in_chain(block)
                     else:
                         logging.info("Block %s accepted but not in main chain yet", block_hash)
                     continue
@@ -238,13 +238,13 @@ def _process_blocks_from_peer_impl(blocks: list[dict]):
         # Try to connect orphan blocks that may now be connectable
         if rejected_count > 0:
             logging.info("[SYNC] Attempting to connect orphan blocks...")
-            orphans_connected = cm.try_connect_orphan_chain()
+            orphans_connected = await cm.try_connect_orphan_chain()
             if orphans_connected:
                 logging.info("[SYNC] Successfully connected some orphan blocks")
                 accepted_count += 1  # Mark that we made progress
         
         # Check if we need to request more blocks
-        best_tip, best_height = cm.get_best_chain_tip_sync()
+        best_tip, best_height = await cm.get_best_chain_tip()
         logging.info("Current best chain height: %d", best_height)
         
         # Check for orphan chains that need ancestor blocks
@@ -281,7 +281,7 @@ def _process_blocks_from_peer_impl(blocks: list[dict]):
         # Always disable sync mode after processing
         cm.set_sync_mode(False)
 
-def _process_block_in_chain(block: dict):
+async def _process_block_in_chain(block: dict):
     """Process a block that is confirmed to be in the main chain"""
     # Validate input type
     if not isinstance(block, dict):
@@ -544,10 +544,10 @@ def _process_block_in_chain(block: dict):
     # Emit block event
     emit_database_event(block_key, db.get(block_key))
 
-def get_blockchain_info() -> Dict:
+async def get_blockchain_info() -> Dict:
     """Get current blockchain information"""
-    cm = get_chain_manager()
-    best_hash, best_height = cm.get_best_chain_tip_sync()
+    cm = await get_chain_manager()
+    best_hash, best_height = await cm.get_best_chain_tip()
     
     return {
         "best_block_hash": best_hash,
@@ -559,14 +559,14 @@ def get_blockchain_info() -> Dict:
 
 async def _check_orphan_chains_for_missing_blocks(gossip_client=None):
     """Check if any orphan chains need ancestor blocks to be requested"""
-    cm = get_chain_manager()
+    cm = await get_chain_manager()
     
     # Track blocks we need to request
     blocks_to_request: Set[Tuple[str, int]] = set()
     
     # Check each orphan for missing ancestors
     for orphan_hash in cm.orphan_blocks:
-        ancestor_info = cm.request_missing_ancestor(orphan_hash)
+        ancestor_info = await cm.request_missing_ancestor(orphan_hash)
         if ancestor_info:
             blocks_to_request.add(ancestor_info)
     
@@ -585,7 +585,7 @@ async def _check_orphan_chains_for_missing_blocks(gossip_client=None):
             if received_blocks:
                 logging.info(f"[SYNC] Successfully requested {len(received_blocks)} missing blocks")
                 # Process the received blocks
-                process_blocks_from_peer(received_blocks)
+                await process_blocks_from_peer(received_blocks)
             else:
                 logging.error(f"[SYNC] Failed to request missing blocks")
         else:
@@ -649,12 +649,12 @@ async def request_specific_blocks(block_hashes: List[str], gossip_client=None) -
         logging.warning(f"[SYNC] Failed to receive any of the {len(block_hashes)} requested blocks")
         return None
 
-def detect_and_handle_fork(blocks: List[dict]) -> bool:
+async def detect_and_handle_fork(blocks: List[dict]) -> bool:
     """
     Detect if received blocks indicate we're on a different fork.
     Returns True if a fork was detected and handled.
     """
-    cm = get_chain_manager()
+    cm = await get_chain_manager()
     fork_detected = False
     
     for block in blocks:
@@ -663,7 +663,7 @@ def detect_and_handle_fork(blocks: List[dict]) -> bool:
         prev_hash = block.get("previous_hash")
         
         # Check if we have a different block at this height
-        our_block_at_height = cm.detect_fork_at_height(height)
+        our_block_at_height = await cm.detect_fork_at_height(height)
         
         if our_block_at_height and our_block_at_height != block_hash:
             # We have a different block at this height - fork detected!

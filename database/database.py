@@ -70,9 +70,26 @@ def get_current_height(db, max_retries: int = 3) -> Tuple[int, str]:
         try:
             # Method 1: Try ChainManager (preferred)
             try:
-                from blockchain.chain_singleton import get_chain_manager
-                cm = get_chain_manager()
-                best_hash, best_height = cm.get_best_chain_tip_sync()
+                from blockchain.chain_singleton import get_chain_manager_sync
+                cm = get_chain_manager_sync()
+                # Since this is a sync context, we'll fallback to using the block index directly
+                # rather than the async get_best_chain_tip method
+                best_tip = None
+                best_difficulty = 0
+                best_height = -1
+                
+                for tip_hash in cm.chain_tips:
+                    tip_info = cm.block_index.get(tip_hash)
+                    if tip_info and tip_info.get("cumulative_difficulty", 0) > best_difficulty:
+                        best_difficulty = tip_info["cumulative_difficulty"]
+                        best_tip = tip_hash
+                        best_height = tip_info["height"]
+                
+                if best_tip:
+                    best_hash = best_tip
+                else:
+                    best_hash = "00" * 32
+                    best_height = -1
                 
                 # Validate the result
                 if best_hash and best_hash != "00" * 32 and best_height >= 0:
