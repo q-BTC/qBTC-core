@@ -394,7 +394,7 @@ async def get_block_template(data):
         "noncerange": "00000000ffffffff",
         "capabilities": ["proposal"],
         "coinbaseaux": {},
-        "coinbasevalue": 5000000000,
+        "coinbasevalue": 50,
         "transactions": transactions,
         "longpollid": previous_block_hash,
     }
