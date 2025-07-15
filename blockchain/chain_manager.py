@@ -323,10 +323,15 @@ class ChainManager:
         self.is_syncing = syncing
         logger.info(f"Sync mode set to: {syncing}")
     
-    async def add_block(self, block_data: dict) -> Tuple[bool, Optional[str]]:
+    async def add_block(self, block_data: dict, pre_validated_batch: WriteBatch = None) -> Tuple[bool, Optional[str]]:
         """
         Add a new block to the chain
         Returns (success, error_message)
+        
+        Args:
+            block_data: The block data including full_transactions
+            pre_validated_batch: Optional batch with pre-computed UTXOs and transactions
+                               (used by RPC to make block acceptance atomic)
         """
         # Validate required fields
         required_fields = ["block_hash", "previous_hash", "height", "version", "merkle_root", "timestamp", "bits", "nonce"]
@@ -594,10 +599,17 @@ class ChainManager:
                     logger.debug(f"Failed to update caches: {e}")
             
             # Connect the block to process its transactions and create UTXOs
-            # Need to create a WriteBatch for the transaction
-            batch = WriteBatch()
-            self._connect_block(block_data, batch)
-            self.db.write(batch)
+            if pre_validated_batch:
+                # Use the pre-validated batch from RPC (contains UTXOs and transactions)
+                # Still need to apply block-specific changes
+                batch = pre_validated_batch
+                self._connect_block(block_data, batch)
+                self.db.write(batch)
+            else:
+                # Normal path: create our own batch
+                batch = WriteBatch()
+                self._connect_block(block_data, batch)
+                self.db.write(batch)
             
             # Update chain:best_tip in database
             tip_key = b"chain:best_tip"

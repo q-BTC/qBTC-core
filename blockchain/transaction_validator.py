@@ -260,7 +260,7 @@ class TransactionValidator:
         
         # Verify signature (skip only for genesis transaction)
         # All non-genesis, non-coinbase transactions MUST have valid signatures
-        if height != 1 and not self._is_coinbase_transaction(tx):
+        if height != 0 and not self._is_coinbase_transaction(tx):
             if not signature or not pubkey or not msg_str:
                 return False, f"Transaction {txid} missing signature, pubkey, or message", Decimal("0")
             

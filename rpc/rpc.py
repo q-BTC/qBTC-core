@@ -758,13 +758,16 @@ async def submit_block(request: Request, data: dict) -> dict:
         # Add full_transactions to block_data
         block_data["full_transactions"] = full_transactions
         
-        # Store block and transactions in database BEFORE adding block to chain
-        batch.put(b"block:" + block.hash().encode(), json.dumps(block_data).encode())
-        db.write(batch)
+        # CRITICAL FIX: Pass everything to ChainManager for atomic validation
+        # This prevents database corruption from invalid blocks
         
-        # Now add block using ChainManager (transactions are already in DB)
-        success, error_msg = await cm.add_block(block_data)
+        # Add block data to batch but DON'T write yet
+        batch.put(b"block:" + block.hash().encode(), json.dumps(block_data).encode())
+        
+        # Pass the batch to ChainManager for atomic validation and write
+        success, error_msg = await cm.add_block(block_data, pre_validated_batch=batch)
         if not success:
+            # Batch was never written, so no cleanup needed!
             logger.error(f"ChainManager rejected block: {error_msg}")
             return rpc_error(-1, f"Block rejected: {error_msg}", data["id"])
         
@@ -798,7 +801,8 @@ async def submit_block(request: Request, data: dict) -> dict:
         block_gossip = {
                 "type": "blocks_response",
                 "blocks": [block_data],  # blocks should be a list
-                "timestamp": int(time.time() * 1000)
+                "timestamp": int(time.time() * 1000),
+                "is_new_block": True  # Flag to indicate this is a new block announcement, not a sync response
         }
 
         logger.info(f"Broadcasting block {block.hash()} at height {block_data['height']}")

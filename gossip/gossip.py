@@ -257,8 +257,10 @@ class GossipNode:
         elif msg_type == "blocks_response":
             logger.info(f"Received blocks_response from {from_peer}")
             blocks = msg.get("blocks", [])
+            is_new_block = msg.get("is_new_block", False)
+            
             if blocks:
-                logger.info(f"Processing {len(blocks)} blocks from peer")
+                logger.info(f"Processing {len(blocks)} blocks from peer (is_new_block={is_new_block})")
                 # Log first block structure for debugging
                 if blocks and len(blocks) > 0:
                     logger.info(f"First block keys: {list(blocks[0].keys())}")
@@ -279,6 +281,11 @@ class GossipNode:
                                     logger.warning(f"Could not determine txid for transaction {i} in block {block.get('height', 'unknown')}")
                 
                 await process_blocks_from_peer(blocks)
+                
+                # If this is a new block announcement (not a sync response), propagate it
+                if is_new_block:
+                    logger.info(f"Propagating new block announcement to other peers")
+                    await self.randomized_broadcast(msg)
         
         elif msg_type == "blocks_by_hash_response":
             logger.info(f"Received blocks_by_hash_response from {from_peer}")
@@ -472,8 +479,8 @@ class GossipNode:
         
         if not peers:
             # CRITICAL: This should NEVER happen for blocks!
-            if msg_type == "block":
-                logger.error("CRITICAL: No peers available for BLOCK broadcast! This will cause validators to fall behind!")
+            if msg_type == "blocks_response" and msg_dict.get("is_new_block"):
+                logger.error("CRITICAL: No peers available for NEW BLOCK broadcast! This will cause validators to fall behind!")
                 # Try to recover by re-discovering peers
                 logger.info("Attempting emergency peer discovery...")
                 from dht.dht import discover_peers_once
