@@ -181,6 +181,11 @@ class WebSocketEventHandlers:
                     if sender == receiver:
                         continue
                     
+                    # Check if this is a coinbase transaction (but not genesis)
+                    # Genesis transaction has empty sender, other coinbase transactions have "coinbase" as sender
+                    if sender == "coinbase":
+                        continue
+                    
                     # For genesis transactions (empty sender), set sender to "GENESIS"
                     if sender == "":
                         sender = "GENESIS"
