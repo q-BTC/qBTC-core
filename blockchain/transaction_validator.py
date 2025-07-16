@@ -42,6 +42,14 @@ class TransactionValidator:
         for i, tx in enumerate(full_transactions):
             if tx is None:
                 continue
+            
+            # Debug logging
+            if "txid" not in tx:
+                logger.error(f"Transaction at index {i} missing txid!")
+                logger.error(f"Transaction keys: {list(tx.keys())}")
+                logger.error(f"Full transaction: {json.dumps(tx, indent=2)}")
+            else:
+                logger.info(f"Transaction {i} has txid: {tx['txid']}")
                 
             # Check if this is a coinbase transaction
             is_coinbase = self._is_coinbase_transaction(tx)
@@ -93,6 +101,8 @@ class TransactionValidator:
         
         # All transactions MUST have a txid - no exceptions
         if "txid" not in tx:
+            logger.error(f"[VALIDATOR] Transaction missing txid! Keys: {list(tx.keys())}")
+            logger.error(f"[VALIDATOR] Transaction data: {json.dumps(tx, default=str)[:500]}...")
             return False, "Invalid transaction format - missing txid", Decimal("0")
         
         txid = tx["txid"]

@@ -381,10 +381,12 @@ async def _process_block_in_chain(block: dict):
         if validator._is_coinbase_transaction(tx):
             continue
 
-        # All transactions MUST have a txid
+        # Ensure transaction has txid (for blocks received via gossip)
         if "txid" not in tx:
-            logging.warning(f"[SYNC] Skipping transaction without txid in block {height}")
-            continue
+            from blockchain.blockchain import serialize_transaction, sha256d
+            raw_tx = serialize_transaction(tx)
+            tx["txid"] = sha256d(bytes.fromhex(raw_tx))[::-1].hex()
+            logging.info(f"[SYNC] Added missing txid to transaction: {tx['txid']}")
         
         txid = tx["txid"]
         
@@ -406,6 +408,16 @@ async def _process_block_in_chain(block: dict):
                 utxo_rec = json.loads(db.get(spent_key).decode())
                 utxo_rec["spent"] = True
                 batch.put(spent_key, json.dumps(utxo_rec).encode())
+                
+                # Remove from wallet index
+                if 'receiver' in utxo_rec:
+                    wallet_index_key = f"wallet_utxos:{utxo_rec['receiver']}".encode()
+                    if wallet_index_key in db:
+                        wallet_utxos = json.loads(db.get(wallet_index_key).decode())
+                        utxo_key = f"utxo:{inp_txid}:{inp_index}"
+                        if utxo_key in wallet_utxos:
+                            wallet_utxos.remove(utxo_key)
+                            batch.put(wallet_index_key, json.dumps(wallet_utxos).encode())
 
         # Create new UTXOs
         for out in outputs:
@@ -420,12 +432,35 @@ async def _process_block_in_chain(block: dict):
             }
             out_key = f"utxo:{txid}:{out.get('utxo_index', 0)}".encode()
             batch.put(out_key, json.dumps(utxo_record).encode())
+            
+            # Add to wallet index
+            if out.get('receiver'):
+                wallet_index_key = f"wallet_utxos:{out['receiver']}".encode()
+                wallet_utxos = []
+                if wallet_index_key in db:
+                    wallet_utxos = json.loads(db.get(wallet_index_key).decode())
+                utxo_key = f"utxo:{txid}:{out.get('utxo_index', 0)}"
+                if utxo_key not in wallet_utxos:
+                    wallet_utxos.append(utxo_key)
+                    batch.put(wallet_index_key, json.dumps(wallet_utxos).encode())
 
     # Store coinbase transaction and outputs
     if coinbase_data is not None:
         batch.put(f"tx:{coinbase_data['tx_id']}".encode(), json.dumps(coinbase_data['tx']).encode())
         for output_key, utxo in coinbase_data['outputs']:
             batch.put(output_key, json.dumps(utxo).encode())
+            
+            # Add coinbase outputs to wallet index
+            if 'receiver' in utxo:
+                wallet_index_key = f"wallet_utxos:{utxo['receiver']}".encode()
+                wallet_utxos = []
+                if wallet_index_key in db:
+                    wallet_utxos = json.loads(db.get(wallet_index_key).decode())
+                # Extract UTXO key from output_key
+                utxo_key = output_key.decode()
+                if utxo_key not in wallet_utxos:
+                    wallet_utxos.append(utxo_key)
+                    batch.put(wallet_index_key, json.dumps(wallet_utxos).encode())
     
     calculated_root = calculate_merkle_root(tx_ids)
     if calculated_root != block_merkle_root:

@@ -592,6 +592,9 @@ async def submit_block(request: Request, data: dict) -> dict:
             txid = sha256d(bytes.fromhex(raw_tx))[::-1].hex()
             logger.debug(f"Processing transaction {i}: TXID: {txid}")
             
+            # Add txid to the transaction object itself
+            tx["txid"] = txid
+            
             # Only add unique txids to our list
             if txid not in unique_txids_processed:
                 txids.append(txid)
@@ -657,6 +660,16 @@ async def submit_block(request: Request, data: dict) -> dict:
                             utxo["spent"] = True
                             batch.put(utxo_key, json.dumps(utxo).encode())
                             spent_in_this_block.add(utxo_key_str)
+                            
+                            # Remove from wallet index
+                            if 'receiver' in utxo:
+                                wallet_index_key = f"wallet_utxos:{utxo['receiver']}".encode()
+                                if wallet_index_key in db:
+                                    wallet_utxos = json.loads(db.get(wallet_index_key).decode())
+                                    if utxo_key_str in wallet_utxos:
+                                        wallet_utxos.remove(utxo_key_str)
+                                        batch.put(wallet_index_key, json.dumps(wallet_utxos).encode())
+                            
                             print(f"****** Done marking {utxo_key} as spent")
 
                     # Create outputs
@@ -672,6 +685,18 @@ async def submit_block(request: Request, data: dict) -> dict:
                             "spent": False
                         }
                         batch.put(utxo_key, json.dumps(utxo_value).encode())
+                        
+                        # Add to wallet index
+                        if output_["receiver"]:
+                            wallet_index_key = f"wallet_utxos:{output_['receiver']}".encode()
+                            wallet_utxos = []
+                            if wallet_index_key in db:
+                                wallet_utxos = json.loads(db.get(wallet_index_key).decode())
+                            utxo_key_str = utxo_key.decode()
+                            if utxo_key_str not in wallet_utxos:
+                                wallet_utxos.append(utxo_key_str)
+                                batch.put(wallet_index_key, json.dumps(wallet_utxos).encode())
+                        
                         print(f"****** Created UTXO {utxo_key} → {utxo_value}")
 
                     # Store transaction
@@ -732,6 +757,11 @@ async def submit_block(request: Request, data: dict) -> dict:
         # Add all other transactions to full_transactions
         for tx in tx_list:
             if tx:  # Only add non-None transactions
+                # Calculate and add txid to transaction
+                raw_tx = serialize_transaction(tx)
+                calculated_txid = sha256d(bytes.fromhex(raw_tx))[::-1].hex()
+                tx["txid"] = calculated_txid
+                logger.info(f"[SUBMIT_BLOCK] Added txid {calculated_txid} to transaction")
                 full_transactions.append(tx)
         
         # Use ChainManager singleton to add the block

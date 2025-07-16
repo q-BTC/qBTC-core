@@ -250,7 +250,7 @@ class WebSocketEventHandlers:
                 logger.warning("Mempool manager is None")
             
             balance = get_balance(wallet_address)
-            transactions = get_transactions(wallet_address)
+            transactions = get_transactions(wallet_address, include_coinbase=False)
             
             logger.info(f"Wallet {wallet_address} - Balance: {balance}, Transactions: {len(transactions)}")
             

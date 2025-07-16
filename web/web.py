@@ -278,14 +278,31 @@ async def create_opentimestamp(data: bytes) -> Optional[str]:
 def get_balance(wallet_address: str) -> Decimal:
     db = get_db()
     total = Decimal("0")
-    for key, value in db.items():
-        if key.startswith(b"utxo:"):
-            utxo_data = json.loads(value.decode())
-            if utxo_data["receiver"] == wallet_address and not utxo_data["spent"]:
-                total += Decimal(utxo_data["amount"])
+    
+    # First try to use the wallet index for fast lookup
+    wallet_index_key = f"wallet_utxos:{wallet_address}".encode()
+    wallet_index_data = db.get(wallet_index_key)
+    
+    if wallet_index_data:
+        # Use indexed approach - O(m) where m is UTXOs for this wallet
+        wallet_utxos = json.loads(wallet_index_data.decode())
+        for utxo_key_str in wallet_utxos:
+            utxo_data_raw = db.get(utxo_key_str.encode())
+            if utxo_data_raw:
+                utxo_data = json.loads(utxo_data_raw.decode())
+                if not utxo_data.get("spent", False):
+                    total += Decimal(utxo_data["amount"])
+    else:
+        # Fallback to full scan for backward compatibility - O(n)
+        logging.warning(f"No wallet index found for {wallet_address}, falling back to full scan")
+        for key, value in db.items():
+            if key.startswith(b"utxo:"):
+                utxo_data = json.loads(value.decode())
+                if utxo_data["receiver"] == wallet_address and not utxo_data["spent"]:
+                    total += Decimal(utxo_data["amount"])
     return total
 
-def get_transactions(wallet_address: str, limit: int = 50):
+def get_transactions(wallet_address: str, limit: int = 50, include_coinbase: bool = False):
     logging.debug(f"=== get_transactions called for wallet: {wallet_address} ===")
     db = get_db()
     tx_list = []
@@ -317,6 +334,11 @@ def get_transactions(wallet_address: str, limit: int = 50):
         txid = utxo["txid"]
         
         logging.debug(f"UTXO {utxo_count}: key={key.decode()}, txid={txid}, sender={sender}, receiver={receiver}, amount={amount}")
+
+        # Skip coinbase transactions if not explicitly requested
+        if not include_coinbase and (sender == "coinbase" or sender == ""):
+            logging.debug(f"  -> Skipping coinbase transaction for txid {txid}")
+            continue
 
         # Skip change transactions explicitly
         if sender == wallet_address and receiver == wallet_address:
@@ -662,7 +684,7 @@ async def get_balance_endpoint(wallet_address: str):
         raise HTTPException(status_code=500, detail="Error retrieving balance")
 
 @app.get("/transactions/{wallet_address}")
-async def get_transactions_endpoint(wallet_address: str, limit: int = 50):
+async def get_transactions_endpoint(wallet_address: str, limit: int = 50, include_coinbase: bool = False):
     logging.info(f"=== API: /transactions/{wallet_address} called (limit={limit}) ===")
     
     # Validate inputs
@@ -675,7 +697,7 @@ async def get_transactions_endpoint(wallet_address: str, limit: int = 50):
         raise ValidationError("Limit must be between 1 and 1000")
     
     try:
-        transactions = get_transactions(wallet_address, limit)
+        transactions = get_transactions(wallet_address, limit, include_coinbase)
         logging.info(f"API returning {len(transactions)} transactions for {wallet_address}")
         return {"wallet_address": wallet_address, "transactions": transactions}
     except Exception as e:
@@ -693,20 +715,45 @@ async def get_utxos_endpoint(wallet_address: str):
         db = get_db()
         utxos = []
         
-        for key, value in db.items():
-            if key.startswith(b"utxo:"):
-                utxo_data = json.loads(value.decode())
-                # Only include unspent UTXOs that belong to this address
-                if utxo_data["receiver"] == wallet_address and not utxo_data.get("spent", False):
-                    utxos.append({
-                        "txid": utxo_data.get("txid"),
-                        "vout": utxo_data.get("utxo_index", 0),  # output index
-                        "amount": utxo_data.get("amount"),
-                        "address": wallet_address,
-                        "confirmations": 1,  # Since we don't track confirmations in qBTC, assume confirmed
-                        "spendable": True,
-                        "solvable": True
-                    })
+        # First try to use the wallet index for fast lookup
+        wallet_index_key = f"wallet_utxos:{wallet_address}".encode()
+        wallet_index_data = db.get(wallet_index_key)
+        
+        if wallet_index_data:
+            # Use indexed approach - O(m) where m is UTXOs for this wallet
+            wallet_utxos = json.loads(wallet_index_data.decode())
+            for utxo_key_str in wallet_utxos:
+                utxo_data_raw = db.get(utxo_key_str.encode())
+                if utxo_data_raw:
+                    utxo_data = json.loads(utxo_data_raw.decode())
+                    # Only include unspent UTXOs
+                    if not utxo_data.get("spent", False):
+                        utxos.append({
+                            "txid": utxo_data.get("txid"),
+                            "vout": utxo_data.get("utxo_index", 0),  # output index
+                            "amount": utxo_data.get("amount"),
+                            "address": wallet_address,
+                            "confirmations": 1,  # Since we don't track confirmations in qBTC, assume confirmed
+                            "spendable": True,
+                            "solvable": True
+                        })
+        else:
+            # Fallback to full scan for backward compatibility - O(n)
+            logging.warning(f"No wallet index found for {wallet_address}, falling back to full scan")
+            for key, value in db.items():
+                if key.startswith(b"utxo:"):
+                    utxo_data = json.loads(value.decode())
+                    # Only include unspent UTXOs that belong to this address
+                    if utxo_data["receiver"] == wallet_address and not utxo_data.get("spent", False):
+                        utxos.append({
+                            "txid": utxo_data.get("txid"),
+                            "vout": utxo_data.get("utxo_index", 0),  # output index
+                            "amount": utxo_data.get("amount"),
+                            "address": wallet_address,
+                            "confirmations": 1,  # Since we don't track confirmations in qBTC, assume confirmed
+                            "spendable": True,
+                            "solvable": True
+                        })
         
         return {
             "wallet_address": wallet_address,
@@ -1138,7 +1185,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         # Send initial data directly without relying on event system
                         try:
                             balance = get_balance(wallet_address)
-                            transactions = get_transactions(wallet_address)
+                            transactions = get_transactions(wallet_address, include_coinbase=False)
                             
                             formatted = []
                             logging.debug(f"=== WEBSOCKET FORMATTING {len(transactions)} TRANSACTIONS ===")

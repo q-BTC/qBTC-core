@@ -467,6 +467,11 @@ class ChainManager:
                 self.validator.skip_time_validation = True
             
             # Validate all non-coinbase transactions
+            logger.info(f"About to validate block with {len(block_data.get('full_transactions', []))} full_transactions")
+            for i, tx in enumerate(block_data.get('full_transactions', [])):
+                if tx and 'txid' not in tx:
+                    logger.error(f"[CHAIN_MANAGER] Transaction at index {i} missing txid!")
+                    logger.error(f"[CHAIN_MANAGER] Transaction keys: {list(tx.keys()) if tx else 'None'}")
             is_valid, error_msg, total_fees = self.validator.validate_block_transactions(block_data)
             
             # Reset skip_time_validation after validation
@@ -1484,6 +1489,18 @@ class ChainManager:
                     utxo = json.loads(current_utxo_data.decode())
                     utxo["spent"] = False
                     batch.put(utxo_key, json.dumps(utxo).encode())
+                    
+                    # Re-add to wallet index
+                    if 'receiver' in utxo:
+                        wallet_index_key = f"wallet_utxos:{utxo['receiver']}".encode()
+                        wallet_utxos = []
+                        wallet_index_data = self.db.get(wallet_index_key)
+                        if wallet_index_data:
+                            wallet_utxos = json.loads(wallet_index_data.decode())
+                        utxo_key_str = utxo_key.decode()
+                        if utxo_key_str not in wallet_utxos:
+                            wallet_utxos.append(utxo_key_str)
+                            batch.put(wallet_index_key, json.dumps(wallet_utxos).encode())
         
         # Remove outputs created by this transaction
         for idx, out in enumerate(tx.get("outputs", [])):
@@ -1494,6 +1511,18 @@ class ChainManager:
             if current_data:
                 backup_key = f"{txid}:{idx}"
                 utxo_backups[backup_key] = current_data
+                
+                # Remove from wallet index
+                utxo = json.loads(current_data.decode())
+                if 'receiver' in utxo:
+                    wallet_index_key = f"wallet_utxos:{utxo['receiver']}".encode()
+                    wallet_index_data = self.db.get(wallet_index_key)
+                    if wallet_index_data:
+                        wallet_utxos = json.loads(wallet_index_data.decode())
+                        utxo_key_str = utxo_key.decode()
+                        if utxo_key_str in wallet_utxos:
+                            wallet_utxos.remove(utxo_key_str)
+                            batch.put(wallet_index_key, json.dumps(wallet_utxos).encode())
             
             batch.delete(utxo_key)
     
@@ -1524,6 +1553,17 @@ class ChainManager:
                         utxo = json.loads(utxo_data.decode())
                         utxo["spent"] = True
                         batch.put(utxo_key, json.dumps(utxo).encode())
+                        
+                        # Remove from wallet index
+                        if 'receiver' in utxo:
+                            wallet_index_key = f"wallet_utxos:{utxo['receiver']}".encode()
+                            wallet_index_data = self.db.get(wallet_index_key)
+                            if wallet_index_data:
+                                wallet_utxos = json.loads(wallet_index_data.decode())
+                                utxo_key_str = utxo_key.decode()
+                                if utxo_key_str in wallet_utxos:
+                                    wallet_utxos.remove(utxo_key_str)
+                                    batch.put(wallet_index_key, json.dumps(wallet_utxos).encode())
         
         # Create new UTXOs (including for coinbase!)
         for idx, out in enumerate(tx.get("outputs", [])):
@@ -1538,6 +1578,18 @@ class ChainManager:
             }
             utxo_key = f"utxo:{txid}:{idx}".encode()
             batch.put(utxo_key, json.dumps(utxo_record).encode())
+            
+            # Add to wallet index
+            if out.get('receiver'):
+                wallet_index_key = f"wallet_utxos:{out['receiver']}".encode()
+                wallet_utxos = []
+                wallet_index_data = self.db.get(wallet_index_key)
+                if wallet_index_data:
+                    wallet_utxos = json.loads(wallet_index_data.decode())
+                utxo_key_str = utxo_key.decode()
+                if utxo_key_str not in wallet_utxos:
+                    wallet_utxos.append(utxo_key_str)
+                    batch.put(wallet_index_key, json.dumps(wallet_utxos).encode())
             
             if is_coinbase:
                 logger.info(f"Created coinbase UTXO: {utxo_key.decode()} for {out.get('receiver')} amount: {out.get('amount')}")
@@ -1690,6 +1742,17 @@ class ChainManager:
                         utxo = json.loads(utxo_data.decode())
                         utxo["spent"] = True
                         batch.put(utxo_db_key, json.dumps(utxo).encode())
+                        
+                        # Remove from wallet index
+                        if 'receiver' in utxo:
+                            wallet_index_key = f"wallet_utxos:{utxo['receiver']}".encode()
+                            wallet_index_data = self.db.get(wallet_index_key)
+                            if wallet_index_data:
+                                wallet_utxos = json.loads(wallet_index_data.decode())
+                                utxo_db_key_str = utxo_db_key.decode()
+                                if utxo_db_key_str in wallet_utxos:
+                                    wallet_utxos.remove(utxo_db_key_str)
+                                    batch.put(wallet_index_key, json.dumps(wallet_utxos).encode())
         
         # Create new UTXOs (including for coinbase!)
         for idx, out in enumerate(tx.get("outputs", [])):
@@ -1704,6 +1767,18 @@ class ChainManager:
             }
             utxo_key = f"utxo:{txid}:{idx}".encode()
             batch.put(utxo_key, json.dumps(utxo_record).encode())
+            
+            # Add to wallet index
+            if out.get('receiver'):
+                wallet_index_key = f"wallet_utxos:{out['receiver']}".encode()
+                wallet_utxos = []
+                wallet_index_data = self.db.get(wallet_index_key)
+                if wallet_index_data:
+                    wallet_utxos = json.loads(wallet_index_data.decode())
+                utxo_key_str = utxo_key.decode()
+                if utxo_key_str not in wallet_utxos:
+                    wallet_utxos.append(utxo_key_str)
+                    batch.put(wallet_index_key, json.dumps(wallet_utxos).encode())
             
             if is_coinbase:
                 logger.info(f"Created coinbase UTXO during reorg: {utxo_key.decode()} for {out.get('receiver')} amount: {out.get('amount')}")

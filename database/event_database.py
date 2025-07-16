@@ -81,6 +81,17 @@ class EventDatabase:
             key = f"utxo:{utxo_key}".encode()
             db.put(key, json.dumps(utxo_data).encode())
             
+            # Update wallet index
+            if utxo_data.get('receiver'):
+                wallet_index_key = f"wallet_utxos:{utxo_data['receiver']}".encode()
+                wallet_utxos = []
+                wallet_index_data = db.get(wallet_index_key)
+                if wallet_index_data:
+                    wallet_utxos = json.loads(wallet_index_data.decode())
+                if key.decode() not in wallet_utxos:
+                    wallet_utxos.append(key.decode())
+                    db.put(wallet_index_key, json.dumps(wallet_utxos).encode())
+            
             # Emit UTXO created event
             await event_bus.emit(EventTypes.UTXO_CREATED, {
                 'utxo_key': utxo_key,
@@ -115,6 +126,16 @@ class EventDatabase:
                 
                 # Update UTXO
                 db.put(key, json.dumps(utxo_data).encode())
+                
+                # Remove from wallet index
+                if utxo_data.get('receiver'):
+                    wallet_index_key = f"wallet_utxos:{utxo_data['receiver']}".encode()
+                    wallet_index_data = db.get(wallet_index_key)
+                    if wallet_index_data:
+                        wallet_utxos = json.loads(wallet_index_data.decode())
+                        if key.decode() in wallet_utxos:
+                            wallet_utxos.remove(key.decode())
+                            db.put(wallet_index_key, json.dumps(wallet_utxos).encode())
                 
                 # Emit UTXO spent event
                 await event_bus.emit(EventTypes.UTXO_SPENT, {

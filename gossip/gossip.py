@@ -466,16 +466,18 @@ class GossipNode:
         
         # For critical messages like transactions, try to discover new peers first
         msg_type = msg_dict.get("type", "unknown")
-        if msg_type == "transaction" and len(peers) < 3:
-            logger.info(f"Only {len(peers)} peers known for transaction broadcast, checking for new peers...")
-            # Import here to avoid circular dependency
-            from dht.dht import discover_peers_once
-            try:
-                await discover_peers_once(self)
-                peers = self.dht_peers | self.client_peers
-                logger.info(f"After discovery, have {len(peers)} peers")
-            except Exception as e:
-                logger.warning(f"Failed to discover new peers: {e}")
+        # Disabled peer discovery for transactions to improve submission speed
+        # This was causing significant delays (several seconds) when submitting transactions
+        # if msg_type == "transaction" and len(peers) < 3:
+        #     logger.info(f"Only {len(peers)} peers known for transaction broadcast, checking for new peers...")
+        #     # Import here to avoid circular dependency
+        #     from dht.dht import discover_peers_once
+        #     try:
+        #         await discover_peers_once(self)
+        #         peers = self.dht_peers | self.client_peers
+        #         logger.info(f"After discovery, have {len(peers)} peers")
+        #     except Exception as e:
+        #         logger.warning(f"Failed to discover new peers: {e}")
         
         if not peers:
             # CRITICAL: This should NEVER happen for blocks!
@@ -526,7 +528,7 @@ class GossipNode:
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(peer[0], peer[1], limit=MAX_LINE_BYTES),
-                timeout=5
+                timeout=2  # Reduced from 5s to 2s for faster failures
             )
             
             # Send the message
@@ -557,12 +559,12 @@ class GossipNode:
             return None
 
     async def _send_message(self, peer, payload):
-        # Try direct connection with more retries and exponential backoff
-        for attempt in range(5):  # Increased from 2 to 5 attempts
+        # Try direct connection with reduced retries for faster failures
+        for attempt in range(2):  # Reduced from 5 to 2 attempts
             try:
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(peer[0], peer[1], limit=MAX_LINE_BYTES),
-                    timeout=5
+                    timeout=2  # Reduced from 5s to 2s for faster failures
                 )
                 writer.write(payload)
                 await writer.drain()
@@ -572,8 +574,8 @@ class GossipNode:
                 return
             except Exception as e:
                 logger.debug(f"Direct connection attempt {attempt + 1} to {peer} failed: {e}")
-                # Exponential backoff: 1s, 2s, 4s, 8s
-                await asyncio.sleep(min(2 ** attempt, 8))
+                # Faster exponential backoff: 0.5s, 1s
+                await asyncio.sleep(min(0.5 * (2 ** attempt), 2))
         
         # Try NAT traversal if available and peer supports it
         if NAT_TRAVERSAL_AVAILABLE and peer in self.peer_info:
@@ -587,7 +589,7 @@ class GossipNode:
                         local_peer = (peer_info['local_ip'], peer_info['local_port'])
                         reader, writer = await asyncio.wait_for(
                             asyncio.open_connection(local_peer[0], local_peer[1], limit=MAX_LINE_BYTES),
-                            timeout=3
+                            timeout=1  # Reduced from 3s to 1s for local network
                         )
                         writer.write(payload)
                         await writer.drain()
@@ -645,7 +647,7 @@ class GossipNode:
                         # Simple ping to check if peer is back online
                         reader, writer = await asyncio.wait_for(
                             asyncio.open_connection(peer[0], peer[1]),
-                            timeout=3
+                            timeout=1  # Reduced from 3s to 1s for recovery check
                         )
                         # Send a get_height request as ping
                         ping_msg = json.dumps({"type": "get_height", "timestamp": int(time.time() * 1000)}) + "\n"
@@ -653,7 +655,7 @@ class GossipNode:
                         await writer.drain()
                         
                         # Wait for response
-                        response = await asyncio.wait_for(reader.readline(), timeout=3)
+                        response = await asyncio.wait_for(reader.readline(), timeout=2)  # Reduced from 3s to 2s
                         if response:
                             # Peer is back online, reset failure count
                             self.failed_peers[peer] = 0
@@ -699,7 +701,7 @@ class GossipNode:
                     try:
                         reader, writer = await asyncio.wait_for(
                             asyncio.open_connection(peer[0], peer[1]),
-                            timeout=5
+                            timeout=2  # Reduced from 5s to 2s for faster sync
                         )
                         
                         # Request peer's height
@@ -708,7 +710,7 @@ class GossipNode:
                         await writer.drain()
                         
                         # Read response
-                        response = await asyncio.wait_for(reader.readline(), timeout=5)
+                        response = await asyncio.wait_for(reader.readline(), timeout=3)  # Reduced from 5s to 3s
                         if response:
                             msg = json.loads(response.decode('utf-8').strip())
                             if msg.get("type") == "height_response":
