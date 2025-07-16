@@ -31,7 +31,7 @@ services:
       # Websocket transaction broadcasting (optional for validators)
       BROADCAST_TRANSACTIONS: "${BROADCAST_TRANSACTIONS:-false}"
     # Validator command - set BROADCAST_TRANSACTIONS=true in .env to enable websocket transaction broadcasting
-    command: ["bash", "-c", "if [ \"$$BROADCAST_TRANSACTIONS\" = \"true\" ]; then python3 main.py --bootstrap_server \"${BOOTSTRAP_SERVER:-api.bitcoinqs.org}\" --bootstrap_port \"${BOOTSTRAP_PORT:-8001}\" --dht-port 8001 --gossip-port 8002 --broadcast-transactions; else python3 main.py --bootstrap_server \"${BOOTSTRAP_SERVER:-api.bitcoinqs.org}\" --bootstrap_port \"${BOOTSTRAP_PORT:-8001}\" --dht-port 8001 --gossip-port 8002; fi"]
+    command: bash -c 'if [ "$$BROADCAST_TRANSACTIONS" = "true" ]; then python3 main.py --bootstrap_server "${BOOTSTRAP_SERVER:-api.bitcoinqs.org}" --bootstrap_port "${BOOTSTRAP_PORT:-8001}" --dht-port 8001 --gossip-port 8002 --broadcast-transactions; else python3 main.py --bootstrap_server "${BOOTSTRAP_SERVER:-api.bitcoinqs.org}" --bootstrap_port "${BOOTSTRAP_PORT:-8001}" --dht-port 8001 --gossip-port 8002; fi'
     ports:
       # Remove 8080 from here since nginx will handle it
       - "8332:8332"     # RPC
