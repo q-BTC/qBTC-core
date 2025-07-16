@@ -700,11 +700,28 @@ async def update_heartbeat():
                 logger.debug("DHT server not initialized, skipping heartbeat")
                 await asyncio.sleep(HEARTBEAT_INTERVAL)
                 continue
+            
+            # Check if we have any neighbors before trying to set values
+            try:
+                neighbors = kad_server.bootstrappable_neighbors()
+                if not neighbors:
+                    logger.debug("No DHT neighbors available, skipping heartbeat update")
+                    await asyncio.sleep(HEARTBEAT_INTERVAL)
+                    continue
+            except Exception as e:
+                logger.debug(f"Could not check neighbors: {e}")
+                await asyncio.sleep(HEARTBEAT_INTERVAL)
+                continue
+                
             # Always try to update heartbeat, not just when bootstrapped
             await kad_server.set(heartbeat_key, str(time.time()))
             logger.debug(f"Updated heartbeat for {VALIDATOR_ID}")
         except Exception as e:
-            logger.warning(f"Failed to update heartbeat: {e}")
+            # Only log as warning if it's not the "empty sequence" error
+            if "empty sequence" not in str(e):
+                logger.warning(f"Failed to update heartbeat: {e}")
+            else:
+                logger.debug(f"DHT not ready for heartbeat update (no nodes): {e}")
         await asyncio.sleep(HEARTBEAT_INTERVAL)
 
 async def maintain_validator_list(gossip_node):
@@ -770,7 +787,10 @@ async def maintain_validator_list(gossip_node):
                         # Heartbeat is stale, but check if validator is in gossip peer list
                         # before marking as dead
                         if v in known_validators:
-                            logger.warning(f"Validator {v} heartbeat is stale ({current_time - last_seen:.1f}s old) but keeping in list")
+                            if last_seen:
+                                logger.warning(f"Validator {v} heartbeat is stale ({current_time - last_seen:.1f}s old) but keeping in list")
+                            else:
+                                logger.warning(f"Validator {v} has no heartbeat recorded but keeping in list")
                             alive.add(v)  # Keep validator alive if it's in our known list
                 except Exception as e:
                     logger.warning(f"Failed to fetch heartbeat for {v}: {e}")

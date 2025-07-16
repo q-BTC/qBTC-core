@@ -230,9 +230,13 @@ async def startup(args=None):
             
             # Also set in web module for health checks
             try:
-                from web.web import set_gossip_node
+                from web.web import set_gossip_node, set_broadcast_transactions
                 set_gossip_node(gossip_node)
                 logger.info("Gossip node reference set in web module")
+                
+                # Configure websocket transaction broadcasting
+                set_broadcast_transactions(args.broadcast_transactions)
+                logger.info(f"Websocket transaction broadcasting configured: {args.broadcast_transactions}")
             except Exception as e:
                 logger.warning(f"Could not set gossip node in web module: {e}")
             

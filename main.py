@@ -82,8 +82,14 @@ if __name__ == "__main__":
                         help='Gossip port (default: 8002)')
     parser.add_argument('--external-ip', type=str, default=None,
                         help='External IP address for NAT traversal')
+    parser.add_argument('--broadcast-transactions', action='store_true',
+                        help='Enable websocket transaction broadcasting (optional for validators, mandatory for bootstrap)')
     
     args = parser.parse_args()
+    
+    # Make transaction broadcasting mandatory for bootstrap nodes
+    if args.bootstrap:
+        args.broadcast_transactions = True
     
     try:
         asyncio.run(main(args))

@@ -48,6 +48,7 @@ class GossipNode:
         self.server = None
         self.partition_task = None
         self.sync_task = None
+        self.cleanup_task = None
         self.is_bootstrap = is_bootstrap
         self.is_full_node = is_full_node
         self.gossip_port = None  # Will be set when server starts
@@ -66,6 +67,8 @@ class GossipNode:
         self.partition_task = asyncio.create_task(self.check_partition())
         # Start periodic sync task
         self.sync_task = asyncio.create_task(self.periodic_sync())
+        # Start periodic cleanup task
+        self.cleanup_task = asyncio.create_task(self.periodic_cleanup())
         logger.info(f"Gossip server started on {host}:{port}")
 
     async def handle_client(self, reader: StreamReader, writer: StreamWriter):
@@ -603,10 +606,12 @@ class GossipNode:
         
         # All attempts failed
         self.failed_peers[peer] = self.failed_peers.get(peer, 0) + 1
-        if peer in self.dht_peers and self.failed_peers[peer] > 10:  # Increased from 3 to 10
-            # Don't remove peer, just mark it as temporarily unreachable
-            logger.warning(f"Peer {peer} has failed {self.failed_peers[peer]} times, marking as unreachable")
-            # The partition check will attempt to recover this peer
+        if peer in self.dht_peers and self.failed_peers[peer] > 5:  # Reduced from 10 to 5
+            # Remove from synced_peers immediately on repeated failures
+            if peer in self.synced_peers:
+                self.synced_peers.discard(peer)
+                logger.warning(f"Removed {peer} from synced_peers after {self.failed_peers[peer]} failures")
+            # The partition check will handle final removal from dht_peers
     
     def _is_same_network(self, peer_local_ip: str) -> bool:
         """Check if peer is in same local network"""
@@ -661,21 +666,41 @@ class GossipNode:
                             self.failed_peers[peer] = 0
                             logger.info(f"Peer {peer} is back online, resetting failure count")
                             
-                            # If peer was in synced_peers, trigger sync
-                            if peer in self.synced_peers:
+                            # Ensure peer is in both lists if it's back online
+                            if peer not in self.synced_peers:
+                                self.synced_peers.add(peer)
                                 asyncio.create_task(push_blocks(peer[0], peer[1]))
                         
                         writer.close()
                         await writer.wait_closed()
                     except Exception as e:
                         logger.debug(f"Peer {peer} still unreachable: {e}")
-                        # Only remove peer after many failures and extended downtime
-                        if self.failed_peers.get(peer, 0) > 20:
+                        # Remove peer after fewer failures (5 instead of 20)
+                        if self.failed_peers.get(peer, 0) > 5:
+                            # Don't remove protected peers
+                            if peer in self.protected_peers:
+                                logger.info(f"Not removing protected peer {peer} despite failures")
+                                continue
+                            
                             self.dht_peers.discard(peer)
                             self.peer_info.pop(peer, None)
                             self.synced_peers.discard(peer)
                             del self.failed_peers[peer]
-                            logger.info(f"Permanently removed peer {peer} after extended downtime")
+                            logger.info(f"Removed unreachable peer {peer} after {self.failed_peers.get(peer, 0)} failures")
+            
+            # Clean up peers that are in dht_peers but not in synced_peers for too long
+            for peer in list(self.dht_peers):
+                if peer not in self.synced_peers and peer not in self.protected_peers:
+                    # Check if we have a timestamp for when this peer was added
+                    if peer in self.peer_timestamps:
+                        age = time.time() - self.peer_timestamps[peer]
+                        # If peer has been unsynced for more than 5 minutes, remove it
+                        if age > 300:  # 5 minutes
+                            logger.info(f"Removing stale unsynced peer {peer} (age: {age:.0f}s)")
+                            self.dht_peers.discard(peer)
+                            self.peer_info.pop(peer, None)
+                            self.failed_peers.pop(peer, None)
+                            del self.peer_timestamps[peer]
             
             await asyncio.sleep(30)
 
@@ -799,6 +824,12 @@ class GossipNode:
                         
                     except Exception as e:
                         logger.debug(f"[PERIODIC_SYNC] Error syncing with peer {peer}: {e}")
+                        # Mark failed peers
+                        self.failed_peers[peer] = self.failed_peers.get(peer, 0) + 1
+                        # Remove from synced_peers if too many failures
+                        if self.failed_peers[peer] > 3 and peer in self.synced_peers:
+                            self.synced_peers.discard(peer)
+                            logger.info(f"[PERIODIC_SYNC] Removed {peer} from synced_peers after repeated failures")
                 
             except Exception as e:
                 logger.error(f"[PERIODIC_SYNC] Error in periodic sync: {e}", exc_info=True)
@@ -812,6 +843,48 @@ class GossipNode:
             
             # Check every 30 seconds
             await asyncio.sleep(30)
+
+    async def periodic_cleanup(self):
+        """Periodically clean up peer lists to ensure consistency"""
+        await asyncio.sleep(60)  # Initial delay
+        
+        while True:
+            try:
+                # Ensure dht_peers and synced_peers are consistent
+                # Remove peers from dht_peers that are not in synced_peers and not protected
+                peers_to_remove = []
+                for peer in self.dht_peers:
+                    if peer not in self.synced_peers and peer not in self.protected_peers:
+                        # Check if peer has been unsynced for too long
+                        if peer in self.peer_timestamps:
+                            age = time.time() - self.peer_timestamps[peer]
+                            if age > 180:  # 3 minutes
+                                peers_to_remove.append(peer)
+                                logger.info(f"[CLEANUP] Marking {peer} for removal (unsynced for {age:.0f}s)")
+                
+                # Remove stale peers
+                for peer in peers_to_remove:
+                    self.dht_peers.discard(peer)
+                    self.peer_info.pop(peer, None)
+                    self.failed_peers.pop(peer, None)
+                    if peer in self.peer_timestamps:
+                        del self.peer_timestamps[peer]
+                    logger.info(f"[CLEANUP] Removed stale peer {peer}")
+                
+                # Log current state
+                logger.info(f"[CLEANUP] Current state - dht_peers: {len(self.dht_peers)}, synced_peers: {len(self.synced_peers)}, protected: {len(self.protected_peers)}")
+                
+                # Ensure all synced_peers are also in dht_peers
+                for peer in self.synced_peers:
+                    if peer not in self.dht_peers:
+                        self.dht_peers.add(peer)
+                        logger.warning(f"[CLEANUP] Added missing synced peer {peer} to dht_peers")
+                
+            except Exception as e:
+                logger.error(f"[CLEANUP] Error in periodic cleanup: {e}", exc_info=True)
+            
+            # Run every 2 minutes
+            await asyncio.sleep(120)
 
     def add_peer(self, ip: str, port: int, peer_info=None, protected=False):
         peer = (ip, port)
@@ -940,6 +1013,10 @@ class GossipNode:
             self.server_task.cancel()
         if self.partition_task:
             self.partition_task.cancel()
+        if self.sync_task:
+            self.sync_task.cancel()
+        if hasattr(self, 'cleanup_task') and self.cleanup_task:
+            self.cleanup_task.cancel()
         if self.server:
             self.server.close()
             await self.server.wait_closed()

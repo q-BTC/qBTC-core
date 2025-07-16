@@ -28,6 +28,13 @@ class WebSocketEventHandlers:
     async def handle_transaction_confirmed(self, event: Event):
         """Handle confirmed transaction events"""
         try:
+            from web.web import get_broadcast_transactions
+            
+            # Check if transaction broadcasting is enabled
+            if not get_broadcast_transactions():
+                logger.info(f"Skipping websocket broadcast for confirmed transaction {event.data.get('txid')} - broadcasting disabled")
+                return
+            
             tx_data = event.data
             txid = tx_data.get('txid')
             transaction = tx_data.get('transaction', {})
@@ -89,6 +96,13 @@ class WebSocketEventHandlers:
     async def handle_transaction_pending(self, event: Event):
         """Handle pending transaction events"""
         try:
+            from web.web import get_broadcast_transactions
+            
+            # Check if transaction broadcasting is enabled
+            if not get_broadcast_transactions():
+                logger.info(f"Skipping websocket broadcast for pending transaction {event.data.get('txid')} - broadcasting disabled")
+                return
+            
             tx_data = event.data
             txid = tx_data.get('txid')
             transaction = tx_data.get('transaction')
@@ -162,6 +176,13 @@ class WebSocketEventHandlers:
     async def _broadcast_all_transactions_update(self):
         """Broadcast update to all_transactions subscribers"""
         try:
+            from web.web import get_broadcast_transactions
+            
+            # Check if transaction broadcasting is enabled
+            if not get_broadcast_transactions():
+                logger.debug("Skipping all_transactions broadcast - broadcasting disabled")
+                return
+            
             db = get_db()
             formatted = []
             
@@ -182,12 +203,12 @@ class WebSocketEventHandlers:
                         continue
                     
                     # Check if this is a coinbase transaction (but not genesis)
-                    # Genesis transaction has empty sender, other coinbase transactions have "coinbase" as sender
+                    # Skip regular coinbase transactions but not genesis
                     if sender == "coinbase":
                         continue
                     
-                    # For genesis transactions (empty sender), set sender to "GENESIS"
-                    if sender == "":
+                    # For genesis transactions, set sender to "GENESIS" for display
+                    if sender == "" or sender == "bqs1genesis00000000000000000000000000000000":
                         sender = "GENESIS"
                     
                     # Get timestamp
@@ -239,8 +260,13 @@ class WebSocketEventHandlers:
     async def _broadcast_wallet_update(self, wallet_address: str):
         """Broadcast update for specific wallet"""
         try:
-            from web.web import get_balance, get_transactions
+            from web.web import get_balance, get_transactions, get_broadcast_transactions
             from state.state import mempool_manager
+            
+            # Check if transaction broadcasting is enabled
+            if not get_broadcast_transactions():
+                logger.debug(f"Skipping wallet update broadcast for {wallet_address} - broadcasting disabled")
+                return
             
             logger.info(f"Broadcasting wallet update for: {wallet_address}")
             

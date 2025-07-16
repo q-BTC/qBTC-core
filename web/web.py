@@ -51,6 +51,7 @@ logger = logging.getLogger(__name__)
 
 # Global reference to gossip node (set by startup)
 _gossip_node = None
+_broadcast_transactions = True  # Default to true for backward compatibility
 
 def set_gossip_node(node):
     """Set the global gossip node reference"""
@@ -61,6 +62,16 @@ def set_gossip_node(node):
 def get_gossip_node():
     """Get the global gossip node reference"""
     return _gossip_node
+
+def set_broadcast_transactions(enabled):
+    """Set whether to broadcast transactions on websockets"""
+    global _broadcast_transactions
+    _broadcast_transactions = enabled
+    logger.info(f"Websocket transaction broadcasting: {'enabled' if enabled else 'disabled'}")
+
+def get_broadcast_transactions():
+    """Get whether to broadcast transactions on websockets"""
+    return _broadcast_transactions
 
 app = FastAPI(title="qBTC Core API", version="1.0.0")
 
@@ -336,7 +347,9 @@ def get_transactions(wallet_address: str, limit: int = 50, include_coinbase: boo
         logging.debug(f"UTXO {utxo_count}: key={key.decode()}, txid={txid}, sender={sender}, receiver={receiver}, amount={amount}")
 
         # Skip coinbase transactions if not explicitly requested
-        if not include_coinbase and (sender == "coinbase" or sender == ""):
+        # But always include genesis transactions (sender is "bqs1genesis..." or empty string for admin)
+        is_genesis = sender == "bqs1genesis00000000000000000000000000000000" or (sender == "" and receiver == "bqs1HpmbeSd8nhRpq5zX5df91D3Xy8pSUovmV")
+        if not include_coinbase and sender == "coinbase" and not is_genesis:
             logging.debug(f"  -> Skipping coinbase transaction for txid {txid}")
             continue
 
@@ -378,10 +391,10 @@ def get_transactions(wallet_address: str, limit: int = 50, include_coinbase: boo
             transactions[txid]["sent_to"].append(receiver)
             logging.debug(f"  -> Added SENT transaction: txid={txid}, amount={amount}, to={receiver}")
 
-        elif receiver == wallet_address and (sender != wallet_address or sender == ""):
+        elif receiver == wallet_address and (sender != wallet_address or sender == "" or sender == "bqs1genesis00000000000000000000000000000000"):
             transactions[txid]["received"] += amount
             transactions[txid]["received_from"].append(sender)
-            if sender == "":
+            if sender == "" or sender == "bqs1genesis00000000000000000000000000000000":
                 logging.debug(f"  -> Added GENESIS transaction: txid={txid}, amount={amount}, from=GENESIS")
             else:
                 logging.debug(f"  -> Added RECEIVED transaction: txid={txid}, amount={amount}, from={sender}")
@@ -399,8 +412,8 @@ def get_transactions(wallet_address: str, limit: int = 50, include_coinbase: boo
 
         if data["received"] > 0:
             received_from_addr = next((addr for addr in data["received_from"] if addr != wallet_address), "Unknown")
-            # Display "GENESIS" for genesis transactions with empty sender
-            if received_from_addr == "":
+            # Display "GENESIS" for genesis transactions
+            if received_from_addr == "" or received_from_addr == "bqs1genesis00000000000000000000000000000000":
                 received_from_addr = "GENESIS"
             
             # Log genesis transaction detection
