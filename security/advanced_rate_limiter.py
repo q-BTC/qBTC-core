@@ -153,6 +153,20 @@ class AdvancedRateLimiter:
         """Get or create client info"""
         if self.use_redis and self.redis_client:
             try:
+                # Check if IP is in permanently blocked list
+                is_permanently_blocked = await self.redis_client.sismember("permanently_blocked_ips", client_key)
+                if is_permanently_blocked:
+                    # Return a permanently blocked client info
+                    return ClientInfo(
+                        ip=client_key,
+                        user_agent=user_agent,
+                        first_seen=time.time(),
+                        last_seen=time.time(),
+                        threat_level=ThreatLevel.CRITICAL,
+                        blocked_until=float('inf'),  # Blocked forever
+                        warnings=999
+                    )
+                
                 data = await self.redis_client.get(f"client:{client_key}")
                 if data:
                     client_data = json.loads(data)
@@ -365,6 +379,69 @@ class AdvancedRateLimiter:
         
         return blocked_clients
     
+    async def block_client(self, client_key: str, duration_hours: int = 24, reason: str = "Manual block") -> bool:
+        """Manually block a client"""
+        try:
+            block_duration = duration_hours * 3600  # Convert hours to seconds
+            blocked_until = time.time() + block_duration
+            
+            if self.use_redis and self.redis_client:
+                # Check if client exists, if not create new entry
+                data = await self.redis_client.get(f"client:{client_key}")
+                if data:
+                    client_data = json.loads(data)
+                else:
+                    # Create new client entry
+                    client_data = {
+                        'ip': client_key,
+                        'user_agent': 'Unknown',
+                        'first_seen': time.time(),
+                        'last_seen': time.time(),
+                        'request_count': 0,
+                        'failed_requests': 0,
+                        'threat_level': ThreatLevel.CRITICAL.value,
+                        'warnings': 999  # High warning count for manual blocks
+                    }
+                
+                client_data['blocked_until'] = blocked_until
+                client_data['threat_level'] = ThreatLevel.CRITICAL.value
+                client_data['block_reason'] = reason
+                
+                # Store with expiration longer than block duration
+                await self.redis_client.setex(f"client:{client_key}", block_duration + 3600, json.dumps(client_data))
+                
+                # Add to permanently blocked list for persistent blocking
+                await self.redis_client.sadd("permanently_blocked_ips", client_key)
+                
+                logger.info(f"Blocked client {client_key} for {duration_hours} hours. Reason: {reason}")
+                return True
+            else:
+                # In-memory fallback
+                if client_key in self.client_info:
+                    client = self.client_info[client_key]
+                else:
+                    # Create new client entry
+                    client = ClientInfo(
+                        ip=client_key,
+                        user_agent='Unknown',
+                        first_seen=time.time(),
+                        last_seen=time.time(),
+                        threat_level=ThreatLevel.CRITICAL
+                    )
+                    self.client_info[client_key] = client
+                
+                client.blocked_until = blocked_until
+                client.threat_level = ThreatLevel.CRITICAL
+                client.warnings = 999  # High warning count for manual blocks
+                
+                logger.info(f"Blocked client {client_key} for {duration_hours} hours. Reason: {reason}")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Failed to block client {client_key}: {e}")
+        
+        return False
+
     async def unblock_client(self, client_key: str) -> bool:
         """Manually unblock a client"""
         try:
@@ -375,6 +452,10 @@ class AdvancedRateLimiter:
                     client_data['blocked_until'] = 0
                     client_data['warnings'] = 0
                     await self.redis_client.setex(f"client:{client_key}", 3600, json.dumps(client_data))
+                    
+                    # Remove from permanently blocked list
+                    await self.redis_client.srem("permanently_blocked_ips", client_key)
+                    
                     logger.info(f"Unblocked client {client_key}")
                     return True
             else:

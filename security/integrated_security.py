@@ -423,6 +423,10 @@ async def get_security_status() -> Dict[str, Any]:
         }
     }
 
+async def block_client(client_ip: str, duration_hours: int = 24, reason: str = "Manual block") -> bool:
+    """Block a specific client"""
+    return await advanced_rate_limiter.block_client(client_ip, duration_hours, reason)
+
 async def unblock_client(client_ip: str) -> bool:
     """Unblock a specific client"""
     return await advanced_rate_limiter.unblock_client(client_ip)

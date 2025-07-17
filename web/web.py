@@ -27,7 +27,7 @@ from errors.exceptions import (
 from middleware.error_handler import setup_error_handlers
 from security.integrated_security import integrated_security_middleware
 from monitoring.health import health_monitor
-from security.integrated_security import get_security_status, unblock_client, get_client_info
+from security.integrated_security import get_security_status, block_client, unblock_client, get_client_info
 
 # Import event system
 from events.event_bus import event_bus, EventTypes
@@ -1299,6 +1299,35 @@ async def get_security_status_endpoint():
     except Exception as e:
         logger.error(f"Failed to get security status: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to retrieve security status")
+
+@app.post("/admin/security/block/{client_ip}")
+async def block_client_endpoint(client_ip: str, duration_hours: int = 24, reason: str = "Manual block by admin"):
+    """Block a specific client IP (admin only)"""
+    try:
+        # Validate IP format
+        import ipaddress
+        ipaddress.ip_address(client_ip)
+        
+        # Validate duration
+        if duration_hours < 1 or duration_hours > 8760:  # Max 1 year
+            raise ValidationError("Duration must be between 1 and 8760 hours")
+        
+        success = await block_client(client_ip, duration_hours, reason)
+        if success:
+            logger.info(f"Client {client_ip} blocked by admin for {duration_hours} hours. Reason: {reason}")
+            return {
+                "status": "success", 
+                "message": f"Client {client_ip} blocked for {duration_hours} hours",
+                "duration_hours": duration_hours,
+                "reason": reason
+            }
+        else:
+            return {"status": "error", "message": f"Failed to block client {client_ip}"}
+    except ValueError:
+        raise ValidationError("Invalid IP address format")
+    except Exception as e:
+        logger.error(f"Failed to block client {client_ip}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to block client")
 
 @app.post("/admin/security/unblock/{client_ip}")
 async def unblock_client_endpoint(client_ip: str):
