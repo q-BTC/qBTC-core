@@ -804,12 +804,26 @@ async def submit_block(request: Request, data: dict) -> dict:
         # No need to invalidate cache - we removed caching
 
         # Remove all non-coinbase transactions from mempool
+        logger.info(f"[MEMPOOL_CLEANUP] Attempting to remove {len(txids)-1} non-coinbase transactions from mempool")
+        logger.info(f"[MEMPOOL_CLEANUP] Current mempool size before cleanup: {mempool_manager.size()}")
+        
+        # Get all mempool transactions for debugging
+        all_mempool_txids = list(mempool_manager.get_all_transactions().keys())
+        logger.info(f"[MEMPOOL_CLEANUP] Current mempool txids: {all_mempool_txids[:10]}...")  # Log first 10
+        
+        removed_count = 0
+        not_found_count = 0
         for tid in txids[1:]:
             if mempool_manager.get_transaction(tid):
-                logger.info(f"Removing transaction {tid} from mempool")
+                logger.info(f"[MEMPOOL_CLEANUP] Removing transaction {tid} from mempool")
                 mempool_manager.remove_transaction(tid)
+                removed_count += 1
             else:
-                logger.debug(f"Transaction {tid} not in mempool (might be duplicate)")
+                logger.debug(f"[MEMPOOL_CLEANUP] Transaction {tid} not in mempool (might be duplicate or already removed)")
+                not_found_count += 1
+        
+        logger.info(f"[MEMPOOL_CLEANUP] Cleanup complete: removed={removed_count}, not_found={not_found_count}")
+        logger.info(f"[MEMPOOL_CLEANUP] Mempool size after cleanup: {mempool_manager.size()}")
 
         async with state_lock:
             blockchain.append(block.hash())

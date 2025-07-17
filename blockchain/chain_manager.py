@@ -1344,15 +1344,26 @@ class ChainManager:
         
         # Remove mined transactions from mempool
         # Skip coinbase (first transaction) as it's not in mempool
+        logger.info(f"[ChainManager] Starting mempool cleanup for block {block_data['block_hash']}")
+        logger.info(f"[ChainManager] Full transactions in block: {len(full_transactions)}")
+        logger.info(f"[ChainManager] Current mempool size: {mempool_manager.size()}")
+        
         removed_count = 0
+        not_in_mempool = 0
         for tx in full_transactions:
             if tx and "txid" in tx and not self.validator._is_coinbase_transaction(tx):
-                if mempool_manager.get_transaction(tx["txid"]) is not None:
-                    mempool_manager.remove_transaction(tx["txid"])
+                txid = tx["txid"]
+                logger.debug(f"[ChainManager] Checking if txid {txid} is in mempool")
+                if mempool_manager.get_transaction(txid) is not None:
+                    logger.info(f"[ChainManager] Removing mined transaction {txid} from mempool")
+                    mempool_manager.remove_transaction(txid)
                     removed_count += 1
+                else:
+                    logger.debug(f"[ChainManager] Transaction {txid} not in mempool")
+                    not_in_mempool += 1
         
-        if removed_count > 0:
-            logger.info(f"Removed {removed_count} mined transactions from mempool after connecting block {block_data['block_hash']}")
+        logger.info(f"[ChainManager] Mempool cleanup complete: removed={removed_count}, not_in_mempool={not_in_mempool}")
+        logger.info(f"[ChainManager] Mempool size after cleanup: {mempool_manager.size()}")
         
         # Mark block as connected
         block_data["connected"] = True

@@ -440,8 +440,17 @@ def get_transactions(wallet_address: str, limit: int = 50, include_coinbase: boo
     all_mempool_txs = mempool_manager.get_all_transactions()
     logging.debug(f"Current mempool size: {len(all_mempool_txs)}")
     logging.debug(f"Mempool transactions: {list(all_mempool_txs.keys())}")
+    
+    # Collect all confirmed transaction IDs to avoid duplicates
+    confirmed_txids = {tx["txid"] for tx in tx_list}
+    logging.debug(f"Confirmed transaction IDs: {confirmed_txids}")
+    
     mempool_count = 0
     for txid, tx in all_mempool_txs.items():
+        # Skip if this transaction is already in the confirmed list
+        if txid in confirmed_txids:
+            logging.debug(f"Skipping mempool tx {txid} - already confirmed")
+            continue
         # Check if this transaction involves our wallet
         involves_wallet = False
         
@@ -1123,6 +1132,9 @@ async def worker_endpoint(request: Request):
         raw_tx = serialize_transaction(transaction)
         txid = sha256d(bytes.fromhex(raw_tx))[::-1].hex() 
         transaction["txid"] = txid
+        logger.info(f"[WEB] Calculated txid for new transaction: {txid}")
+        logger.info(f"[WEB] Transaction details: sender={sender_}, receiver={receiver_}, amount={send_amount}")
+        
         # Don't add txid to outputs - this contaminates the transaction structure
         success, error = mempool_manager.add_transaction(transaction)
         if not success:
