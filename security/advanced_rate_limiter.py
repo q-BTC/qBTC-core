@@ -97,10 +97,12 @@ class AdvancedRateLimiter:
         
         # Rate limit rules
         self.rules = {
+            "/": RateLimitRule("/", 1000, 60, burst_limit=100),  # RPC endpoint - very high limit
             "/worker": RateLimitRule("/worker", 10, 60, burst_limit=3),
             "/balance": RateLimitRule("/balance", 100, 60, burst_limit=20),
             "/transactions": RateLimitRule("/transactions", 50, 60, burst_limit=10),
             "/health": RateLimitRule("/health", 30, 60, burst_limit=10),
+            "/ws": RateLimitRule("/ws", 100, 60, burst_limit=20),  # WebSocket endpoint
             "default": RateLimitRule("default", 60, 60, burst_limit=15)
         }
         

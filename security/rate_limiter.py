@@ -152,9 +152,9 @@ class DDoSProtection:
         })
         
         # Thresholds
-        self.max_connections_per_ip = 10
-        self.rapid_request_threshold = 50  # requests in 10 seconds
-        self.identical_request_threshold = 20
+        self.max_connections_per_ip = 100  # Increased from 10 to allow more concurrent connections
+        self.rapid_request_threshold = 500  # Increased from 50 to allow more rapid requests
+        self.identical_request_threshold = 100  # Increased from 20 to allow more identical requests
     
     def check_connection_limit(self, ip: str) -> bool:
         """Check if IP has too many concurrent connections"""

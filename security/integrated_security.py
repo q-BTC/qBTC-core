@@ -218,9 +218,11 @@ class IntegratedSecurityMiddleware:
     
     async def __call__(self, request: Request, call_next):
         """Main security middleware function"""
+        logger.debug(f"[MIDDLEWARE.__call__] Starting for {request.url.path}")
         start_time = time.time()
         client_info = self._get_client_info(request)
         client_ip = client_info['ip']
+        logger.debug(f"[MIDDLEWARE.__call__] Got client info for {client_ip}")
         
         # Check if security features are disabled via environment variables
         rate_limit_enabled = os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
@@ -402,13 +404,26 @@ _integrated_security_middleware_instance = IntegratedSecurityMiddleware()
 # Create the actual middleware function that FastAPI expects
 async def integrated_security_middleware(request: Request, call_next):
     """Wrapper function for FastAPI middleware compatibility"""
-    logger.info(f"Middleware wrapper called for {request.url.path}")
+    logger.info(f"[MIDDLEWARE] Start processing {request.method} {request.url.path}")
     try:
-        result = await _integrated_security_middleware_instance(request, call_next)
-        logger.info(f"Middleware wrapper completed for {request.url.path}")
+        # Add timeout to detect hanging
+        import asyncio
+        result = await asyncio.wait_for(
+            _integrated_security_middleware_instance(request, call_next),
+            timeout=30.0
+        )
+        logger.info(f"[MIDDLEWARE] Completed {request.url.path}")
         return result
+    except asyncio.TimeoutError:
+        logger.error(f"[MIDDLEWARE] Timeout after 30s for {request.url.path}")
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=504,
+            content={"error": "Gateway timeout"},
+            headers={"X-Timeout": "true"}
+        )
     except Exception as e:
-        logger.error(f"Middleware wrapper error: {e}")
+        logger.error(f"[MIDDLEWARE] Error for {request.url.path}: {e}", exc_info=True)
         raise
 
 # Security management API functions
