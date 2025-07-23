@@ -397,7 +397,19 @@ class IntegratedSecurityMiddleware:
             ddos_protection.release_connection(client_ip)
 
 # Create middleware instance
-integrated_security_middleware = IntegratedSecurityMiddleware()
+_integrated_security_middleware_instance = IntegratedSecurityMiddleware()
+
+# Create the actual middleware function that FastAPI expects
+async def integrated_security_middleware(request: Request, call_next):
+    """Wrapper function for FastAPI middleware compatibility"""
+    logger.info(f"Middleware wrapper called for {request.url.path}")
+    try:
+        result = await _integrated_security_middleware_instance(request, call_next)
+        logger.info(f"Middleware wrapper completed for {request.url.path}")
+        return result
+    except Exception as e:
+        logger.error(f"Middleware wrapper error: {e}")
+        raise
 
 # Security management API functions
 async def get_security_status() -> Dict[str, Any]:

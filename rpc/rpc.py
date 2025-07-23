@@ -20,7 +20,7 @@ from sync.sync import get_blockchain_info
 from models.validation import RPCRequest, BlockSubmissionRequest
 from errors.exceptions import ValidationError
 from middleware.error_handler import setup_error_handlers
-from security.integrated_security import integrated_security_middleware
+from security.simple_middleware import simple_security_middleware
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,7 @@ async def notify_new_block():
 rpc_app = FastAPI(title="qBTC RPC API", version="1.0.0")
 
 # Setup security middleware
-rpc_app.middleware("http")(integrated_security_middleware)
+rpc_app.middleware("http")(simple_security_middleware)
 
 # Setup error handlers
 setup_error_handlers(rpc_app)
@@ -109,7 +109,7 @@ async def rpc_handler(request: Request):
 async def get_blockchain_info_rpc(data):
     """Handle getblockchaininfo RPC call"""
     try:
-        info = get_blockchain_info()
+        info = await get_blockchain_info()
         return {
             "result": info,
             "error": None,

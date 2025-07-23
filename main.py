@@ -47,8 +47,15 @@ async def main(args):
     try:
         logger.info("Starting web/RPC servers and node initialization concurrently")
         
-        # Create tasks for servers and startup
-        server_tasks = asyncio.gather(server_web.serve(), server_rpc.serve())
+        # Create background tasks for servers
+        web_task = asyncio.create_task(server_web.serve())
+        rpc_task = asyncio.create_task(server_rpc.serve())
+        
+        # Give servers a moment to start listening
+        await asyncio.sleep(0.5)
+        logger.info("Servers initialized, proceeding with node startup")
+        
+        # Create startup task
         startup_task = asyncio.create_task(startup(args))
         
         # Wait for startup to complete
@@ -56,7 +63,7 @@ async def main(args):
         logger.info("Node startup completed successfully")
         
         # Continue running servers
-        await server_tasks
+        await asyncio.gather(web_task, rpc_task)
         
     except asyncio.CancelledError:
         logger.info("Servers cancelled, shutting down gracefully")

@@ -12,10 +12,10 @@
         ROCKSDB_PATH: "/app/db"
         # Production security configuration
         RATE_LIMIT_ENABLED: "false"
-        DDOS_PROTECTION_ENABLED: "true"
+        DDOS_PROTECTION_ENABLED: "false"
         ADMIN_ADDRESS: ${ADMIN_ADDRESS}
-        ATTACK_PATTERN_DETECTION: "true"
-        BOT_DETECTION_ENABLED: "true"
+        ATTACK_PATTERN_DETECTION: "false"
+        BOT_DETECTION_ENABLED: "false"
         PEER_REPUTATION_ENABLED: "true"
         SECURITY_LOGGING_ENABLED: "true"
         # Redis configuration

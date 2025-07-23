@@ -56,12 +56,19 @@ async def run_kad_server(port, bootstrap_addr=None, wallet=None, gossip_node=Non
         resolved_bootstrap = []
         for addr in bootstrap_addr:
             if isinstance(addr[0], str) and not addr[0].replace('.', '').isdigit():
-                # It's a hostname, resolve it
+                # It's a hostname, resolve it asynchronously
                 try:
                     import socket
-                    ip = socket.gethostbyname(addr[0])
-                    resolved_bootstrap.append((ip, addr[1]))
-                    logger.info(f"Resolved {addr[0]} to {ip}")
+                    # Use asyncio's getaddrinfo for non-blocking DNS resolution
+                    loop = asyncio.get_event_loop()
+                    addrinfo = await loop.getaddrinfo(addr[0], addr[1], family=socket.AF_INET, type=socket.SOCK_DGRAM)
+                    if addrinfo:
+                        ip = addrinfo[0][4][0]  # Get the IP address from the first result
+                        resolved_bootstrap.append((ip, addr[1]))
+                        logger.info(f"Resolved {addr[0]} to {ip}")
+                    else:
+                        logger.error(f"No address info found for {addr[0]}")
+                        resolved_bootstrap.append(addr)
                 except Exception as e:
                     logger.error(f"Failed to resolve {addr[0]}: {e}")
                     # In Docker, try using the hostname directly
@@ -122,12 +129,18 @@ async def run_kad_server(port, bootstrap_addr=None, wallet=None, gossip_node=Non
             import socket
             bootstrap_host = bootstrap_addr[0][0] if bootstrap_addr else "api.bitcoinqs.org"
             try:
-                # Resolve hostname to IP
-                bootstrap_ip = socket.gethostbyname(bootstrap_host)
-                logger.info(f"Resolved bootstrap server {bootstrap_host} to {bootstrap_ip}")
-            except:
+                # Resolve hostname to IP asynchronously
+                loop = asyncio.get_event_loop()
+                addrinfo = await loop.getaddrinfo(bootstrap_host, None, family=socket.AF_INET)
+                if addrinfo:
+                    bootstrap_ip = addrinfo[0][4][0]
+                    logger.info(f"Resolved bootstrap server {bootstrap_host} to {bootstrap_ip}")
+                else:
+                    bootstrap_ip = bootstrap_host
+                    logger.warning(f"No address info found for {bootstrap_host}, using as-is")
+            except Exception as e:
                 bootstrap_ip = bootstrap_host
-                logger.warning(f"Could not resolve {bootstrap_host}, using as-is")
+                logger.warning(f"Could not resolve {bootstrap_host}: {e}, using as-is")
             
             bootstrap_info = {
                 "ip": bootstrap_ip,

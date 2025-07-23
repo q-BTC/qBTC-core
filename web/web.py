@@ -25,7 +25,7 @@ from errors.exceptions import (
     ValidationError, InsufficientFundsError, InvalidSignatureError
 )
 from middleware.error_handler import setup_error_handlers
-from security.integrated_security import integrated_security_middleware
+from security.simple_middleware import simple_security_middleware
 from monitoring.health import health_monitor
 from security.integrated_security import get_security_status, block_client, unblock_client, get_client_info
 
@@ -76,7 +76,7 @@ def get_broadcast_transactions():
 app = FastAPI(title="qBTC Core API", version="1.0.0")
 
 # Setup security middleware
-app.middleware("http")(integrated_security_middleware)
+app.middleware("http")(simple_security_middleware)
 
 # Setup error handlers
 setup_error_handlers(app)
