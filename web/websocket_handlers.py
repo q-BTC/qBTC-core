@@ -10,7 +10,7 @@ from decimal import Decimal
 from typing import Set, Dict
 
 from events.event_bus import Event, EventTypes
-from database.database import get_db
+from database.database import get_db, get_current_height
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,12 @@ class WebSocketEventHandlers:
             txid = tx_data.get('txid')
             transaction = tx_data.get('transaction', {})
             confirmed_from_mempool = tx_data.get('confirmed_from_mempool', False)
+            
+            # Check if this is a coinbase transaction and skip it
+            inputs = transaction.get("inputs", [])
+            if len(inputs) == 1 and inputs[0].get("txid", "") == "0" * 64:
+                logger.info(f"Skipping coinbase transaction {txid} from websocket broadcast")
+                return
             
             logger.info(f"Processing confirmed transaction: {txid} (from_mempool: {confirmed_from_mempool})")
             
@@ -174,74 +180,19 @@ class WebSocketEventHandlers:
             logger.error(f"Error handling wallet balance change: {e}")
     
     async def _broadcast_all_transactions_update(self):
-        """Broadcast update to all_transactions subscribers"""
+        """Broadcast update to all_transactions subscribers - O(limit) complexity"""
         try:
             from web.web import get_broadcast_transactions
-            
+            from blockchain.explorer_index import get_explorer_index
+
             # Check if transaction broadcasting is enabled
             if not get_broadcast_transactions():
                 logger.debug("Skipping all_transactions broadcast - broadcasting disabled")
                 return
-            
-            db = get_db()
-            formatted = []
-            
-            for key, value in db.items():
-                key_text = key.decode("utf-8")
-                if not key_text.startswith("utxo:"):
-                    continue
-                
-                try:
-                    utxo = json.loads(value.decode("utf-8"))
-                    txid = utxo["txid"]
-                    sender = utxo["sender"]
-                    receiver = utxo["receiver"]
-                    amount = Decimal(utxo["amount"])
-                    
-                    # Skip change outputs (self-to-self)
-                    if sender == receiver:
-                        continue
-                    
-                    # Check if this is a coinbase transaction (but not genesis)
-                    # Skip regular coinbase transactions but not genesis
-                    if sender == "coinbase":
-                        continue
-                    
-                    # For genesis transactions, set sender to "GENESIS" for display
-                    if sender == "" or sender == "bqs1genesis00000000000000000000000000000000":
-                        sender = "GENESIS"
-                    
-                    # Get timestamp
-                    tx_data_raw = db.get(f"tx:{txid}".encode())
-                    if tx_data_raw:
-                        tx_data = json.loads(tx_data_raw.decode())
-                        ts = tx_data.get("timestamp", 0)
-                    else:
-                        ts = 0
-                    
-                    timestamp_iso = datetime.fromtimestamp(ts / 1000).isoformat() if ts else datetime.utcnow().isoformat()
-                    
-                    formatted.append({
-                        "id": txid,
-                        "hash": txid,
-                        "sender": sender,
-                        "receiver": receiver,
-                        "amount": f"{amount:.8f} qBTC",
-                        "timestamp": timestamp_iso,
-                        "status": "confirmed",
-                        "_sort_ts": ts
-                    })
-                    
-                except Exception as e:
-                    logger.debug(f"Skipping UTXO: {e}")
-                    continue
-            
-            # Sort by timestamp
-            formatted.sort(key=lambda x: x["_sort_ts"], reverse=True)
-            
-            # Remove internal field
-            for tx in formatted:
-                tx.pop("_sort_ts", None)
+
+            # Get transactions using the efficient index
+            explorer_index = get_explorer_index()
+            formatted = explorer_index.get_recent_transactions(limit=100)
             
             update_data = {
                 "type": "transaction_update",
@@ -260,7 +211,7 @@ class WebSocketEventHandlers:
     async def _broadcast_wallet_update(self, wallet_address: str):
         """Broadcast update for specific wallet"""
         try:
-            from web.web import get_balance, get_transactions, get_broadcast_transactions
+            from web.web import get_balance, get_transactions, get_broadcast_transactions, get_db
             from state.state import mempool_manager
             
             # Check if transaction broadcasting is enabled
@@ -282,29 +233,79 @@ class WebSocketEventHandlers:
             
             balance = get_balance(wallet_address)
             transactions = get_transactions(wallet_address, include_coinbase=False)
-            
+
             logger.info(f"Wallet {wallet_address} - Balance: {balance}, Transactions: {len(transactions)}")
-            
+            if transactions:
+                logger.debug(f"First transaction data: {transactions[0]}")
+
             formatted = []
+            db = get_db()
+
+            # Get current height ONCE before the loop - O(1) optimization
+            current_height_tuple = await get_current_height(db)
+            current_height = current_height_tuple[0] if current_height_tuple else None
+
+            # PERFORMANCE OPTIMIZATION: Batch fetch all transaction block data
+            tx_block_data_cache = {}
+            for tx in transactions:
+                txid = tx["txid"]
+                tx_block_key = f"tx_block:{txid}".encode()
+                tx_block_data = db.get(tx_block_key)
+                if tx_block_data:
+                    tx_block_data_cache[txid] = json.loads(tx_block_data.decode())
+
+            # Now process all transactions with cached block data
             for tx in transactions:
                 tx_type = "send" if tx["direction"] == "sent" else "receive"
                 amt_dec = Decimal(tx["amount"])
                 amount_fmt = f"{abs(amt_dec):.8f} qBTC"
-                address = tx["counterpart"] if tx["counterpart"] else "n/a"
-                
+
+                # Get from/to addresses from transaction
+                txid = tx["txid"]
+                from_address = tx.get("from", "Unknown")
+                to_address = tx.get("to", "Unknown")
+
+                # For backward compatibility, set address field to the counterparty
+                if tx["direction"] == "sent":
+                    address = to_address
+                else:
+                    address = from_address
+
+                logger.debug(f"Processing tx {txid}: direction={tx['direction']}, from={from_address}, to={to_address}")
+
+                # Find block height for this transaction - O(1) lookup from cache
+                block_height = None
+                confirmations = 0  # Default to 0 confirmations
+
+                tx_block = tx_block_data_cache.get(txid)
+                if tx_block:
+                    block_height = tx_block.get("height")
+
+                    # Calculate confirmations if we have the block height
+                    if block_height is not None and current_height is not None:
+                        if current_height >= 0 and current_height >= block_height:
+                            confirmations = current_height - block_height + 1
+                            logger.debug(f"Calculated confirmations for tx {txid}: height={block_height}, current={current_height}, confirmations={confirmations}")
+                # If no index exists, block_height will remain None and confirmations will be 0
+                # We won't do O(N) search - the index should be maintained when blocks are added
+
                 # Check if this is a genesis transaction
-                # Genesis transactions have either txid "genesis_tx" or counterpart "bqs1genesis..."
-                if tx["txid"] == "genesis_tx" or tx["counterpart"] == "bqs1genesis00000000000000000000000000000000":
+                # Genesis transactions have either txid "genesis_tx" or from "bqs1genesis..."
+                if tx["txid"] == "genesis_tx" or from_address == "bqs1genesis00000000000000000000000000000000":
                     timestamp_str = "Genesis Block"
-                    logger.info(f"Setting Genesis Block timestamp for tx {tx['txid']}")
+                    logger.debug(f"Setting Genesis Block timestamp for tx {tx['txid']}")
                 else:
                     timestamp_str = datetime.fromtimestamp(tx["timestamp"] / 1000).isoformat() if tx["timestamp"] else "Unknown"
-                
+
                 formatted.append({
                     "id": tx["txid"],
                     "type": tx_type,
                     "amount": amount_fmt,
                     "address": address,
+                    "from_address": from_address,
+                    "to_address": to_address,
+                    "block_height": block_height,
+                    "confirmations": confirmations,
                     "timestamp": timestamp_str,
                     "hash": tx["txid"],
                     "status": "confirmed" if not tx.get("isMempool") else "pending",

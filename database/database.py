@@ -1,6 +1,7 @@
 import logging
 import json
 import rocksdict
+from rocksdict import Rdict, Options, BlockBasedOptions, Cache, DBCompressionType, SliceTransform
 import time
 import threading
 import asyncio
@@ -55,8 +56,11 @@ async def get_current_height(db, max_retries: int = 3) -> Tuple[int, str]:
     Returns (-1, GENESIS_PREVHASH) if the DB has no blocks yet.
     Uses retry logic to handle transient failures.
     """
-    # NO CACHING - always get fresh data from database
-    
+    # Check cache first for performance
+    cached = height_cache.get()
+    if cached:
+        return cached
+
     # Try multiple times to get the height
     last_error = None
     
@@ -83,6 +87,7 @@ async def get_current_height(db, max_retries: int = 3) -> Tuple[int, str]:
                 # Validate the result
                 if best_hash and best_hash != "00" * 32 and best_height >= 0:
                     logging.debug(f"ChainManager returned: hash={best_hash}, height={best_height}")
+                    height_cache.set(best_height, best_hash)
                     return best_height, best_hash
                 elif best_height == -1 and best_hash == "00" * 32:
                     # This is a valid "no blocks" response, not an error
@@ -107,6 +112,7 @@ async def get_current_height(db, max_retries: int = 3) -> Tuple[int, str]:
                     block_hash = height_index.get_block_hash_by_height(highest_height)
                     if block_hash:
                         logging.debug(f"Height index method: Best block height={highest_height}")
+                        height_cache.set(highest_height, block_hash)
                         return highest_height, block_hash
                 
                 # If height is -1, check if this is genuinely empty or an error
@@ -150,6 +156,7 @@ async def get_current_height(db, max_retries: int = 3) -> Tuple[int, str]:
                     block_hash = tip_block.get("block_hash", "")
                     if height >= 0 and block_hash:
                         logging.info(f"Scan method found tip at height {height}")
+                        height_cache.set(height, block_hash)
                         return height, block_hash
                 
                 if block_count == 0:
@@ -214,8 +221,46 @@ def set_db(db_path):
     global db
     if db is None:
         try:
-            db = rocksdict.Rdict(db_path)
-            logging.info(f"Database initialized at {db_path}")
+            # Create optimized RocksDB options for blockchain workload
+            opts = Options()
+
+            # Write buffer configuration
+            # Larger write buffers reduce write amplification and improve write throughput
+            opts.set_write_buffer_size(256 * 1024 * 1024)  # 256MB per memtable
+            opts.set_max_write_buffer_number(3)  # Allow up to 3 memtables
+            opts.set_min_write_buffer_number_to_merge(2)  # Merge 2 memtables before flushing
+
+            # SST file configuration
+            opts.set_target_file_size_base(64 * 1024 * 1024)  # 64MB base file size
+            opts.set_max_bytes_for_level_base(512 * 1024 * 1024)  # 512MB for level 1
+
+            # Block cache for reads - critical for performance
+            block_cache = Cache(512 * 1024 * 1024)  # 512MB block cache
+            block_opts = BlockBasedOptions()
+            block_opts.set_block_cache(block_cache)
+            block_opts.set_block_size(16 * 1024)  # 16KB blocks
+            block_opts.set_cache_index_and_filter_blocks(True)  # Cache index/filter blocks
+            block_opts.set_pin_l0_filter_and_index_blocks_in_cache(True)  # Keep L0 in cache
+            opts.set_block_based_table_factory(block_opts)
+
+            # Compression - LZ4 for good balance of speed/ratio
+            opts.set_compression_type(DBCompressionType.lz4())
+
+            # Parallelism - use multiple threads for compaction
+            opts.increase_parallelism(4)
+            opts.set_max_background_jobs(4)
+
+            # Optimize for point lookups and sequential scans
+            opts.set_level_compaction_dynamic_level_bytes(True)
+
+            # Prefix bloom filter for efficient prefix scans (block:, utxo:, etc.)
+            prefix_transform = SliceTransform.create_fixed_prefix(6)  # "block:", "utxo:", etc. are 5-6 chars
+            opts.set_prefix_extractor(prefix_transform)
+            block_opts.set_bloom_filter(10, True)  # 10 bits per key, block-based
+
+            db = Rdict(db_path, options=opts)
+            logging.info(f"Database initialized at {db_path} with optimized RocksDB configuration")
+            logging.info(f"RocksDB config: 256MB write buffer, 512MB block cache, LZ4 compression, 4 threads")
         except Exception as e:
             logging.error(f"Failed to initialize RocksDB at {db_path}: {e}")
             raise

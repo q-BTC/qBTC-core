@@ -3,7 +3,7 @@ import json
 import time
 import aiohttp
 from kademlia.network import Server as KademliaServer
-from config.config import  shutdown_event, VALIDATOR_ID, HEARTBEAT_INTERVAL, VALIDATOR_TIMEOUT, VALIDATORS_LIST_KEY, DEFAULT_GOSSIP_PORT, KNOWN_VALIDATORS
+from config.config import  shutdown_event, VALIDATOR_ID, HEARTBEAT_INTERVAL, VALIDATOR_TIMEOUT, VALIDATORS_LIST_KEY, DEFAULT_GOSSIP_PORT, KNOWN_VALIDATORS, MAX_HEARTBEAT_FAILURES, MAX_BLOCKS_PER_SYNC_REQUEST
 from state.state import validator_keys, known_validators
 
 # Track validator heartbeat failures
@@ -496,11 +496,28 @@ async def push_blocks(peer_ip, peer_port):
             #peer_tip = msg.get("current_tip")
             logger.info(f"*** Peer {peer_ip} responded with height {peer_height}")
 
+        # Validate peer height before any comparisons
+        try:
+            peer_height_int = int(peer_height) if peer_height is not None else -1
+        except (ValueError, TypeError):
+            logger.error(f"Invalid peer height received: {peer_height} (type: {type(peer_height)})")
+            logger.error(f"Cannot sync with peer {peer_ip} - invalid height")
+            w.close()
+            await w.wait_closed()
+            return
+        
+        # Validate local height as well
+        if not isinstance(local_height, int):
+            logger.error(f"Invalid local height: {local_height} (type: {type(local_height)})")
+            w.close()
+            await w.wait_closed()
+            return
+
         # Only push if our height is greater than peer's
-        if int(peer_height) < local_height:
+        if peer_height_int < local_height:
             print("***** WILL PUSH BLOCKS TO PEER ****")
 
-            start_height = int(peer_height+1)
+            start_height = peer_height_int + 1  # Fixed: proper integer addition
             end_height = local_height
 
             blocks_to_send = []
@@ -555,91 +572,167 @@ async def push_blocks(peer_ip, peer_port):
             await w.drain()
             print(f"Sent {len(blocks_to_send)} blocks to {peer_ip}")
         
-        elif peer_height > local_height:
+        elif peer_height_int > local_height:
             # We need blocks from peer
             print("***** WILL PULL BLOCKS FROM PEER *****")
-            print(f"Decision logic: peer_height={peer_height}, local_height={local_height}")
+            print(f"Decision logic: peer_height={peer_height_int}, local_height={local_height}")
             
-            if local_height == -1:
-                # We have no blocks, request from genesis
-                start_height = 0
-            else:
-                start_height = local_height + 1
-            end_height = peer_height
+            # Keep connection alive and sync all blocks in batches
+            current_height = local_height
+            total_blocks_needed = peer_height_int - (local_height if local_height >= 0 else -1)
+            blocks_synced = 0
+            sync_start_time = time.time()
             
-            logger.info(f"Requesting blocks from height {start_height} to {end_height}")
-
-            get_blocks_request = {
-                "type": "get_blocks",
-                "start_height": start_height,
-                "end_height": end_height,
-                "timestamp": int(time.time() * 1000)
-            }
-            w.write((json.dumps(get_blocks_request) + "\n").encode('utf-8'))
-            await w.drain()
-
-            # First, read the response header to check if it's chunked
-            header_line = await r.readline()
-            if not header_line:
-                raise ConnectionError("Peer closed the connection")
+            logger.info(f"Starting sync: need {total_blocks_needed} blocks (from {local_height + 1} to {peer_height_int})")
             
-            try:
-                header = json.loads(header_line.decode())
-            except json.JSONDecodeError as e:
-                raise ValueError(f"Bad JSON header from peer: {e}")
-            
-            if header.get("type") == "blocks_response_chunked":
-                # Handle chunked response
-                total_chunks = header.get("total_chunks", 0)
-                blocks = []
+            # Continue syncing until we're caught up
+            while current_height < peer_height_int:
+                if current_height == -1:
+                    # We have no blocks, request from genesis
+                    start_height = 0
+                else:
+                    start_height = current_height + 1
                 
-                logger.info(f"Receiving chunked response with {total_chunks} chunks")
+                # Cap the end height to avoid requesting too many blocks at once
+                end_height = min(peer_height_int, start_height + MAX_BLOCKS_PER_SYNC_REQUEST - 1)
                 
-                for chunk_num in range(total_chunks):
-                    chunk_line = await r.readline()
-                    if not chunk_line:
-                        raise ConnectionError(f"Connection closed while reading chunk {chunk_num}")
+                # Calculate and log progress
+                progress_pct = (blocks_synced / total_blocks_needed * 100) if total_blocks_needed > 0 else 0
+                elapsed_time = time.time() - sync_start_time
+                if blocks_synced > 0:
+                    blocks_per_sec = blocks_synced / elapsed_time
+                    remaining_blocks = total_blocks_needed - blocks_synced
+                    eta_seconds = remaining_blocks / blocks_per_sec if blocks_per_sec > 0 else 0
+                    eta_str = f", ETA: {int(eta_seconds)}s" if blocks_per_sec > 0 else ""
+                else:
+                    eta_str = ""
+                
+                logger.info(f"Sync progress: {progress_pct:.1f}% ({blocks_synced}/{total_blocks_needed} blocks){eta_str}")
+                logger.info(f"Requesting blocks from height {start_height} to {end_height}")
+
+                get_blocks_request = {
+                    "type": "get_blocks",
+                    "start_height": start_height,
+                    "end_height": end_height,
+                    "timestamp": int(time.time() * 1000)
+                }
+                w.write((json.dumps(get_blocks_request) + "\n").encode('utf-8'))
+                await w.drain()
+
+                # First, read the response header to check if it's chunked
+                header_line = await r.readline()
+                if not header_line:
+                    logger.error("Peer closed the connection during sync")
+                    break
+                
+                try:
+                    header = json.loads(header_line.decode())
+                except json.JSONDecodeError as e:
+                    logger.error(f"Bad JSON header from peer: {e}")
+                    break
+                
+                if header.get("type") == "blocks_response_chunked":
+                    # Handle chunked response
+                    total_chunks = header.get("total_chunks", 0)
+                    blocks = []
                     
-                    try:
-                        chunk_data = json.loads(chunk_line.decode())
-                        if chunk_data.get("chunk_num") != chunk_num:
-                            raise ValueError(f"Expected chunk {chunk_num}, got {chunk_data.get('chunk_num')}")
+                    logger.info(f"Receiving chunked response with {total_chunks} chunks")
+                    
+                    for chunk_num in range(total_chunks):
+                        chunk_line = await r.readline()
+                        if not chunk_line:
+                            logger.error(f"Connection closed while reading chunk {chunk_num}")
+                            break
                         
-                        blocks.extend(chunk_data.get("blocks", []))
-                        logger.info(f"Received chunk {chunk_num + 1}/{total_chunks} with {len(chunk_data.get('blocks', []))} blocks")
-                        
-                    except json.JSONDecodeError as e:
-                        raise ValueError(f"Bad JSON in chunk {chunk_num}: {e}")
-                
-                response = {"blocks": blocks}
-            else:
-                # Handle regular response (backward compatibility)
-                response = header
+                        try:
+                            chunk_data = json.loads(chunk_line.decode())
+                            if chunk_data.get("chunk_num") != chunk_num:
+                                logger.error(f"Expected chunk {chunk_num}, got {chunk_data.get('chunk_num')}")
+                                break
+                            
+                            blocks.extend(chunk_data.get("blocks", []))
+                            logger.info(f"Received chunk {chunk_num + 1}/{total_chunks} with {len(chunk_data.get('blocks', []))} blocks")
+                            
+                        except json.JSONDecodeError as e:
+                            logger.error(f"Bad JSON in chunk {chunk_num}: {e}")
+                            break
+                    
+                    response = {"blocks": blocks}
+                else:
+                    # Handle regular response (backward compatibility)
+                    response = header
 
-            blocks = sorted(response.get("blocks", []), key=lambda x: x["height"])
-            logger.info(f"Received {len(blocks)} blocks from from peer")
+                blocks = sorted(response.get("blocks", []), key=lambda x: x["height"])
+                logger.info(f"Received {len(blocks)} blocks from from peer")
             
-            # Fix missing txid in transactions before processing
-            for block in blocks:
-                if "full_transactions" in block and block["full_transactions"]:
-                    tx_ids = block.get("tx_ids", [])
-                    for i, tx in enumerate(block["full_transactions"]):
-                        if tx and "txid" not in tx:
-                            # Try to get txid from tx_ids array
-                            if i < len(tx_ids):
-                                tx["txid"] = tx_ids[i]
-                            # Coinbase transactions should already have a txid from when they were mined
-                            elif tx.get("inputs") and len(tx["inputs"]) > 0 and tx["inputs"][0].get("txid") == "00" * 32:
-                                logger.error(f"Coinbase transaction missing txid in block {block.get('height', 0)}")
-                            else:
-                                logger.warning(f"Could not determine txid for transaction {i} in block {block.get('height', 'unknown')}")
+                # Validate and fix missing txid in transactions before processing
+                from blockchain.blockchain import serialize_transaction, sha256d
+                blocks_to_process = []
+                for block in blocks:
+                    block_valid = True
+                    if "full_transactions" in block and block["full_transactions"]:
+                        tx_ids = block.get("tx_ids", [])
+                        for i, tx in enumerate(block["full_transactions"]):
+                            if tx and "txid" not in tx:
+                                # Try to get txid from tx_ids array
+                                if i < len(tx_ids):
+                                    claimed_txid = tx_ids[i]
+                                    # Validate the txid matches the transaction hash
+                                    try:
+                                        tx_bytes = serialize_transaction(tx)
+                                        calculated_txid = sha256d(tx_bytes)
+                                        if calculated_txid != claimed_txid:
+                                            logger.error(f"Transaction hash mismatch! Claimed: {claimed_txid}, Calculated: {calculated_txid}")
+                                            logger.error(f"Block height: {block.get('height', 'unknown')}, tx index: {i}")
+                                            logger.error(f"Rejecting block {block.get('block_hash', 'unknown')} due to invalid transaction hash")
+                                            block_valid = False
+                                            break
+                                        tx["txid"] = claimed_txid
+                                    except Exception as e:
+                                        logger.error(f"Failed to validate transaction hash: {e}")
+                                        logger.error(f"Rejecting block {block.get('block_hash', 'unknown')} due to transaction validation error")
+                                        block_valid = False
+                                        break
+                                # Coinbase transactions should already have a txid from when they were mined
+                                elif tx.get("inputs") and len(tx["inputs"]) > 0 and tx["inputs"][0].get("txid") == "00" * 32:
+                                    logger.error(f"Coinbase transaction missing txid in block {block.get('height', 0)}")
+                                else:
+                                    logger.warning(f"Could not determine txid for transaction {i} in block {block.get('height', 'unknown')}")
+                    if block_valid:
+                        blocks_to_process.append(block)
+                blocks = blocks_to_process
+                
+                # Process the blocks
+                await process_blocks_from_peer(blocks)
+                
+                # Update our current height based on blocks we processed
+                if blocks:
+                    # Get the highest block height we just processed
+                    highest_block = max(blocks, key=lambda x: x.get("height", -1))
+                    new_height = highest_block.get("height", current_height)
+                    blocks_in_batch = len(blocks)
+                    
+                    # Update tracking variables
+                    current_height = new_height
+                    blocks_synced += blocks_in_batch
+                    
+                    logger.info(f"Processed {blocks_in_batch} blocks, new height: {current_height}")
+                else:
+                    logger.warning("No valid blocks received in this batch")
+                    break
             
-            await process_blocks_from_peer(blocks)
+            # Log final sync summary
+            total_sync_time = time.time() - sync_start_time
+            if blocks_synced > 0:
+                blocks_per_sec = blocks_synced / total_sync_time
+                logger.info(f"Sync completed: {blocks_synced} blocks in {total_sync_time:.1f}s ({blocks_per_sec:.1f} blocks/s)")
+            else:
+                logger.info("No blocks were synced")
 
         else:
             print("Peer up to date")
-            print(f"Decision logic: peer_height={peer_height}, local_height={local_height}")
-            logger.info(f"No sync needed: peer_height={peer_height}, local_height={local_height}")
+            print(f"Decision logic: peer_height={peer_height_int}, local_height={local_height}")
+            logger.info(f"No sync needed: peer_height={peer_height_int}, local_height={local_height}")
 
         w.close()
         await w.wait_closed()
@@ -776,9 +869,11 @@ async def maintain_validator_list(gossip_node):
 
             current_time = time.time()
             alive = set()
+            force_keep = set()  # Track validators we must keep regardless
 
             # Always keep actively connected validators
             alive.update(active_validators)
+            force_keep.update(active_validators)
             
             # Check heartbeats for all validators
             for v in dht_set:
@@ -797,14 +892,29 @@ async def maintain_validator_list(gossip_node):
                         if v in validator_heartbeat_failures:
                             del validator_heartbeat_failures[v]
                     else:
-                        # Heartbeat is stale, but check if validator is in gossip peer list
-                        # before marking as dead
+                        # Heartbeat is stale - INCREMENT the failure counter
+                        validator_heartbeat_failures[v] = validator_heartbeat_failures.get(v, 0) + 1
+                        
+                        # Check if validator is in our known list and hasn't exceeded failure threshold
                         if v in known_validators:
-                            if last_seen:
-                                logger.warning(f"Validator {v} heartbeat is stale ({current_time - last_seen:.1f}s old) but keeping in list")
+                            if validator_heartbeat_failures[v] < MAX_HEARTBEAT_FAILURES:
+                                if last_seen:
+                                    logger.warning(f"Validator {v} heartbeat is stale ({current_time - last_seen:.1f}s old), "
+                                                f"failures: {validator_heartbeat_failures[v]}/{MAX_HEARTBEAT_FAILURES}, keeping in list")
+                                else:
+                                    logger.warning(f"Validator {v} has no heartbeat recorded, "
+                                                f"failures: {validator_heartbeat_failures[v]}/{MAX_HEARTBEAT_FAILURES}, keeping in list")
+                                alive.add(v)  # Keep validator alive until it exceeds failure threshold
                             else:
-                                logger.warning(f"Validator {v} has no heartbeat recorded but keeping in list")
-                            alive.add(v)  # Keep validator alive if it's in our known list
+                                logger.error(f"Validator {v} exceeded failure threshold ({validator_heartbeat_failures[v]}/{MAX_HEARTBEAT_FAILURES}), "
+                                           f"will be removed from list")
+                        else:
+                            # Not a known validator, apply stricter timeout (1 failure)
+                            if validator_heartbeat_failures[v] < 1:
+                                logger.info(f"Unknown validator {v} has stale heartbeat, failures: {validator_heartbeat_failures[v]}/1")
+                                alive.add(v)  # Give unknown validators only 1 chance
+                            else:
+                                logger.info(f"Removing unknown validator {v} after {validator_heartbeat_failures[v]} failures")
                 except Exception as e:
                     logger.warning(f"Failed to fetch heartbeat for {v}: {e}")
                     # On DHT lookup failure, keep the validator if it's known
@@ -858,7 +968,7 @@ async def maintain_validator_list(gossip_node):
                     # CRITICAL: Never remove actively connected validators
                     if v in active_validators:
                         logger.warning(f"REFUSING to remove validator {v} - it has an active gossip connection!")
-                        alive.add(v)  # Force it back into alive set
+                        force_keep.add(v)  # Use force_keep instead of modifying alive directly
                         continue
                     
                     # Check if validator is still in gossip peer list
@@ -867,19 +977,19 @@ async def maintain_validator_list(gossip_node):
                         peer = (validator_info.get('ip'), validator_info.get('port'))
                         if gossip_node and hasattr(gossip_node, 'dht_peers') and peer in gossip_node.dht_peers:
                             logger.warning(f"REFUSING to remove validator {v} at {peer} - still in gossip peer list!")
-                            alive.add(v)  # Force it back into alive set
+                            force_keep.add(v)  # Use force_keep instead of modifying alive directly
                             continue
                     
                     # Only remove if DHT is actually working
                     if not kad_server:
                         logger.warning(f"REFUSING to remove validator {v} - DHT is not initialized")
-                        alive.add(v)
+                        force_keep.add(v)
                         continue
                         
                     # Check if this validator has exceeded failure threshold
-                    if validator_heartbeat_failures.get(v, 0) < 10:  # Increased from 3 to 10
-                        logger.info(f"Validator {v} marked as left but hasn't exceeded failure threshold ({validator_heartbeat_failures.get(v, 0)}/10), skipping removal")
-                        alive.add(v)  # Keep it alive
+                    if validator_heartbeat_failures.get(v, 0) < MAX_HEARTBEAT_FAILURES:
+                        logger.info(f"Validator {v} marked as left but hasn't exceeded failure threshold ({validator_heartbeat_failures.get(v, 0)}/{MAX_HEARTBEAT_FAILURES}), skipping removal")
+                        force_keep.add(v)  # Use force_keep instead of modifying alive directly
                         continue
                         
                     # Only proceed with removal if we're ABSOLUTELY SURE
@@ -894,6 +1004,19 @@ async def maintain_validator_list(gossip_node):
                         if ip and port:
                             logger.warning(f"Removing validator {v} at {ip}:{port} after {validator_heartbeat_failures.get(v, 0)} failures")
                             gossip_node.remove_peer(ip, port)
+                    
+                    # Clean up DHT entries for the dead validator
+                    try:
+                        logger.info(f"Cleaning up DHT entries for validator {v}")
+                        # Note: Kademlia doesn't support delete, so we set to None or empty string
+                        # This effectively removes the entry from active use
+                        await kad_server.set(f"validator_{v}_heartbeat", "")
+                        await kad_server.set(f"gossip_{v}", "")
+                        await kad_server.set(f"validator_{v}", "")
+                        logger.info(f"DHT cleanup completed for validator {v}")
+                    except Exception as cleanup_error:
+                        logger.warning(f"Failed to clean up DHT entries for {v}: {cleanup_error}")
+                    
                     validator_keys.pop(v, None)
                     validator_peer_mapping.pop(v, None)
                     # Clear failure tracking
@@ -903,8 +1026,11 @@ async def maintain_validator_list(gossip_node):
                 except Exception as e:
                     logger.warning(f"Failed to remove validator {v}: {e}")
                     # On error, keep the validator
-                    alive.add(v)
+                    force_keep.add(v)
 
+            # Merge force_keep validators back into alive set to avoid race conditions
+            alive.update(force_keep)
+            
             # Update known validators
             known_validators.clear()
             known_validators.update(alive)

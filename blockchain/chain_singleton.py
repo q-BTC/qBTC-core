@@ -5,12 +5,16 @@ import asyncio
 from blockchain.chain_manager import ChainManager
 
 _chain_manager_instance = None
-_initialization_lock = asyncio.Lock()
+_initialization_lock = None  # Will be created lazily
 _initialized = False
 
 async def get_chain_manager() -> ChainManager:
     """Get the singleton ChainManager instance (async to ensure initialization)"""
-    global _chain_manager_instance, _initialized
+    global _chain_manager_instance, _initialized, _initialization_lock
+    
+    # Create lock lazily in the current event loop
+    if _initialization_lock is None:
+        _initialization_lock = asyncio.Lock()
     
     async with _initialization_lock:
         if _chain_manager_instance is None:

@@ -75,7 +75,9 @@ class RPCRequest(BaseModel):
         allowed_methods = [
             'getblocktemplate', 'submitblock', 'getblock', 'getbalance',
             'getblockchaininfo', 'getmininginfo', 'getnetworkinfo', 'getpeerinfo',
-            'getwork'
+            'getwork', 'createwallet', 'listwallets', 'getwalletinfo',
+            'listunspent', 'walletpassphrase', 'walletlock', 'walletpassphrasechange',
+            'encryptwallet'
         ]
         if v not in allowed_methods:
             raise ValueError(f'Method must be one of: {", ".join(allowed_methods)}')

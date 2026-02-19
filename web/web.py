@@ -75,20 +75,20 @@ def get_broadcast_transactions():
 
 app = FastAPI(title="qBTC Core API", version="1.0.0")
 
-# Setup security middleware
-app.middleware("http")(simple_security_middleware)
+# Setup CORS to allow requests from qb.tc
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://qb.tc", "http://localhost:3000"],  # Add your frontend origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Setup error handlers
+# Setup error handlers - these just register exception handlers, not middleware
 setup_error_handlers(app)
 
-# CORS - in production, restrict origins
-app.add_middleware(
-    CORSMiddleware, 
-    allow_origins=["*"],  # TODO: Restrict in production
-    allow_credentials=True, 
-    allow_methods=["GET", "POST"],  # Only allow necessary methods
-    allow_headers=["*"]
-)
+# Setup security middleware
+app.middleware("http")(simple_security_middleware)
 websocket_clients: Set[WebSocket] = set()
 
 # Initialize event handlers on startup
@@ -287,217 +287,171 @@ async def create_opentimestamp(data: bytes) -> Optional[str]:
         return None
 
 def get_balance(wallet_address: str) -> Decimal:
-    db = get_db()
-    total = Decimal("0")
-    
-    # First try to use the wallet index for fast lookup
-    wallet_index_key = f"wallet_utxos:{wallet_address}".encode()
-    wallet_index_data = db.get(wallet_index_key)
-    
-    if wallet_index_data:
-        # Use indexed approach - O(m) where m is UTXOs for this wallet
-        wallet_utxos = json.loads(wallet_index_data.decode())
-        for utxo_key_str in wallet_utxos:
-            utxo_data_raw = db.get(utxo_key_str.encode())
-            if utxo_data_raw:
-                utxo_data = json.loads(utxo_data_raw.decode())
-                if not utxo_data.get("spent", False):
-                    total += Decimal(utxo_data["amount"])
-    else:
-        # Fallback to full scan for backward compatibility - O(n)
-        logging.warning(f"No wallet index found for {wallet_address}, falling back to full scan")
-        for key, value in db.items():
-            if key.startswith(b"utxo:"):
-                utxo_data = json.loads(value.decode())
-                if utxo_data["receiver"] == wallet_address and not utxo_data["spent"]:
-                    total += Decimal(utxo_data["amount"])
-    return total
+    """Get wallet balance using efficient index - O(1) with caching."""
+    from blockchain.wallet_index import get_wallet_index
+    wallet_index = get_wallet_index()
+    return wallet_index.get_wallet_balance(wallet_address)
 
 def get_transactions(wallet_address: str, limit: int = 50, include_coinbase: bool = False):
-    logging.debug(f"=== get_transactions called for wallet: {wallet_address} ===")
-    db = get_db()
+    """
+    Get wallet transactions using efficient indexes - O(T) where T = number of wallet transactions.
+    Includes both confirmed and mempool transactions.
+    """
+    from blockchain.wallet_index import get_wallet_index
+    from state.state import mempool_manager
+    
+    wallet_index = get_wallet_index()
+    
+    # Get transactions from the efficient index
+    wallet_txs = wallet_index.get_wallet_transactions(wallet_address, limit=limit)
+    
     tx_list = []
-    transactions = {}
-    utxo_count = 0
-    matching_utxos = 0
+    db = get_db()
     
-    # Log all transaction entries in the database
-    logging.debug("=== SCANNING ALL TRANSACTIONS IN DATABASE ===")
-    tx_entries = []
-    for key, value in db.items():
-        if key.startswith(b"tx:"):
-            tx_data = json.loads(value.decode('utf-8'))
-            tx_entries.append((key.decode(), tx_data))
-    
-    logging.debug(f"Found {len(tx_entries)} transaction entries in database")
-    for tx_key, tx_data in tx_entries[:10]:  # Log first 10
-        logging.debug(f"Transaction: {tx_key} -> {json.dumps(tx_data, default=str)}")
-
-    for key, value in db.items():
-        if not key.startswith(b"utxo:"):
+    for tx in wallet_txs:
+        txid = tx.get("txid")
+        if not txid:
             continue
-
-        utxo_count += 1
-        utxo = json.loads(value.decode('utf-8'))
-        sender = utxo["sender"]
-        receiver = utxo["receiver"]
-        amount = Decimal(utxo["amount"])
-        txid = utxo["txid"]
-        
-        logging.debug(f"UTXO {utxo_count}: key={key.decode()}, txid={txid}, sender={sender}, receiver={receiver}, amount={amount}")
-
-        # Skip coinbase transactions if not explicitly requested
-        # But always include genesis transactions (sender is "bqs1genesis..." or empty string for admin)
-        is_genesis = sender == "bqs1genesis00000000000000000000000000000000" or (sender == "" and receiver == "bqs1HpmbeSd8nhRpq5zX5df91D3Xy8pSUovmV")
-        if not include_coinbase and sender == "coinbase" and not is_genesis:
-            logging.debug(f"  -> Skipping coinbase transaction for txid {txid}")
-            continue
-
-        # Skip change transactions explicitly
-        if sender == wallet_address and receiver == wallet_address:
-            logging.debug(f"  -> Skipping change transaction for txid {txid}")
-            continue
-        
-        # Check if this UTXO involves our wallet
-        involves_wallet = (sender == wallet_address or receiver == wallet_address)
-        if involves_wallet:
-            matching_utxos += 1
-            logging.debug(f"  -> UTXO involves wallet: sender={sender}, receiver={receiver}, wallet={wallet_address}")
-        else:
-            logging.debug(f"  -> UTXO does NOT involve wallet: sender={sender}, receiver={receiver}, wallet={wallet_address}")
-
-        # Initialize if needed
-        if txid not in transactions:
-            # Fetch the correct timestamp from corresponding tx entry
-            tx_key = f"tx:{txid}".encode()
-            tx_data_raw = db.get(tx_key)
-
-            if tx_data_raw:
-                tx_data = json.loads(tx_data_raw.decode('utf-8'))
-                timestamp = tx_data.get("timestamp", 0)
-            else:
-                timestamp = 0
-
-            transactions[txid] = {
-                "sent": Decimal("0"),
-                "received": Decimal("0"),
-                "sent_to": [],
-                "received_from": [],
-                "timestamp": timestamp
-            }
-
-        if sender == wallet_address and receiver != wallet_address:
-            transactions[txid]["sent"] += amount
-            transactions[txid]["sent_to"].append(receiver)
-            logging.debug(f"  -> Added SENT transaction: txid={txid}, amount={amount}, to={receiver}")
-
-        elif receiver == wallet_address and (sender != wallet_address or sender == "" or sender == "bqs1genesis00000000000000000000000000000000"):
-            transactions[txid]["received"] += amount
-            transactions[txid]["received_from"].append(sender)
-            if sender == "" or sender == "bqs1genesis00000000000000000000000000000000":
-                logging.debug(f"  -> Added GENESIS transaction: txid={txid}, amount={amount}, from=GENESIS")
-            else:
-                logging.debug(f"  -> Added RECEIVED transaction: txid={txid}, amount={amount}, from={sender}")
-
-    for txid, data in transactions.items():
-        if data["sent"] > 0:
-            sent_to_addr = next((addr for addr in data["sent_to"] if addr != wallet_address), "Unknown")
-            tx_list.append({
-                "txid": txid,
-                "direction": "sent",
-                "amount": f"-{data['sent']}",
-                "counterpart": sent_to_addr,
-                "timestamp": data["timestamp"]
-            })
-
-        if data["received"] > 0:
-            received_from_addr = next((addr for addr in data["received_from"] if addr != wallet_address), "Unknown")
-            # Display "GENESIS" for genesis transactions
-            if received_from_addr == "" or received_from_addr == "bqs1genesis00000000000000000000000000000000":
-                received_from_addr = "GENESIS"
             
-            # Log genesis transaction detection
-            if received_from_addr == "GENESIS":
-                logging.debug(f"*** GENESIS TRANSACTION DETECTED ***")
-                logging.debug(f"  txid: {txid}")
-                logging.debug(f"  counterpart: {received_from_addr}")
-                logging.debug(f"  amount: {data['received']}")
-                logging.debug(f"  timestamp: {data['timestamp']}")
-                
-            tx_list.append({
-                "txid": txid,
-                "direction": "received",
-                "amount": f"{data['received']}",
-                "counterpart": received_from_addr,
-                "timestamp": data["timestamp"]
-            })
-
-    logging.debug(f"Summary: Found {utxo_count} total UTXOs, {matching_utxos} involving wallet {wallet_address}")
-    logging.debug(f"Grouped into {len(transactions)} unique transactions")
-    
-    # Add pending transactions from mempool
-    logging.debug(f"Checking mempool for pending transactions...")
-    all_mempool_txs = mempool_manager.get_all_transactions()
-    logging.debug(f"Current mempool size: {len(all_mempool_txs)}")
-    logging.debug(f"Mempool transactions: {list(all_mempool_txs.keys())}")
-    
-    # Collect all confirmed transaction IDs to avoid duplicates
-    confirmed_txids = {tx["txid"] for tx in tx_list}
-    logging.debug(f"Confirmed transaction IDs: {confirmed_txids}")
-    
-    mempool_count = 0
-    for txid, tx in all_mempool_txs.items():
-        # Skip if this transaction is already in the confirmed list
-        if txid in confirmed_txids:
-            logging.debug(f"Skipping mempool tx {txid} - already confirmed")
+        # Skip coinbase if not requested
+        if not include_coinbase and tx.get("inputs", [{}])[0].get("txid") == "0" * 64:
             continue
-        # Check if this transaction involves our wallet
-        involves_wallet = False
+            
+        # Determine transaction direction
+        is_sender = False
+        for inp in tx.get("inputs", []):
+            if inp.get("txid") == "0" * 64:  # Coinbase
+                continue
+            utxo_key = f"utxo:{inp['txid']}:{inp.get('utxo_index', 0)}".encode()
+            utxo_data = db.get(utxo_key)
+            if utxo_data:
+                utxo = json.loads(utxo_data.decode())
+                if utxo.get("receiver") == wallet_address:
+                    is_sender = True
+                    break
         
-        # Check outputs for involvement
-        for output in tx.get("outputs", []):
-            if output.get("sender") == wallet_address or output.get("receiver") == wallet_address:
-                involves_wallet = True
-                break
+        # Calculate amounts - properly distinguish between sent amounts and change
+        total_received = Decimal("0")
+        total_sent_to_others = Decimal("0")
+        change_amount = Decimal("0")
+        recipients = []
         
-        if involves_wallet:
-            mempool_count += 1
-            # Determine direction and counterpart
-            for output in tx.get("outputs", []):
-                if output.get("sender") == wallet_address and output.get("receiver") != wallet_address:
-                    # Sending transaction
-                    tx_list.append({
-                        "txid": txid,
-                        "direction": "sent",
-                        "amount": f"-{output.get('amount', '0')}",
-                        "counterpart": output.get("receiver", "Unknown"),
-                        "timestamp": tx.get("timestamp", int(time.time() * 1000)),
-                        "isMempool": True,
-                        "isPending": True
-                    })
-                elif output.get("receiver") == wallet_address and output.get("sender") != wallet_address:
-                    # Receiving transaction
-                    tx_list.append({
-                        "txid": txid,
-                        "direction": "received", 
-                        "amount": f"{output.get('amount', '0')}",
-                        "counterpart": output.get("sender", "Unknown"),
-                        "timestamp": tx.get("timestamp", int(time.time() * 1000)),
-                        "isMempool": True,
-                        "isPending": True
-                    })
+        for out in tx.get("outputs", []):
+            amount = Decimal(out.get("amount", "0"))
+            receiver = out.get("receiver")
+            
+            if receiver == wallet_address:
+                if is_sender:
+                    # This is change coming back to us
+                    change_amount += amount
+                else:
+                    # This is amount received from someone else
+                    total_received += amount
+            elif is_sender:
+                # This is amount we're sending to others (not change)
+                total_sent_to_others += amount
+                if receiver:
+                    recipients.append(receiver)
+        
+        # Create transaction info based on perspective
+        # Extract from/to directly from outputs and msg_str
+        from_address = None
+        to_address = None
+
+        if is_sender and total_sent_to_others > 0:
+            # We sent money to others - show only the amount sent, not change
+            direction = "sent"
+            amount = f"-{total_sent_to_others}"
+            from_address = wallet_address
+            to_address = recipients[0] if recipients else "Unknown"
+        elif total_received > 0:
+            # We received money
+            direction = "received"
+            amount = str(total_received)
+            to_address = wallet_address
+
+            # Get sender from transaction body msg_str (always present in valid transactions)
+            body = tx.get("body", {})
+            msg_str = body.get("msg_str", "")
+            if msg_str:
+                parts = msg_str.split(":")
+                if len(parts) >= 2:
+                    from_address = parts[0]  # Sender address from msg_str
+                else:
+                    from_address = "Unknown"
+            else:
+                # Fallback: try to get sender from outputs
+                for out in tx.get("outputs", []):
+                    sender = out.get("sender")
+                    if sender and sender != wallet_address:
+                        from_address = sender
+                        break
+                if not from_address:
+                    from_address = "Unknown"
+        else:
+            continue  # Skip transactions where we're not involved
+
+        tx_list.append({
+            "txid": txid,
+            "timestamp": tx.get("timestamp", int(time.time() * 1000)),
+            "direction": direction,
+            "amount": amount,
+            "from": from_address,
+            "to": to_address,
+            "isPending": False
+        })
     
-    logging.debug(f"Found {mempool_count} pending transactions in mempool for wallet {wallet_address}")
+    # Add mempool transactions for this wallet
+    if mempool_manager:
+        mempool_txs = mempool_manager.get_all_transactions()
+        for txid, tx in mempool_txs.items():
+            # Check if this wallet is involved in the transaction
+            is_involved = False
+            
+            # Check outputs
+            for out in tx.get("outputs", []):
+                if out.get("receiver") == wallet_address:
+                    is_involved = True
+                    break
+            
+            # Check inputs (if wallet is sender)
+            if not is_involved:
+                body = tx.get("body", {})
+                msg_str = body.get("msg_str", "")
+                if msg_str:
+                    parts = msg_str.split(":")
+                    if len(parts) >= 2 and parts[0] == wallet_address:
+                        is_involved = True
+            
+            if is_involved:
+                # Add this mempool transaction
+                body = tx.get("body", {})
+                msg_str = body.get("msg_str", "")
+                if msg_str:
+                    parts = msg_str.split(":")
+                    if len(parts) >= 3:
+                        sender = parts[0]
+                        receiver = parts[1]
+                        amount = parts[2]
+
+                        direction = "sent" if sender == wallet_address else "received"
+                        from_address = sender
+                        to_address = receiver
+
+                        tx_list.append({
+                            "txid": txid,
+                            "timestamp": tx.get("timestamp", int(time.time() * 1000)),
+                            "direction": direction,
+                            "amount": amount if direction == "received" else f"-{amount}",
+                            "from": from_address,
+                            "to": to_address,
+                            "isPending": True,
+                            "isMempool": True
+                        })
     
+    # Sort by timestamp (newest first)
     tx_list.sort(key=lambda x: x["timestamp"], reverse=True)
-    
-    logging.debug(f"Final transaction list has {len(tx_list)} entries")
-    logging.debug("=== ALL TRANSACTIONS BEING RETURNED ===")
-    for idx, tx in enumerate(tx_list):
-        logging.debug(f"  Transaction {idx+1}: txid={tx['txid']}, direction={tx['direction']}, counterpart={tx['counterpart']}, amount={tx['amount']}, timestamp={tx['timestamp']}")
-
     return tx_list[:limit]
-
 # DEPRECATED: Replaced by event-based system
 # async def simulate_all_transactions():
 #     while True:
@@ -726,61 +680,55 @@ async def get_transactions_endpoint(wallet_address: str, limit: int = 50, includ
         logger.error(f"Error getting transactions for {wallet_address}: {str(e)}")
         raise HTTPException(status_code=500, detail="Error retrieving transactions")
 
+@app.get("/api/all_transactions")
+async def get_all_transactions_endpoint(limit: int = 100):
+    """Get all recent user transactions (excluding coinbase) for the explorer - O(limit) complexity"""
+    try:
+        from blockchain.explorer_index import get_explorer_index
+
+        # Get transactions using the efficient index
+        explorer_index = get_explorer_index()
+        formatted = explorer_index.get_recent_transactions(limit)
+        
+        return {
+            "transactions": formatted[:limit],
+            "count": len(formatted[:limit])
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting all transactions: {e}")
+        raise HTTPException(status_code=500, detail="Error retrieving transactions")
+
 @app.get("/utxos/{wallet_address}")
 async def get_utxos_endpoint(wallet_address: str):
-    """Get unspent transaction outputs (UTXOs) for a wallet address"""
+    """Get unspent transaction outputs (UTXOs) for a wallet address - O(U) complexity"""
     # Validate address format
     if not wallet_address.startswith('bqs') or len(wallet_address) < 20:
         raise ValidationError("Invalid wallet address format")
     
     try:
-        db = get_db()
-        utxos = []
+        from blockchain.wallet_index import get_wallet_index
+        wallet_index = get_wallet_index()
         
-        # First try to use the wallet index for fast lookup
-        wallet_index_key = f"wallet_utxos:{wallet_address}".encode()
-        wallet_index_data = db.get(wallet_index_key)
+        utxos = wallet_index.get_wallet_utxos(wallet_address)
         
-        if wallet_index_data:
-            # Use indexed approach - O(m) where m is UTXOs for this wallet
-            wallet_utxos = json.loads(wallet_index_data.decode())
-            for utxo_key_str in wallet_utxos:
-                utxo_data_raw = db.get(utxo_key_str.encode())
-                if utxo_data_raw:
-                    utxo_data = json.loads(utxo_data_raw.decode())
-                    # Only include unspent UTXOs
-                    if not utxo_data.get("spent", False):
-                        utxos.append({
-                            "txid": utxo_data.get("txid"),
-                            "vout": utxo_data.get("utxo_index", 0),  # output index
-                            "amount": utxo_data.get("amount"),
-                            "address": wallet_address,
-                            "confirmations": 1,  # Since we don't track confirmations in qBTC, assume confirmed
-                            "spendable": True,
-                            "solvable": True
-                        })
-        else:
-            # Fallback to full scan for backward compatibility - O(n)
-            logging.warning(f"No wallet index found for {wallet_address}, falling back to full scan")
-            for key, value in db.items():
-                if key.startswith(b"utxo:"):
-                    utxo_data = json.loads(value.decode())
-                    # Only include unspent UTXOs that belong to this address
-                    if utxo_data["receiver"] == wallet_address and not utxo_data.get("spent", False):
-                        utxos.append({
-                            "txid": utxo_data.get("txid"),
-                            "vout": utxo_data.get("utxo_index", 0),  # output index
-                            "amount": utxo_data.get("amount"),
-                            "address": wallet_address,
-                            "confirmations": 1,  # Since we don't track confirmations in qBTC, assume confirmed
-                            "spendable": True,
-                            "solvable": True
-                        })
+        # Format for API response
+        formatted_utxos = []
+        for utxo in utxos:
+            formatted_utxos.append({
+                "txid": utxo.get("txid"),
+                "vout": utxo.get("utxo_index", 0),
+                "amount": utxo.get("amount"),
+                "address": wallet_address,
+                "confirmations": 1,
+                "spendable": True,
+                "solvable": True
+            })
         
         return {
             "wallet_address": wallet_address,
-            "utxos": utxos,
-            "count": len(utxos)
+            "utxos": formatted_utxos,
+            "count": len(formatted_utxos)
         }
     except Exception as e:
         logger.error(f"Error getting UTXOs for {wallet_address}: {str(e)}")
@@ -1083,20 +1031,38 @@ async def worker_endpoint(request: Request):
 
         inputs = []
         total_available = Decimal("0")
-        for key, value in db.items():
-            if key.startswith(b"utxo:"):
-                utxo_data = json.loads(value.decode())
-                if utxo_data["receiver"] == sender_ and not utxo_data["spent"]:
-                    amount_decimal = Decimal(str(utxo_data.get("amount")))
-                    inputs.append({
-                        "txid": utxo_data.get("txid"),
-                        "utxo_index": utxo_data.get("utxo_index"),
-                        "sender": utxo_data.get("sender"),
-                        "receiver": utxo_data.get("receiver"),
-                        "amount": str(amount_decimal),
-                        "spent": False
-                    })
-                    total_available += amount_decimal
+        
+        # Get UTXOs already being used in mempool to avoid double-spending
+        mempool_used_utxos = set()
+        all_mempool_txs = mempool_manager.get_all_transactions()
+        for mempool_tx in all_mempool_txs.values():
+            for inp in mempool_tx.get("inputs", []):
+                utxo_key = f"{inp['txid']}:{inp.get('utxo_index', 0)}"
+                mempool_used_utxos.add(utxo_key)
+        
+        # Use new wallet index for fast lookup
+        from blockchain.wallet_index import get_wallet_index
+        wallet_index = get_wallet_index()
+        wallet_utxos = wallet_index.get_wallet_utxos(sender_)
+        
+        for utxo_data in wallet_utxos:
+            if not utxo_data.get("spent", False):
+                # Check if this UTXO is already being spent in mempool
+                utxo_check_key = f"{utxo_data.get('txid')}:{utxo_data.get('utxo_index', 0)}"
+                if utxo_check_key in mempool_used_utxos:
+                    logger.debug(f"Skipping UTXO {utxo_check_key} - already being spent in mempool")
+                    continue
+                
+                amount_decimal = Decimal(str(utxo_data.get("amount")))
+                inputs.append({
+                    "txid": utxo_data.get("txid"),
+                    "utxo_index": utxo_data.get("utxo_index"),
+                    "sender": utxo_data.get("sender"),
+                    "receiver": utxo_data.get("receiver"),
+                    "amount": str(amount_decimal),
+                    "spent": False
+                })
+                total_available += amount_decimal
 
         miner_fee = (Decimal(send_amount) * Decimal("0.001")).quantize(Decimal("0.00000001"))
         total_required = Decimal(send_amount) + Decimal(miner_fee)
@@ -1108,7 +1074,13 @@ async def worker_endpoint(request: Request):
             )
 
         outputs = [
-            {"utxo_index": 0, "sender": sender_, "receiver": receiver_, "amount": str(send_amount), "spent": False},
+            {
+            "utxo_index": 0, 
+            "sender": sender_, 
+            "receiver": receiver_, 
+            "amount": str(send_amount), 
+            "spent": False
+            },
         ]
 
         change = total_available - total_required
@@ -1121,6 +1093,9 @@ async def worker_endpoint(request: Request):
             "type": "transaction",
             "inputs": inputs,
             "outputs": outputs,
+            "sender": sender_,  # Add direct sender field
+            "receiver": receiver_,  # Add direct receiver field
+            "amount": send_amount,  # Add direct amount field
             "body": {
                 "msg_str": message_str,
                 "pubkey": pubkey_hex,
@@ -1209,38 +1184,71 @@ async def websocket_endpoint(websocket: WebSocket):
                     if update_type == "combined_update" and wallet_address:
                         # Send initial data directly without relying on event system
                         try:
+                            db = get_db()
                             balance = get_balance(wallet_address)
                             transactions = get_transactions(wallet_address, include_coinbase=False)
                             
                             formatted = []
                             logging.debug(f"=== WEBSOCKET FORMATTING {len(transactions)} TRANSACTIONS ===")
+
+                            # Get current height ONCE before the loop - O(1) optimization
+                            current_height_tuple = await get_current_height(db)
+                            current_height = current_height_tuple[0] if current_height_tuple else None
+
                             for idx, tx in enumerate(transactions):
-                                logging.debug(f"WebSocket TX {idx+1}: txid={tx['txid']}, direction={tx['direction']}, counterpart={tx['counterpart']}, timestamp={tx['timestamp']}")
-                                
+                                logging.debug(f"WebSocket TX {idx+1}: txid={tx['txid']}, direction={tx['direction']}, from={tx.get('from', 'N/A')}, to={tx.get('to', 'N/A')}, timestamp={tx['timestamp']}")
+
                                 tx_type = "send" if tx["direction"] == "sent" else "receive"
                                 amt_dec = Decimal(tx["amount"])
                                 amount_fmt = f"{abs(amt_dec):.8f} qBTC"
-                                address = tx["counterpart"] if tx["counterpart"] else "n/a"
-                                
+
+                                # Get from/to from transaction
+                                from_address = tx.get("from", "Unknown")
+                                to_address = tx.get("to", "Unknown")
+
+                                # Set address to counterparty for backward compatibility
+                                if tx["direction"] == "sent":
+                                    address = to_address
+                                else:
+                                    address = from_address
+
                                 # Check if this is a genesis transaction
                                 logging.debug(f"  Checking genesis conditions:")
                                 logging.debug(f"    - txid == 'genesis_tx'? {tx['txid'] == 'genesis_tx'}")
                                 logging.debug(f"    - direction == 'received'? {tx['direction'] == 'received'}")
-                                logging.debug(f"    - counterpart == 'GENESIS'? {tx['counterpart'] == 'GENESIS'}")
-                                
-                                # Check if this is a genesis transaction by looking at the counterpart or txid
-                                if tx["txid"] == "genesis_tx" or tx["counterpart"] == "bqs1genesis00000000000000000000000000000000":
+                                logging.debug(f"    - from == 'GENESIS'? {from_address == 'GENESIS'}")
+
+                                # Check if this is a genesis transaction
+                                if tx["txid"] == "genesis_tx" or from_address == "bqs1genesis00000000000000000000000000000000":
                                     timestamp_str = "Genesis Block"
                                     logging.debug(f"  *** GENESIS BLOCK TIMESTAMP SET ***")
                                 else:
                                     timestamp_str = datetime.fromtimestamp(tx["timestamp"] / 1000).isoformat() if tx["timestamp"] else "Unknown"
                                     logging.debug(f"  Regular timestamp: {timestamp_str}")
-                                
+
+                                # Get block height and calculate confirmations for this transaction
+                                block_height = None
+                                confirmations = 0  # Default to 0 confirmations
+                                tx_block_key = f"tx_block:{tx['txid']}".encode()
+                                tx_block_data = db.get(tx_block_key)
+                                if tx_block_data:
+                                    tx_block = json.loads(tx_block_data.decode())
+                                    block_height = tx_block.get("height")
+
+                                    # Calculate confirmations if we have the block height
+                                    if block_height is not None and current_height is not None:
+                                        if current_height >= 0 and current_height >= block_height:
+                                            confirmations = current_height - block_height + 1
+
                                 formatted.append({
                                     "id": tx["txid"],
                                     "type": tx_type,
                                     "amount": amount_fmt,
                                     "address": address,
+                                    "from_address": from_address,
+                                    "to_address": to_address,
+                                    "block_height": block_height,
+                                    "confirmations": confirmations,
                                     "timestamp": timestamp_str,
                                     "hash": tx["txid"],
                                     "status": "confirmed" if not tx.get("isMempool") else "pending",
@@ -1439,12 +1447,17 @@ async def commit_btc_to_qbtc(request: CommitRequest):
             "ots_proof": ots_proof
         }
         
-        # Store commitment in database
-        db.put(commitment_key, json.dumps(commitment_data).encode())
-        
+        # Store commitment in database atomically
+        from rocksdict import WriteBatch
+        batch = WriteBatch()
+        batch.put(commitment_key, json.dumps(commitment_data).encode())
+
         # Also store reverse lookup (qBTC -> BTC)
         reverse_key = f"commitment_reverse:{qbtc_address}".encode()
-        db.put(reverse_key, btc_address.encode())
+        batch.put(reverse_key, btc_address.encode())
+
+        # Write atomically
+        db.write(batch)
         
         # Log the commitment
         logger.info(f"BTC commitment created: {btc_address} -> {qbtc_address}")

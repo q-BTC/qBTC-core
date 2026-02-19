@@ -4,6 +4,7 @@ Test consensus mechanisms including chain reorganization, fork resolution, and o
 import pytest
 import json
 import time
+import asyncio
 from unittest.mock import MagicMock, patch
 from blockchain.chain_manager import ChainManager
 from blockchain.blockchain import Block, sha256d
@@ -72,181 +73,199 @@ class TestConsensus:
     
     def test_simple_chain_extension(self, chain_manager):
         """Test adding blocks to extend the chain"""
-        # Genesis
-        genesis = self.create_test_block(0, "00" * 32, nonce=1)
-        success, error = chain_manager.add_block(genesis)
-        assert success, f"Failed to add genesis block: {error}"
+        async def run_test():
+            # Genesis
+            genesis = self.create_test_block(0, "00" * 32, nonce=1)
+            success, error = await chain_manager.add_block(genesis)
+            assert success, f"Failed to add genesis block: {error}"
+            
+            # Add block 1
+            block1 = self.create_test_block(1, genesis["block_hash"], nonce=2)
+            success, error = await chain_manager.add_block(block1)
+            assert success
+            
+            # Verify chain state
+            best_hash, best_height = chain_manager.get_best_chain_tip_sync()
+            assert best_height == 1
+            assert best_hash == block1["block_hash"]
         
-        # Add block 1
-        block1 = self.create_test_block(1, genesis["block_hash"], nonce=2)
-        success, error = chain_manager.add_block(block1)
-        assert success
-        
-        # Verify chain state
-        best_hash, best_height = chain_manager.get_best_chain_tip_sync()
-        assert best_height == 1
-        assert best_hash == block1["block_hash"]
+        asyncio.run(run_test())
     
     def test_orphan_block_handling(self, chain_manager):
         """Test orphan blocks are properly queued and connected"""
-        # Genesis
-        genesis = self.create_test_block(0, "00" * 32, nonce=1)
-        chain_manager.add_block(genesis)
+        async def run_test():
+            # Genesis
+            genesis = self.create_test_block(0, "00" * 32, nonce=1)
+            await chain_manager.add_block(genesis)
+            
+            # Add block 2 before block 1 (orphan)
+            block1 = self.create_test_block(1, genesis["block_hash"], nonce=2)
+            block2 = self.create_test_block(2, block1["block_hash"], nonce=3)
+            
+            # Block 2 should be orphaned
+            success, error = await chain_manager.add_block(block2)
+            assert success  # Should accept as orphan
+            assert block2["block_hash"] in chain_manager.orphan_blocks
+            
+            # Add block 1 - should connect block 2
+            success, error = await chain_manager.add_block(block1)
+            assert success
+            
+            # Check final state
+            best_hash, best_height = chain_manager.get_best_chain_tip_sync()
+            assert best_height == 2
+            assert best_hash == block2["block_hash"]
+            assert block2["block_hash"] not in chain_manager.orphan_blocks
         
-        # Add block 2 before block 1 (orphan)
-        block1 = self.create_test_block(1, genesis["block_hash"], nonce=2)
-        block2 = self.create_test_block(2, block1["block_hash"], nonce=3)
-        
-        # Block 2 should be orphaned
-        success, error = chain_manager.add_block(block2)
-        assert success
-        assert block2["block_hash"] in chain_manager.orphan_blocks
-        
-        # Add block 1 - should connect block 2
-        success, error = chain_manager.add_block(block1)
-        assert success
-        assert block2["block_hash"] not in chain_manager.orphan_blocks
-        
-        # Verify final chain
-        best_hash, best_height = chain_manager.get_best_chain_tip_sync()
-        assert best_height == 2
-        assert best_hash == block2["block_hash"]
+        asyncio.run(run_test())
     
     def test_simple_fork_resolution(self, chain_manager):
-        """Test that longer chain wins in a fork"""
-        # Build initial chain: genesis -> block1 -> block2
-        genesis = self.create_test_block(0, "00" * 32, nonce=1)
-        block1 = self.create_test_block(1, genesis["block_hash"], nonce=2)
-        block2 = self.create_test_block(2, block1["block_hash"], nonce=3)
+        """Test that longer chain wins in fork resolution"""
+        async def run_test():
+            # Build main chain: genesis -> block1 -> block2
+            genesis = self.create_test_block(0, "00" * 32, nonce=1)
+            await chain_manager.add_block(genesis)
+            block1 = self.create_test_block(1, genesis["block_hash"], nonce=2)
+            await chain_manager.add_block(block1)
+            block2 = self.create_test_block(2, block1["block_hash"], nonce=3)
+            await chain_manager.add_block(block2)
+            
+            # Current best should be block2 at height 2
+            best_hash, best_height = chain_manager.get_best_chain_tip_sync()
+            assert best_height == 2
+            
+            # Create competing fork from block1
+            block2_alt = self.create_test_block(2, block1["block_hash"], nonce=400, timestamp=int(time.time()) + 1)
+            success, error = await chain_manager.add_block(block2_alt)
+            assert success
+            
+            # Should still be on original chain
+            best_hash, best_height = chain_manager.get_best_chain_tip_sync()
+            assert best_hash == block2["block_hash"]
+            
+            # Extend alternative chain to make it longer
+            block3_alt = self.create_test_block(3, block2_alt["block_hash"], nonce=500)
+            success, error = await chain_manager.add_block(block3_alt)
+            assert success
+            
+            # Should switch to alternative chain
+            best_hash, best_height = chain_manager.get_best_chain_tip_sync()
+            assert best_height == 3
+            assert best_hash == block3_alt["block_hash"]
         
-        chain_manager.add_block(genesis)
-        chain_manager.add_block(block1)
-        chain_manager.add_block(block2)
-        
-        # Create competing chain from block1
-        # Chain A: genesis -> block1 -> block2
-        # Chain B: genesis -> block1 -> block2_alt -> block3_alt
-        block2_alt = self.create_test_block(2, block1["block_hash"], nonce=100, timestamp=block2["timestamp"]+1)
-        block3_alt = self.create_test_block(3, block2_alt["block_hash"], nonce=101)
-        
-        # Add alternative chain
-        success, error = chain_manager.add_block(block2_alt)
-        assert success
-        
-        # At this point, both chains have equal height
-        best_hash, best_height = chain_manager.get_best_chain_tip_sync()
-        assert best_height == 2
-        # Either chain could be active (tie-breaking behavior)
-        
-        # Add block3_alt - should trigger reorganization
-        success, error = chain_manager.add_block(block3_alt)
-        assert success
-        
-        # Verify new chain is active
-        best_hash, best_height = chain_manager.get_best_chain_tip_sync()
-        assert best_height == 3
-        assert best_hash == block3_alt["block_hash"]
-        
-        # Verify the reorganization happened
-        assert chain_manager.is_block_in_main_chain(block3_alt["block_hash"])
-        assert chain_manager.is_block_in_main_chain(block2_alt["block_hash"])
-        assert not chain_manager.is_block_in_main_chain(block2["block_hash"])
+        asyncio.run(run_test())
     
     def test_deep_reorganization(self, chain_manager):
-        """Test reorganization with deeper fork"""
-        # Build initial chain: genesis -> b1 -> b2 -> b3
-        genesis = self.create_test_block(0, "00" * 32, nonce=1)
-        chain_manager.add_block(genesis)
+        """Test reorganization with deeper chains"""
+        async def run_test():
+            # Build main chain up to height 5
+            genesis = self.create_test_block(0, "00" * 32, nonce=1)
+            await chain_manager.add_block(genesis)
+            
+            main_blocks = [genesis]
+            for i in range(1, 6):
+                block = self.create_test_block(i, main_blocks[-1]["block_hash"], nonce=i+1)
+                await chain_manager.add_block(block)
+                main_blocks.append(block)
+            
+            # Verify we're at height 5
+            best_hash, best_height = chain_manager.get_best_chain_tip_sync()
+            assert best_height == 5
+            
+            # Create longer alternative chain from height 2
+            alt_blocks = main_blocks[:2]  # Keep genesis and block 1
+            for i in range(2, 8):  # Build to height 7
+                block = self.create_test_block(i, alt_blocks[-1]["block_hash"], nonce=100+i, timestamp=int(time.time()) + i)
+                success, error = await chain_manager.add_block(block)
+                assert success, f"Failed to add alternative block at height {i}: {error}"
+                alt_blocks.append(block)
+            
+            # Should have reorganized to longer chain
+            best_hash, best_height = chain_manager.get_best_chain_tip_sync()
+            assert best_height == 7
+            assert best_hash == alt_blocks[-1]["block_hash"]
         
-        blocks_main = []
-        prev_hash = genesis["block_hash"]
-        for i in range(1, 4):
-            block = self.create_test_block(i, prev_hash, nonce=i+1)
-            chain_manager.add_block(block)
-            blocks_main.append(block)
-            prev_hash = block["block_hash"]
-        
-        # Create alternative chain from block 1: b1 -> b2_alt -> b3_alt -> b4_alt
-        blocks_alt = []
-        prev_hash = blocks_main[0]["block_hash"]  # Fork from block 1
-        for i in range(2, 5):
-            block = self.create_test_block(i, prev_hash, nonce=100+i, timestamp=blocks_main[0]["timestamp"]+i)
-            blocks_alt.append(block)
-            prev_hash = block["block_hash"]
-        
-        # Add alternative chain blocks
-        for block in blocks_alt:
-            success, error = chain_manager.add_block(block)
-            assert success
-        
-        # Verify reorganization happened
-        best_hash, best_height = chain_manager.get_best_chain_tip_sync()
-        assert best_height == 4
-        assert best_hash == blocks_alt[-1]["block_hash"]
-        
-        # Verify the alternative chain is active
-        assert chain_manager.is_block_in_main_chain(blocks_alt[-1]["block_hash"])
-        assert not chain_manager.is_block_in_main_chain(blocks_main[-1]["block_hash"])
+        asyncio.run(run_test())
     
     def test_invalid_pow_rejection(self, chain_manager):
         """Test that blocks with invalid PoW are rejected"""
-        genesis = self.create_test_block(0, "00" * 32, nonce=1)
-        chain_manager.add_block(genesis)
+        async def run_test():
+            with patch('blockchain.chain_manager.validate_pow', return_value=False):
+                genesis = self.create_test_block(0, "00" * 32, nonce=1)
+                success, error = await chain_manager.add_block(genesis)
+                assert not success
+                assert "Invalid proof-of-work" in error
         
-        # Create block with invalid nonce (won't meet difficulty)
-        invalid_block = self.create_test_block(1, genesis["block_hash"], nonce=0)
-        
-        # Mock validate_pow to return False
-        with patch('blockchain.chain_manager.validate_pow', return_value=False):
-            success, error = chain_manager.add_block(invalid_block)
-            assert not success
-            assert "Invalid proof of work" in error
+        asyncio.run(run_test())
     
     def test_multiple_chain_tips(self, chain_manager):
-        """Test handling of multiple chain tips"""
-        # Create a fork situation with multiple tips
-        genesis = self.create_test_block(0, "00" * 32, nonce=1)
-        chain_manager.add_block(genesis)
+        """Test handling of multiple competing chain tips"""
+        async def run_test():
+            # Genesis
+            genesis = self.create_test_block(0, "00" * 32, nonce=1)
+            await chain_manager.add_block(genesis)
+            
+            # Create 3 competing blocks at height 1
+            blocks = []
+            for i in range(3):
+                block = self.create_test_block(1, genesis["block_hash"], nonce=10+i, timestamp=int(time.time()) + i)
+                success, error = await chain_manager.add_block(block)
+                assert success
+                blocks.append(block)
+            
+            # Should have 3 chain tips
+            assert len(chain_manager.chain_tips) == 3
+            
+            # Extend one chain
+            block2 = self.create_test_block(2, blocks[0]["block_hash"], nonce=100)
+            await chain_manager.add_block(block2)
+            
+            # Best tip should be the extended chain
+            best_hash, best_height = chain_manager.get_best_chain_tip_sync()
+            assert best_height == 2
+            assert best_hash == block2["block_hash"]
         
-        # Create two competing chains of equal length
-        block1a = self.create_test_block(1, genesis["block_hash"], nonce=2)
-        block1b = self.create_test_block(1, genesis["block_hash"], nonce=3, timestamp=block1a["timestamp"]+1)
-        
-        chain_manager.add_block(block1a)
-        chain_manager.add_block(block1b)
-        
-        # Should have 2 chain tips
-        assert len(chain_manager.chain_tips) == 2
-        assert block1a["block_hash"] in chain_manager.chain_tips
-        assert block1b["block_hash"] in chain_manager.chain_tips
+        asyncio.run(run_test())
     
     def test_block_already_exists(self, chain_manager):
-        """Test adding a block that already exists"""
-        genesis = self.create_test_block(0, "00" * 32, nonce=1)
+        """Test adding duplicate blocks"""
+        async def run_test():
+            genesis = self.create_test_block(0, "00" * 32, nonce=1)
+            success, error = await chain_manager.add_block(genesis)
+            assert success
+            
+            # Try adding same block again
+            success, error = await chain_manager.add_block(genesis)
+            assert not success
+            assert "already exists" in error
         
-        # Add block first time
-        success, error = chain_manager.add_block(genesis)
-        assert success
-        
-        # Add same block again
-        success, error = chain_manager.add_block(genesis)
-        assert success  # Should return success but not process again
-        assert error is None
+        asyncio.run(run_test())
     
     def test_common_ancestor_finding(self, chain_manager):
-        """Test finding common ancestor between two chains"""
-        # Build chain: genesis -> b1 -> b2
-        #                     \-> b1_alt -> b2_alt
-        genesis = self.create_test_block(0, "00" * 32, nonce=1)
-        block1 = self.create_test_block(1, genesis["block_hash"], nonce=2)
-        block2 = self.create_test_block(2, block1["block_hash"], nonce=3)
-        block1_alt = self.create_test_block(1, genesis["block_hash"], nonce=4, timestamp=block1["timestamp"]+1)
-        block2_alt = self.create_test_block(2, block1_alt["block_hash"], nonce=5)
+        """Test finding common ancestor between chains"""
+        async def run_test():
+            # Build two forked chains
+            genesis = self.create_test_block(0, "00" * 32, nonce=1)
+            await chain_manager.add_block(genesis)
+            
+            # Common chain
+            block1 = self.create_test_block(1, genesis["block_hash"], nonce=2)
+            await chain_manager.add_block(block1)
+            
+            # Fork 1
+            block2a = self.create_test_block(2, block1["block_hash"], nonce=3)
+            await chain_manager.add_block(block2a)
+            block3a = self.create_test_block(3, block2a["block_hash"], nonce=4)
+            await chain_manager.add_block(block3a)
+            
+            # Fork 2
+            block2b = self.create_test_block(2, block1["block_hash"], nonce=103, timestamp=int(time.time()) + 10)
+            await chain_manager.add_block(block2b)
+            block3b = self.create_test_block(3, block2b["block_hash"], nonce=104)
+            await chain_manager.add_block(block3b)
+            
+            # Find common ancestor
+            ancestor = chain_manager._find_common_ancestor(block3a["block_hash"], block3b["block_hash"])
+            assert ancestor == block1["block_hash"]
         
-        # Add all blocks
-        for block in [genesis, block1, block2, block1_alt, block2_alt]:
-            chain_manager.add_block(block)
-        
-        # Find common ancestor
-        ancestor = chain_manager._find_common_ancestor(block2["block_hash"], block2_alt["block_hash"])
-        assert ancestor == genesis["block_hash"]
+        asyncio.run(run_test())

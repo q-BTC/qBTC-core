@@ -1,6 +1,17 @@
 version: '3.8'
 
 services:
+  # Certificate generator - runs once to create SSL certificates
+  cert-generator:
+    image: alpine:latest
+    container_name: qbtc-cert-generator
+    volumes:
+      - ./monitoring/nginx/certs:/certs
+    entrypoint: ["/bin/sh"]
+    command: ["-c", "apk add --no-cache openssl && if [ ! -f /certs/localhost.crt ]; then echo 'Generating self-signed certificates...'; mkdir -p /certs; openssl req -x509 -nodes -days 365 -newkey rsa:4096 -keyout /certs/localhost.key -out /certs/localhost.crt -subj '/C=US/ST=Test/L=Test/O=qBTC-Test/CN=localhost'; openssl dhparam -out /certs/dhparam.pem 2048; chmod 644 /certs/localhost.crt; chmod 644 /certs/localhost.key; chmod 644 /certs/dhparam.pem; echo 'Certificates generated successfully!'; else echo 'Certificates already exist, skipping generation.'; fi"]
+    networks:
+      - qbtc-network
+
   # Bootstrap node - initial network node
   bootstrap:
     build: .
@@ -21,6 +32,8 @@ services:
       # Redis configuration
       USE_REDIS: "true"
       REDIS_URL: "redis://redis:6379/0"
+      # Enable transaction broadcasting for WebSocket
+      BROADCAST_TRANSACTIONS: "true"
       # Rate limits (requests per minute)
       RATE_LIMIT_WORKER: "10"
       RATE_LIMIT_BALANCE: "100"
@@ -30,7 +43,6 @@ services:
       RATE_LIMIT_DEFAULT: "60"
     command: ["--bootstrap", "--dht-port", "8001", "--gossip-port", "8002"]
     ports:
-      # Remove 8080 from here since nginx will handle it in production mode
       - "8332:8332"     # RPC
       - "8001:8001/udp" # DHT UDP
       - "8002:8002"     # Gossip TCP
@@ -57,6 +69,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 40s
 
   # Validator node 1
   validator1:
@@ -174,6 +187,1049 @@ services:
       timeout: 10s
       retries: 3
 
+  # Validator node 3
+  validator3:
+    build: .
+    container_name: qbtc-validator3
+    environment:
+      WALLET_PASSWORD: ${VALIDATOR3_WALLET_PASSWORD:-validator3pass}
+      WALLET_FILE: "validator3.json"
+      DISABLE_NAT_TRAVERSAL: "true"
+      ROCKSDB_PATH: "/app/db"
+      # Security configuration - disabled for test network
+      RATE_LIMIT_ENABLED: "false"
+      DDOS_PROTECTION_ENABLED: "false"
+      ADMIN_ADDRESS: "bqs1HpmbeSd8nhRpq5zX5df91D3Xy8pSUovmV"
+      ATTACK_PATTERN_DETECTION: "false"
+      BOT_DETECTION_ENABLED: "false"
+      PEER_REPUTATION_ENABLED: "true"
+      SECURITY_LOGGING_ENABLED: "true"
+      # Redis configuration
+      USE_REDIS: "true"
+      REDIS_URL: "redis://redis:6379/3"
+      # Rate limits (requests per minute)
+      RATE_LIMIT_WORKER: "10"
+      RATE_LIMIT_BALANCE: "100"
+      RATE_LIMIT_TRANSACTIONS: "100"
+      RATE_LIMIT_HEALTH: "100"
+      RATE_LIMIT_UTXOS: "100"
+      RATE_LIMIT_DEFAULT: "60"
+    command: ["--bootstrap_server", "bootstrap", "--bootstrap_port", "8001", "--dht-port", "8007", "--gossip-port", "8008"]
+    ports:
+      - "8083:8080"
+      - "8335:8332"
+      - "8007:8007/udp"
+      - "8008:8008"
+    volumes:
+      - validator3-data:/app/db
+      - ./logs:/var/log/qbtc
+    depends_on:
+      - bootstrap
+      - redis
+    networks:
+      - qbtc-network
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Validator node 4
+  validator4:
+    build: .
+    container_name: qbtc-validator4
+    environment:
+      WALLET_PASSWORD: ${VALIDATOR4_WALLET_PASSWORD:-validator4pass}
+      WALLET_FILE: "validator4.json"
+      DISABLE_NAT_TRAVERSAL: "true"
+      ROCKSDB_PATH: "/app/db"
+      # Security configuration - disabled for test network
+      RATE_LIMIT_ENABLED: "false"
+      DDOS_PROTECTION_ENABLED: "false"
+      ADMIN_ADDRESS: "bqs1HpmbeSd8nhRpq5zX5df91D3Xy8pSUovmV"
+      ATTACK_PATTERN_DETECTION: "false"
+      BOT_DETECTION_ENABLED: "false"
+      PEER_REPUTATION_ENABLED: "true"
+      SECURITY_LOGGING_ENABLED: "true"
+      # Redis configuration
+      USE_REDIS: "true"
+      REDIS_URL: "redis://redis:6379/4"
+      # Rate limits (requests per minute)
+      RATE_LIMIT_WORKER: "10"
+      RATE_LIMIT_BALANCE: "100"
+      RATE_LIMIT_TRANSACTIONS: "100"
+      RATE_LIMIT_HEALTH: "100"
+      RATE_LIMIT_UTXOS: "100"
+      RATE_LIMIT_DEFAULT: "60"
+    command: ["--bootstrap_server", "bootstrap", "--bootstrap_port", "8001", "--dht-port", "8009", "--gossip-port", "8010"]
+    ports:
+      - "8084:8080"
+      - "8336:8332"
+      - "8009:8009/udp"
+      - "8010:8010"
+    volumes:
+      - validator4-data:/app/db
+      - ./logs:/var/log/qbtc
+    depends_on:
+      - bootstrap
+      - redis
+    networks:
+      - qbtc-network
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Validator node 5
+  validator5:
+    build: .
+    container_name: qbtc-validator5
+    environment:
+      WALLET_PASSWORD: ${VALIDATOR5_WALLET_PASSWORD:-validator5pass}
+      WALLET_FILE: "validator5.json"
+      DISABLE_NAT_TRAVERSAL: "true"
+      ROCKSDB_PATH: "/app/db"
+      # Security configuration - disabled for test network
+      RATE_LIMIT_ENABLED: "false"
+      DDOS_PROTECTION_ENABLED: "false"
+      ADMIN_ADDRESS: "bqs1HpmbeSd8nhRpq5zX5df91D3Xy8pSUovmV"
+      ATTACK_PATTERN_DETECTION: "false"
+      BOT_DETECTION_ENABLED: "false"
+      PEER_REPUTATION_ENABLED: "true"
+      SECURITY_LOGGING_ENABLED: "true"
+      # Redis configuration
+      USE_REDIS: "true"
+      REDIS_URL: "redis://redis:6379/5"
+      # Rate limits (requests per minute)
+      RATE_LIMIT_WORKER: "10"
+      RATE_LIMIT_BALANCE: "100"
+      RATE_LIMIT_TRANSACTIONS: "100"
+      RATE_LIMIT_HEALTH: "100"
+      RATE_LIMIT_UTXOS: "100"
+      RATE_LIMIT_DEFAULT: "60"
+    command: ["--bootstrap_server", "bootstrap", "--bootstrap_port", "8001", "--dht-port", "8011", "--gossip-port", "8012"]
+    ports:
+      - "8085:8080"
+      - "8337:8332"
+      - "8011:8011/udp"
+      - "8012:8012"
+    volumes:
+      - validator5-data:/app/db
+      - ./logs:/var/log/qbtc
+    depends_on:
+      - bootstrap
+      - redis
+    networks:
+      - qbtc-network
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Validator node 6
+  validator6:
+    build: .
+    container_name: qbtc-validator6
+    environment:
+      WALLET_PASSWORD: ${VALIDATOR6_WALLET_PASSWORD:-validator6pass}
+      WALLET_FILE: "validator6.json"
+      DISABLE_NAT_TRAVERSAL: "true"
+      ROCKSDB_PATH: "/app/db"
+      # Security configuration - disabled for test network
+      RATE_LIMIT_ENABLED: "false"
+      DDOS_PROTECTION_ENABLED: "false"
+      ADMIN_ADDRESS: "bqs1HpmbeSd8nhRpq5zX5df91D3Xy8pSUovmV"
+      ATTACK_PATTERN_DETECTION: "false"
+      BOT_DETECTION_ENABLED: "false"
+      PEER_REPUTATION_ENABLED: "true"
+      SECURITY_LOGGING_ENABLED: "true"
+      # Redis configuration
+      USE_REDIS: "true"
+      REDIS_URL: "redis://redis:6379/6"
+      # Rate limits (requests per minute)
+      RATE_LIMIT_WORKER: "10"
+      RATE_LIMIT_BALANCE: "100"
+      RATE_LIMIT_TRANSACTIONS: "100"
+      RATE_LIMIT_HEALTH: "100"
+      RATE_LIMIT_UTXOS: "100"
+      RATE_LIMIT_DEFAULT: "60"
+    command: ["--bootstrap_server", "bootstrap", "--bootstrap_port", "8001", "--dht-port", "8013", "--gossip-port", "8014"]
+    ports:
+      - "8086:8080"
+      - "8338:8332"
+      - "8013:8013/udp"
+      - "8014:8014"
+    volumes:
+      - validator6-data:/app/db
+      - ./logs:/var/log/qbtc
+    depends_on:
+      - bootstrap
+      - redis
+    networks:
+      - qbtc-network
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Validator node 7
+  validator7:
+    build: .
+    container_name: qbtc-validator7
+    environment:
+      WALLET_PASSWORD: ${VALIDATOR7_WALLET_PASSWORD:-validator7pass}
+      WALLET_FILE: "validator7.json"
+      DISABLE_NAT_TRAVERSAL: "true"
+      ROCKSDB_PATH: "/app/db"
+      # Security configuration - disabled for test network
+      RATE_LIMIT_ENABLED: "false"
+      DDOS_PROTECTION_ENABLED: "false"
+      ADMIN_ADDRESS: "bqs1HpmbeSd8nhRpq5zX5df91D3Xy8pSUovmV"
+      ATTACK_PATTERN_DETECTION: "false"
+      BOT_DETECTION_ENABLED: "false"
+      PEER_REPUTATION_ENABLED: "true"
+      SECURITY_LOGGING_ENABLED: "true"
+      # Redis configuration
+      USE_REDIS: "true"
+      REDIS_URL: "redis://redis:6379/7"
+      # Rate limits (requests per minute)
+      RATE_LIMIT_WORKER: "10"
+      RATE_LIMIT_BALANCE: "100"
+      RATE_LIMIT_TRANSACTIONS: "100"
+      RATE_LIMIT_HEALTH: "100"
+      RATE_LIMIT_UTXOS: "100"
+      RATE_LIMIT_DEFAULT: "60"
+    command: ["--bootstrap_server", "bootstrap", "--bootstrap_port", "8001", "--dht-port", "8015", "--gossip-port", "8016"]
+    ports:
+      - "8087:8080"
+      - "8339:8332"
+      - "8015:8015/udp"
+      - "8016:8016"
+    volumes:
+      - validator7-data:/app/db
+      - ./logs:/var/log/qbtc
+    depends_on:
+      - bootstrap
+      - redis
+    networks:
+      - qbtc-network
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Validator node 8
+  validator8:
+    build: .
+    container_name: qbtc-validator8
+    environment:
+      WALLET_PASSWORD: ${VALIDATOR8_WALLET_PASSWORD:-validator8pass}
+      WALLET_FILE: "validator8.json"
+      DISABLE_NAT_TRAVERSAL: "true"
+      ROCKSDB_PATH: "/app/db"
+      # Security configuration - disabled for test network
+      RATE_LIMIT_ENABLED: "false"
+      DDOS_PROTECTION_ENABLED: "false"
+      ADMIN_ADDRESS: "bqs1HpmbeSd8nhRpq5zX5df91D3Xy8pSUovmV"
+      ATTACK_PATTERN_DETECTION: "false"
+      BOT_DETECTION_ENABLED: "false"
+      PEER_REPUTATION_ENABLED: "true"
+      SECURITY_LOGGING_ENABLED: "true"
+      # Redis configuration
+      USE_REDIS: "true"
+      REDIS_URL: "redis://redis:6379/8"
+      # Rate limits (requests per minute)
+      RATE_LIMIT_WORKER: "10"
+      RATE_LIMIT_BALANCE: "100"
+      RATE_LIMIT_TRANSACTIONS: "100"
+      RATE_LIMIT_HEALTH: "100"
+      RATE_LIMIT_UTXOS: "100"
+      RATE_LIMIT_DEFAULT: "60"
+    command: ["--bootstrap_server", "bootstrap", "--bootstrap_port", "8001", "--dht-port", "8017", "--gossip-port", "8018"]
+    ports:
+      - "8088:8080"
+      - "8340:8332"
+      - "8017:8017/udp"
+      - "8018:8018"
+    volumes:
+      - validator8-data:/app/db
+      - ./logs:/var/log/qbtc
+    depends_on:
+      - bootstrap
+      - redis
+    networks:
+      - qbtc-network
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Validator node 9
+  validator9:
+    build: .
+    container_name: qbtc-validator9
+    environment:
+      WALLET_PASSWORD: ${VALIDATOR9_WALLET_PASSWORD:-validator9pass}
+      WALLET_FILE: "validator9.json"
+      DISABLE_NAT_TRAVERSAL: "true"
+      ROCKSDB_PATH: "/app/db"
+      # Security configuration - disabled for test network
+      RATE_LIMIT_ENABLED: "false"
+      DDOS_PROTECTION_ENABLED: "false"
+      ADMIN_ADDRESS: "bqs1HpmbeSd8nhRpq5zX5df91D3Xy8pSUovmV"
+      ATTACK_PATTERN_DETECTION: "false"
+      BOT_DETECTION_ENABLED: "false"
+      PEER_REPUTATION_ENABLED: "true"
+      SECURITY_LOGGING_ENABLED: "true"
+      # Redis configuration
+      USE_REDIS: "true"
+      REDIS_URL: "redis://redis:6379/9"
+      # Rate limits (requests per minute)
+      RATE_LIMIT_WORKER: "10"
+      RATE_LIMIT_BALANCE: "100"
+      RATE_LIMIT_TRANSACTIONS: "100"
+      RATE_LIMIT_HEALTH: "100"
+      RATE_LIMIT_UTXOS: "100"
+      RATE_LIMIT_DEFAULT: "60"
+    command: ["--bootstrap_server", "bootstrap", "--bootstrap_port", "8001", "--dht-port", "8019", "--gossip-port", "8020"]
+    ports:
+      - "8089:8080"
+      - "8341:8332"
+      - "8019:8019/udp"
+      - "8020:8020"
+    volumes:
+      - validator9-data:/app/db
+      - ./logs:/var/log/qbtc
+    depends_on:
+      - bootstrap
+      - redis
+    networks:
+      - qbtc-network
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Validator node 10
+  validator10:
+    build: .
+    container_name: qbtc-validator10
+    environment:
+      WALLET_PASSWORD: ${VALIDATOR10_WALLET_PASSWORD:-validator10pass}
+      WALLET_FILE: "validator10.json"
+      DISABLE_NAT_TRAVERSAL: "true"
+      ROCKSDB_PATH: "/app/db"
+      # Security configuration - disabled for test network
+      RATE_LIMIT_ENABLED: "false"
+      DDOS_PROTECTION_ENABLED: "false"
+      ADMIN_ADDRESS: "bqs1HpmbeSd8nhRpq5zX5df91D3Xy8pSUovmV"
+      ATTACK_PATTERN_DETECTION: "false"
+      BOT_DETECTION_ENABLED: "false"
+      PEER_REPUTATION_ENABLED: "true"
+      SECURITY_LOGGING_ENABLED: "true"
+      # Redis configuration
+      USE_REDIS: "true"
+      REDIS_URL: "redis://redis:6379/10"
+      # Rate limits (requests per minute)
+      RATE_LIMIT_WORKER: "10"
+      RATE_LIMIT_BALANCE: "100"
+      RATE_LIMIT_TRANSACTIONS: "100"
+      RATE_LIMIT_HEALTH: "100"
+      RATE_LIMIT_UTXOS: "100"
+      RATE_LIMIT_DEFAULT: "60"
+    command: ["--bootstrap_server", "bootstrap", "--bootstrap_port", "8001", "--dht-port", "8021", "--gossip-port", "8022"]
+    ports:
+      - "8090:8080"
+      - "8342:8332"
+      - "8021:8021/udp"
+      - "8022:8022"
+    volumes:
+      - validator10-data:/app/db
+      - ./logs:/var/log/qbtc
+    depends_on:
+      - bootstrap
+      - redis
+    networks:
+      - qbtc-network
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Validator node 11
+  validator11:
+    build: .
+    container_name: qbtc-validator11
+    environment:
+      WALLET_PASSWORD: ${VALIDATOR11_WALLET_PASSWORD:-validator11pass}
+      WALLET_FILE: "validator11.json"
+      DISABLE_NAT_TRAVERSAL: "true"
+      ROCKSDB_PATH: "/app/db"
+      # Security configuration - disabled for test network
+      RATE_LIMIT_ENABLED: "false"
+      DDOS_PROTECTION_ENABLED: "false"
+      ADMIN_ADDRESS: "bqs1HpmbeSd8nhRpq5zX5df91D3Xy8pSUovmV"
+      ATTACK_PATTERN_DETECTION: "false"
+      BOT_DETECTION_ENABLED: "false"
+      PEER_REPUTATION_ENABLED: "true"
+      SECURITY_LOGGING_ENABLED: "true"
+      # Redis configuration
+      USE_REDIS: "true"
+      REDIS_URL: "redis://redis:6379/11"
+      # Rate limits (requests per minute)
+      RATE_LIMIT_WORKER: "10"
+      RATE_LIMIT_BALANCE: "100"
+      RATE_LIMIT_TRANSACTIONS: "100"
+      RATE_LIMIT_HEALTH: "100"
+      RATE_LIMIT_UTXOS: "100"
+      RATE_LIMIT_DEFAULT: "60"
+    command: ["--bootstrap_server", "bootstrap", "--bootstrap_port", "8001", "--dht-port", "8023", "--gossip-port", "8024"]
+    ports:
+      - "8091:8080"
+      - "8343:8332"
+      - "8023:8023/udp"
+      - "8024:8024"
+    volumes:
+      - validator11-data:/app/db
+      - ./logs:/var/log/qbtc
+    depends_on:
+      - bootstrap
+      - redis
+    networks:
+      - qbtc-network
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Validator node 12
+  validator12:
+    build: .
+    container_name: qbtc-validator12
+    environment:
+      WALLET_PASSWORD: ${VALIDATOR12_WALLET_PASSWORD:-validator12pass}
+      WALLET_FILE: "validator12.json"
+      DISABLE_NAT_TRAVERSAL: "true"
+      ROCKSDB_PATH: "/app/db"
+      # Security configuration - disabled for test network
+      RATE_LIMIT_ENABLED: "false"
+      DDOS_PROTECTION_ENABLED: "false"
+      ADMIN_ADDRESS: "bqs1HpmbeSd8nhRpq5zX5df91D3Xy8pSUovmV"
+      ATTACK_PATTERN_DETECTION: "false"
+      BOT_DETECTION_ENABLED: "false"
+      PEER_REPUTATION_ENABLED: "true"
+      SECURITY_LOGGING_ENABLED: "true"
+      # Redis configuration
+      USE_REDIS: "true"
+      REDIS_URL: "redis://redis:6379/12"
+      # Rate limits (requests per minute)
+      RATE_LIMIT_WORKER: "10"
+      RATE_LIMIT_BALANCE: "100"
+      RATE_LIMIT_TRANSACTIONS: "100"
+      RATE_LIMIT_HEALTH: "100"
+      RATE_LIMIT_UTXOS: "100"
+      RATE_LIMIT_DEFAULT: "60"
+    command: ["--bootstrap_server", "bootstrap", "--bootstrap_port", "8001", "--dht-port", "8025", "--gossip-port", "8026"]
+    ports:
+      - "8092:8080"
+      - "8344:8332"
+      - "8025:8025/udp"
+      - "8026:8026"
+    volumes:
+      - validator12-data:/app/db
+      - ./logs:/var/log/qbtc
+    depends_on:
+      - bootstrap
+      - redis
+    networks:
+      - qbtc-network
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Validator node 13
+  validator13:
+    build: .
+    container_name: qbtc-validator13
+    environment:
+      WALLET_PASSWORD: ${VALIDATOR13_WALLET_PASSWORD:-validator13pass}
+      WALLET_FILE: "validator13.json"
+      DISABLE_NAT_TRAVERSAL: "true"
+      ROCKSDB_PATH: "/app/db"
+      # Security configuration - disabled for test network
+      RATE_LIMIT_ENABLED: "false"
+      DDOS_PROTECTION_ENABLED: "false"
+      ADMIN_ADDRESS: "bqs1HpmbeSd8nhRpq5zX5df91D3Xy8pSUovmV"
+      ATTACK_PATTERN_DETECTION: "false"
+      BOT_DETECTION_ENABLED: "false"
+      PEER_REPUTATION_ENABLED: "true"
+      SECURITY_LOGGING_ENABLED: "true"
+      # Redis configuration
+      USE_REDIS: "true"
+      REDIS_URL: "redis://redis:6379/13"
+      # Rate limits (requests per minute)
+      RATE_LIMIT_WORKER: "10"
+      RATE_LIMIT_BALANCE: "100"
+      RATE_LIMIT_TRANSACTIONS: "100"
+      RATE_LIMIT_HEALTH: "100"
+      RATE_LIMIT_UTXOS: "100"
+      RATE_LIMIT_DEFAULT: "60"
+    command: ["--bootstrap_server", "bootstrap", "--bootstrap_port", "8001", "--dht-port", "8027", "--gossip-port", "8028"]
+    ports:
+      - "8093:8080"
+      - "8345:8332"
+      - "8027:8027/udp"
+      - "8028:8028"
+    volumes:
+      - validator13-data:/app/db
+      - ./logs:/var/log/qbtc
+    depends_on:
+      - bootstrap
+      - redis
+    networks:
+      - qbtc-network
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Validator node 14
+  validator14:
+    build: .
+    container_name: qbtc-validator14
+    environment:
+      WALLET_PASSWORD: ${VALIDATOR14_WALLET_PASSWORD:-validator14pass}
+      WALLET_FILE: "validator14.json"
+      DISABLE_NAT_TRAVERSAL: "true"
+      ROCKSDB_PATH: "/app/db"
+      # Security configuration - disabled for test network
+      RATE_LIMIT_ENABLED: "false"
+      DDOS_PROTECTION_ENABLED: "false"
+      ADMIN_ADDRESS: "bqs1HpmbeSd8nhRpq5zX5df91D3Xy8pSUovmV"
+      ATTACK_PATTERN_DETECTION: "false"
+      BOT_DETECTION_ENABLED: "false"
+      PEER_REPUTATION_ENABLED: "true"
+      SECURITY_LOGGING_ENABLED: "true"
+      # Redis configuration
+      USE_REDIS: "true"
+      REDIS_URL: "redis://redis:6379/14"
+      # Rate limits (requests per minute)
+      RATE_LIMIT_WORKER: "10"
+      RATE_LIMIT_BALANCE: "100"
+      RATE_LIMIT_TRANSACTIONS: "100"
+      RATE_LIMIT_HEALTH: "100"
+      RATE_LIMIT_UTXOS: "100"
+      RATE_LIMIT_DEFAULT: "60"
+    command: ["--bootstrap_server", "bootstrap", "--bootstrap_port", "8001", "--dht-port", "8029", "--gossip-port", "8030"]
+    ports:
+      - "8094:8080"
+      - "8346:8332"
+      - "8029:8029/udp"
+      - "8030:8030"
+    volumes:
+      - validator14-data:/app/db
+      - ./logs:/var/log/qbtc
+    depends_on:
+      - bootstrap
+      - redis
+    networks:
+      - qbtc-network
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Validator node 15
+  validator15:
+    build: .
+    container_name: qbtc-validator15
+    environment:
+      WALLET_PASSWORD: ${VALIDATOR15_WALLET_PASSWORD:-validator15pass}
+      WALLET_FILE: "validator15.json"
+      DISABLE_NAT_TRAVERSAL: "true"
+      ROCKSDB_PATH: "/app/db"
+      # Security configuration - disabled for test network
+      RATE_LIMIT_ENABLED: "false"
+      DDOS_PROTECTION_ENABLED: "false"
+      ADMIN_ADDRESS: "bqs1HpmbeSd8nhRpq5zX5df91D3Xy8pSUovmV"
+      ATTACK_PATTERN_DETECTION: "false"
+      BOT_DETECTION_ENABLED: "false"
+      PEER_REPUTATION_ENABLED: "true"
+      SECURITY_LOGGING_ENABLED: "true"
+      # Redis configuration
+      USE_REDIS: "true"
+      REDIS_URL: "redis://redis:6379/15"
+      # Rate limits (requests per minute)
+      RATE_LIMIT_WORKER: "10"
+      RATE_LIMIT_BALANCE: "100"
+      RATE_LIMIT_TRANSACTIONS: "100"
+      RATE_LIMIT_HEALTH: "100"
+      RATE_LIMIT_UTXOS: "100"
+      RATE_LIMIT_DEFAULT: "60"
+    command: ["--bootstrap_server", "bootstrap", "--bootstrap_port", "8001", "--dht-port", "8031", "--gossip-port", "8032"]
+    ports:
+      - "8095:8080"
+      - "8347:8332"
+      - "8031:8031/udp"
+      - "8032:8032"
+    volumes:
+      - validator15-data:/app/db
+      - ./logs:/var/log/qbtc
+    depends_on:
+      - bootstrap
+      - redis
+    networks:
+      - qbtc-network
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Validator node 16
+  validator16:
+    build: .
+    container_name: qbtc-validator16
+    environment:
+      WALLET_PASSWORD: ${VALIDATOR16_WALLET_PASSWORD:-validator16pass}
+      WALLET_FILE: "validator16.json"
+      DISABLE_NAT_TRAVERSAL: "true"
+      ROCKSDB_PATH: "/app/db"
+      # Security configuration - disabled for test network
+      RATE_LIMIT_ENABLED: "false"
+      DDOS_PROTECTION_ENABLED: "false"
+      ADMIN_ADDRESS: "bqs1HpmbeSd8nhRpq5zX5df91D3Xy8pSUovmV"
+      ATTACK_PATTERN_DETECTION: "false"
+      BOT_DETECTION_ENABLED: "false"
+      PEER_REPUTATION_ENABLED: "true"
+      SECURITY_LOGGING_ENABLED: "true"
+      # Redis configuration
+      USE_REDIS: "true"
+      REDIS_URL: "redis://redis:6379/16"
+      # Rate limits (requests per minute)
+      RATE_LIMIT_WORKER: "10"
+      RATE_LIMIT_BALANCE: "100"
+      RATE_LIMIT_TRANSACTIONS: "100"
+      RATE_LIMIT_HEALTH: "100"
+      RATE_LIMIT_UTXOS: "100"
+      RATE_LIMIT_DEFAULT: "60"
+    command: ["--bootstrap_server", "bootstrap", "--bootstrap_port", "8001", "--dht-port", "8033", "--gossip-port", "8034"]
+    ports:
+      - "8096:8080"
+      - "8348:8332"
+      - "8033:8033/udp"
+      - "8034:8034"
+    volumes:
+      - validator16-data:/app/db
+      - ./logs:/var/log/qbtc
+    depends_on:
+      - bootstrap
+      - redis
+    networks:
+      - qbtc-network
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Validator node 17
+  validator17:
+    build: .
+    container_name: qbtc-validator17
+    environment:
+      WALLET_PASSWORD: ${VALIDATOR17_WALLET_PASSWORD:-validator17pass}
+      WALLET_FILE: "validator17.json"
+      DISABLE_NAT_TRAVERSAL: "true"
+      ROCKSDB_PATH: "/app/db"
+      # Security configuration - disabled for test network
+      RATE_LIMIT_ENABLED: "false"
+      DDOS_PROTECTION_ENABLED: "false"
+      ADMIN_ADDRESS: "bqs1HpmbeSd8nhRpq5zX5df91D3Xy8pSUovmV"
+      ATTACK_PATTERN_DETECTION: "false"
+      BOT_DETECTION_ENABLED: "false"
+      PEER_REPUTATION_ENABLED: "true"
+      SECURITY_LOGGING_ENABLED: "true"
+      # Redis configuration
+      USE_REDIS: "true"
+      REDIS_URL: "redis://redis:6379/17"
+      # Rate limits (requests per minute)
+      RATE_LIMIT_WORKER: "10"
+      RATE_LIMIT_BALANCE: "100"
+      RATE_LIMIT_TRANSACTIONS: "100"
+      RATE_LIMIT_HEALTH: "100"
+      RATE_LIMIT_UTXOS: "100"
+      RATE_LIMIT_DEFAULT: "60"
+    command: ["--bootstrap_server", "bootstrap", "--bootstrap_port", "8001", "--dht-port", "8035", "--gossip-port", "8036"]
+    ports:
+      - "8097:8080"
+      - "8349:8332"
+      - "8035:8035/udp"
+      - "8036:8036"
+    volumes:
+      - validator17-data:/app/db
+      - ./logs:/var/log/qbtc
+    depends_on:
+      - bootstrap
+      - redis
+    networks:
+      - qbtc-network
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Validator node 18
+  validator18:
+    build: .
+    container_name: qbtc-validator18
+    environment:
+      WALLET_PASSWORD: ${VALIDATOR18_WALLET_PASSWORD:-validator18pass}
+      WALLET_FILE: "validator18.json"
+      DISABLE_NAT_TRAVERSAL: "true"
+      ROCKSDB_PATH: "/app/db"
+      # Security configuration - disabled for test network
+      RATE_LIMIT_ENABLED: "false"
+      DDOS_PROTECTION_ENABLED: "false"
+      ADMIN_ADDRESS: "bqs1HpmbeSd8nhRpq5zX5df91D3Xy8pSUovmV"
+      ATTACK_PATTERN_DETECTION: "false"
+      BOT_DETECTION_ENABLED: "false"
+      PEER_REPUTATION_ENABLED: "true"
+      SECURITY_LOGGING_ENABLED: "true"
+      # Redis configuration
+      USE_REDIS: "true"
+      REDIS_URL: "redis://redis:6379/18"
+      # Rate limits (requests per minute)
+      RATE_LIMIT_WORKER: "10"
+      RATE_LIMIT_BALANCE: "100"
+      RATE_LIMIT_TRANSACTIONS: "100"
+      RATE_LIMIT_HEALTH: "100"
+      RATE_LIMIT_UTXOS: "100"
+      RATE_LIMIT_DEFAULT: "60"
+    command: ["--bootstrap_server", "bootstrap", "--bootstrap_port", "8001", "--dht-port", "8037", "--gossip-port", "8038"]
+    ports:
+      - "8098:8080"
+      - "8350:8332"
+      - "8037:8037/udp"
+      - "8038:8038"
+    volumes:
+      - validator18-data:/app/db
+      - ./logs:/var/log/qbtc
+    depends_on:
+      - bootstrap
+      - redis
+    networks:
+      - qbtc-network
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Validator node 19
+  validator19:
+    build: .
+    container_name: qbtc-validator19
+    environment:
+      WALLET_PASSWORD: ${VALIDATOR19_WALLET_PASSWORD:-validator19pass}
+      WALLET_FILE: "validator19.json"
+      DISABLE_NAT_TRAVERSAL: "true"
+      ROCKSDB_PATH: "/app/db"
+      # Security configuration - disabled for test network
+      RATE_LIMIT_ENABLED: "false"
+      DDOS_PROTECTION_ENABLED: "false"
+      ADMIN_ADDRESS: "bqs1HpmbeSd8nhRpq5zX5df91D3Xy8pSUovmV"
+      ATTACK_PATTERN_DETECTION: "false"
+      BOT_DETECTION_ENABLED: "false"
+      PEER_REPUTATION_ENABLED: "true"
+      SECURITY_LOGGING_ENABLED: "true"
+      # Redis configuration
+      USE_REDIS: "true"
+      REDIS_URL: "redis://redis:6379/19"
+      # Rate limits (requests per minute)
+      RATE_LIMIT_WORKER: "10"
+      RATE_LIMIT_BALANCE: "100"
+      RATE_LIMIT_TRANSACTIONS: "100"
+      RATE_LIMIT_HEALTH: "100"
+      RATE_LIMIT_UTXOS: "100"
+      RATE_LIMIT_DEFAULT: "60"
+    command: ["--bootstrap_server", "bootstrap", "--bootstrap_port", "8001", "--dht-port", "8039", "--gossip-port", "8040"]
+    ports:
+      - "8099:8080"
+      - "8351:8332"
+      - "8039:8039/udp"
+      - "8040:8040"
+    volumes:
+      - validator19-data:/app/db
+      - ./logs:/var/log/qbtc
+    depends_on:
+      - bootstrap
+      - redis
+    networks:
+      - qbtc-network
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Validator node 20
+  validator20:
+    build: .
+    container_name: qbtc-validator20
+    environment:
+      WALLET_PASSWORD: ${VALIDATOR20_WALLET_PASSWORD:-validator20pass}
+      WALLET_FILE: "validator20.json"
+      DISABLE_NAT_TRAVERSAL: "true"
+      ROCKSDB_PATH: "/app/db"
+      # Security configuration - disabled for test network
+      RATE_LIMIT_ENABLED: "false"
+      DDOS_PROTECTION_ENABLED: "false"
+      ADMIN_ADDRESS: "bqs1HpmbeSd8nhRpq5zX5df91D3Xy8pSUovmV"
+      ATTACK_PATTERN_DETECTION: "false"
+      BOT_DETECTION_ENABLED: "false"
+      PEER_REPUTATION_ENABLED: "true"
+      SECURITY_LOGGING_ENABLED: "true"
+      # Redis configuration
+      USE_REDIS: "true"
+      REDIS_URL: "redis://redis:6379/20"
+      # Rate limits (requests per minute)
+      RATE_LIMIT_WORKER: "10"
+      RATE_LIMIT_BALANCE: "100"
+      RATE_LIMIT_TRANSACTIONS: "100"
+      RATE_LIMIT_HEALTH: "100"
+      RATE_LIMIT_UTXOS: "100"
+      RATE_LIMIT_DEFAULT: "60"
+    command: ["--bootstrap_server", "bootstrap", "--bootstrap_port", "8001", "--dht-port", "8041", "--gossip-port", "8042"]
+    ports:
+      - "8100:8080"
+      - "8352:8332"
+      - "8041:8041/udp"
+      - "8042:8042"
+    volumes:
+      - validator20-data:/app/db
+      - ./logs:/var/log/qbtc
+    depends_on:
+      - bootstrap
+      - redis
+    networks:
+      - qbtc-network
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
   # Redis for rate limiting and caching
   redis:
     image: redis:7-alpine
@@ -214,34 +1270,42 @@ services:
       - validator1
       - validator2
 
-  # Grafana for visualization - TEST MODE (full access)
+  # Grafana for visualization - TEST MODE (anonymous access)
   grafana:
     image: grafana/grafana:latest
     container_name: qbtc-grafana
-    ports:
-      - "3000:3000"
+    # Remove external port - only accessible through nginx
+    # ports:
+    #   - "3000:3000"
     environment:
-      # Admin settings
+      # Admin settings (still available if needed)
       - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin123}
       
-      # Test mode - full access
-      - GF_AUTH_ANONYMOUS_ENABLED=false
+      # Anonymous access - no authentication required
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_NAME=Main Org.
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_BASIC_ENABLED=false
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+      - GF_AUTH_DISABLE_SIGNOUT_MENU=true
       - GF_USERS_ALLOW_SIGN_UP=false
       - GF_USERS_ALLOW_ORG_CREATE=false
-      - GF_AUTH_DISABLE_LOGIN_FORM=false
       
       # Security settings
       - GF_SECURITY_DISABLE_GRAVATAR=true
-      - GF_SECURITY_COOKIE_SECURE=false  # false for test mode
-      - GF_SECURITY_STRICT_TRANSPORT_SECURITY=false  # false for test mode
+      - GF_SECURITY_COOKIE_SECURE=true  # true for HTTPS
+      - GF_SECURITY_STRICT_TRANSPORT_SECURITY=false  # nginx handles this
+      
+      # Server settings for reverse proxy
+      - GF_SERVER_ROOT_URL=https://localhost/
+      - GF_SERVER_SERVE_FROM_SUB_PATH=false
       
       # Dashboard settings
       - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/qbtc-overview.json
       
-      # Enable editing for test mode
-      - GF_USERS_DEFAULT_PERMISSIONS=Editor
-      - GF_USERS_VIEWERS_CAN_EDIT=true
+      # Enable full editing for anonymous users in test mode
+      - GF_USERS_DEFAULT_PERMISSIONS=Admin
       - GF_EXPLORE_ENABLED=true
       
       # Performance and chunk loading fixes
@@ -259,21 +1323,31 @@ services:
     depends_on:
       - prometheus
 
-  # Nginx reverse proxy - TEST MODE (simplified configuration)
+  # Nginx reverse proxy - TEST MODE with HTTPS
   nginx:
     image: nginx:alpine
     container_name: qbtc-nginx-test
     ports:
-      - "8080:8080"    # API/WebSocket proxy
+      - "80:80"        # HTTP (redirects to HTTPS)
+      - "443:443"      # HTTPS with Grafana  
+      - "8080:8080"    # HTTPS API/WebSocket for frontend
     volumes:
-      - ./monitoring/nginx/nginx-test.conf:/etc/nginx/nginx.conf:ro
+      - ./monitoring/nginx/nginx-test-ssl.conf:/etc/nginx/nginx.conf:ro
+      - ./monitoring/nginx/certs:/etc/nginx/certs:ro
     networks:
       - qbtc-network
     restart: unless-stopped
     depends_on:
-      - bootstrap
-      - validator1
-      - validator2
+      cert-generator:
+        condition: service_completed_successfully
+      bootstrap:
+        condition: service_started
+      validator1:
+        condition: service_started
+      validator2:
+        condition: service_started
+      grafana:
+        condition: service_started
     security_opt:
       - no-new-privileges:true
 
@@ -281,6 +1355,24 @@ volumes:
   bootstrap-data:
   validator1-data:
   validator2-data:
+  validator3-data:
+  validator4-data:
+  validator5-data:
+  validator6-data:
+  validator7-data:
+  validator8-data:
+  validator9-data:
+  validator10-data:
+  validator11-data:
+  validator12-data:
+  validator13-data:
+  validator14-data:
+  validator15-data:
+  validator16-data:
+  validator17-data:
+  validator18-data:
+  validator19-data:
+  validator20-data:
   redis-data:
   prometheus-data:
   grafana-data:
@@ -290,4 +1382,4 @@ networks:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.20.0.0/16
+        - subnet: 172.21.0.0/16

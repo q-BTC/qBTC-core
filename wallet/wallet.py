@@ -120,7 +120,7 @@ def verify_transaction(message: str, sig_hex: str, pub_hex: str) -> bool:
                 bytes.fromhex(sig_hex),
                 bytes.fromhex(pub_hex)
             )
-            print(f"*** VERIFING MESSAGE: {message} Result: {sig_verify}")
+            #print(f"*** VERIFING MESSAGE: {message} Result: {sig_verify}")
             return sig_verify
 
     except Exception as e:

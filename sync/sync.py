@@ -2,16 +2,19 @@ from database.database import get_db, get_current_height, invalidate_height_cach
 from rocksdict import WriteBatch
 from blockchain.blockchain import Block, calculate_merkle_root, validate_pow, serialize_transaction, sha256d
 from blockchain.chain_singleton import get_chain_manager
+from blockchain.block_factory import normalize_block
 from config.config import ADMIN_ADDRESS, GENESIS_ADDRESS, CHAIN_ID, TX_EXPIRATION_TIME
 from blockchain.transaction_validator import TransactionValidator
 from blockchain.event_integration import emit_database_event
 from state.state import mempool_manager
 from events.event_bus import event_bus, EventTypes
+from sync.sync_state_manager import get_sync_state_manager
 from blockchain.block_height_index import get_height_index
 import asyncio
 import json
 import logging
 import time
+import traceback
 from decimal import Decimal, ROUND_DOWN
 from typing import List, Dict, Tuple, Optional, Set
 
@@ -41,8 +44,15 @@ def _cleanup_mempool_after_sync(blocks: list[dict]):
         logging.error(f"Error during mempool cleanup: {e}", exc_info=True)
 
 # Track concurrent calls
-_processing_lock = asyncio.Lock()
+_processing_lock = None  # Will be created lazily
 _processing_count = 0
+
+def _get_processing_lock():
+    """Get or create the processing lock in the current event loop"""
+    global _processing_lock
+    if _processing_lock is None:
+        _processing_lock = asyncio.Lock()
+    return _processing_lock
 
 async def process_blocks_from_peer(blocks: list[dict]):
     global _processing_count
@@ -163,6 +173,13 @@ async def _process_blocks_from_peer_impl(blocks: list[dict]):
     accepted_count = 0
     rejected_count = 0
     
+    # Get sync state manager for atomic operations
+    sync_manager = get_sync_state_manager()
+    
+    # Start atomic sync transaction
+    block_hashes = [b.get("block_hash") for b in blocks if b.get("block_hash")]
+    sync_id = sync_manager.begin_sync_transaction(block_hashes)
+    
     try:
         for block in blocks:
             try:
@@ -186,24 +203,64 @@ async def _process_blocks_from_peer_impl(blocks: list[dict]):
                 if "full_transactions" not in block:
                     block["full_transactions"] = block.get("full_transactions", [])
                 
+                # Normalize block for consistency before processing
+                try:
+                    block = normalize_block(block, add_defaults=False)
+                except ValueError as e:
+                    logging.warning(f"Block normalization failed: {e}")
+                    rejected_count += 1
+                    continue
+                
                 # Let ChainManager handle consensus
                 logging.debug(f"Calling add_block with height={block.get('height')} (type: {type(block.get('height'))})")
                 success, error = await cm.add_block(block)
                 
                 if success:
                     accepted_count += 1
-                    # Only process if block is in main chain
+                    # Record successful block processing in sync transaction
+                    # Track what was actually added to the database
+                    state_changes = {
+                        "block_added": True,  # Block was added to database
+                        "block_hash": block_hash,
+                        "height": block.get("height"),
+                        "transactions": block.get("tx_ids", []),
+                        "created_utxos": [],  # Would need to track from add_block
+                        "spent_utxos": {}     # Would need to track from add_block
+                    }
+                    sync_manager.record_block_processed(sync_id, block_hash, state_changes)
+                    
+                    # ChainManager.add_block() already handles everything:
+                    # - Validates all transactions
+                    # - Marks UTXOs as spent
+                    # - Creates new UTXOs
+                    # - Updates wallet indexes
+                    # - Stores block and transactions
+                    # - Updates height index
+                    # No need for additional processing!
                     if await cm.is_block_in_main_chain(block_hash):
-                        # Process the block transactions
-                        await _process_block_in_chain(block)
+                        logging.info("Block %s accepted and confirmed in main chain", block_hash)
                     else:
-                        logging.info("Block %s accepted but not in main chain yet", block_hash)
+                        logging.info("Block %s accepted but not in main chain yet (fork/orphan)", block_hash)
                     continue
                 else:
                     rejected_count += 1
+                    # Record failed block in sync transaction
+                    sync_manager.record_block_failed(sync_id, block_hash, error)
                     logging.warning("Block %s rejected: %s", block_hash, error)
-                    
-                    # Even if block is rejected, we should still remove any transactions 
+
+                    # Check if this is a missing UTXO error - indicates we need earlier blocks
+                    if "references non-existent UTXO" in str(error):
+                        logging.warning(f"[SYNC] Block {block_hash} failed due to missing UTXO - need earlier blocks")
+                        # Extract the missing UTXO from error message if possible
+                        import re
+                        utxo_match = re.search(r'UTXO ([a-f0-9]+:[0-9]+)', str(error))
+                        if utxo_match:
+                            missing_utxo = utxo_match.group(1)
+                            logging.info(f"[SYNC] Missing UTXO identified: {missing_utxo}")
+                            # Store this as a block that needs earlier dependencies
+                            await _handle_missing_utxo(block, missing_utxo)
+
+                    # Even if block is rejected, we should still remove any transactions
                     # from mempool that are in this block (they might be invalid)
                     if "tx_ids" in block and len(block.get("tx_ids", [])) > 1:
                         # Skip coinbase (first transaction)
@@ -213,6 +270,8 @@ async def _process_blocks_from_peer_impl(blocks: list[dict]):
                             if mempool_manager.get_transaction(txid) is not None:
                                 mempool_manager.remove_transaction(txid)
                                 removed_txids.append(txid)
+                                # Record mempool removal in sync transaction
+                                sync_manager.record_mempool_removal(sync_id, txid)
                                 logging.info(f"[SYNC] Removed transaction {txid} from mempool (block rejected)")
                         
                         if removed_txids:
@@ -221,14 +280,28 @@ async def _process_blocks_from_peer_impl(blocks: list[dict]):
                     continue
                     
             except Exception as e:
-                logging.error("Error processing block %s: %s", block.get("block_hash", "unknown"), e)
+                block_hash = block.get("block_hash", "unknown")
+                logging.error("Error processing block %s: %s", block_hash, e)
                 logging.error("Block data at error: height=%s (type: %s), hash=%s", 
                             block.get("height"), type(block.get("height")), block.get("block_hash"))
                 logging.error("Exception type: %s", type(e).__name__)
                 logging.error("Full traceback:", exc_info=True)
                 rejected_count += 1
+                # Record the error in sync transaction
+                if block_hash != "unknown":
+                    sync_manager.record_block_failed(sync_id, block_hash, str(e))
 
         logging.info("Block processing complete: %d accepted, %d rejected", accepted_count, rejected_count)
+        
+        # Commit or rollback the sync transaction based on results
+        if rejected_count > 0 and accepted_count == 0:
+            # All blocks failed - rollback the transaction
+            logging.warning(f"[SYNC] All blocks failed, rolling back sync transaction {sync_id}")
+            sync_manager.rollback_sync_transaction(sync_id)
+        else:
+            # At least some blocks succeeded - commit the transaction
+            logging.info(f"[SYNC] Committing sync transaction {sync_id}")
+            sync_manager.commit_sync_transaction(sync_id)
         
         # After initial sync, do a final mempool cleanup
         # This ensures any transactions that were mined in blocks we just synced are removed
@@ -277,307 +350,15 @@ async def _process_blocks_from_peer_impl(blocks: list[dict]):
         
         return accepted_count > 0
     
+    except Exception as e:
+        # If there's an unexpected error, rollback the sync transaction
+        logging.error(f"[SYNC] Unexpected error during sync, rolling back transaction {sync_id}: {e}")
+        sync_manager.rollback_sync_transaction(sync_id)
+        raise
+    
     finally:
         # Always disable sync mode after processing
         cm.set_sync_mode(False)
-
-async def _process_block_in_chain(block: dict):
-    """Process a block that is confirmed to be in the main chain"""
-    # Validate input type
-    if not isinstance(block, dict):
-        raise TypeError(f"Expected dict for block, got {type(block)}: {block}")
-    
-    db = get_db()
-    batch = WriteBatch()
-    
-    height = block.get("height")
-    block_hash = block.get("block_hash")
-    prev_hash = block.get("previous_hash")
-    tx_ids = block.get("tx_ids", [])
-    nonce = block.get("nonce")
-    timestamp = block.get("timestamp")
-    miner_address = block.get("miner_address")
-    full_transactions = block.get("full_transactions", [])
-    block_merkle_root = block.get("merkle_root")
-    version = block.get("version")
-    bits = block.get("bits")
-    
-    # Validate height is a proper integer
-    if isinstance(height, str):
-        try:
-            height = int(height)
-        except ValueError:
-            # Check if this looks like a block hash (64 hex chars)
-            if len(height) == 64 and all(c in '0123456789abcdefABCDEF' for c in height):
-                raise ValueError(f"Block hash '{height}' found in height field for block {block_hash}")
-            else:
-                raise ValueError(f"Invalid height value '{height}' in block {block_hash}")
-    elif height is None:
-        raise ValueError(f"Missing height in block {block_hash}")
-    elif not isinstance(height, int):
-        raise ValueError(f"Height must be an integer, got {type(height)} for block {block_hash}")
-    
-    logging.info("[SYNC] Processing confirmed block height %s with hash %s", height, block_hash)
-    logging.info("[SYNC] Block has %d full transactions", len(full_transactions))
-    
-    # Create transaction validator with sync mode enabled (skip time validation)
-    validator = TransactionValidator(db)
-    validator.skip_time_validation = True  # CRITICAL: Set this for historical blocks during sync
-    
-    # First validate all transactions in the block
-    is_valid, error_msg, total_fees = validator.validate_block_transactions(block)
-    if not is_valid:
-        raise ValueError(f"Block {block_hash} contains invalid transactions: {error_msg}")
-    
-    # Track spent UTXOs within this block to prevent double-spending
-    spent_in_block = set()
-    # Store coinbase data for validation after fee calculation
-    coinbase_data = None
-
-    # Find and validate coinbase transaction separately
-    for tx in full_transactions:
-        if tx and validator._is_coinbase_transaction(tx):
-            # Use the actual txid from the coinbase transaction
-            if "txid" not in tx:
-                raise ValueError(f"Coinbase transaction missing txid in block {height}")
-            coinbase_tx_id = tx["txid"]
-            
-            is_valid, error_msg = validator.validate_coinbase_transaction(tx, height, total_fees)
-            if not is_valid:
-                raise ValueError(f"Invalid coinbase transaction: {error_msg}")
-            
-            # Store coinbase outputs for later processing
-            coinbase_outputs = []
-            for idx, output in enumerate(tx.get("outputs", [])):
-                output_amount = Decimal(str(output.get("value", "0")))
-                output_key = f"utxo:{coinbase_tx_id}:{idx}".encode()
-                utxo = {
-                    "txid": coinbase_tx_id,
-                    "utxo_index": idx,
-                    "sender": "coinbase",
-                    "receiver": miner_address,
-                    "amount": str(output_amount),
-                    "spent": False,
-                }
-                coinbase_outputs.append((output_key, utxo))
-            
-            coinbase_data = {
-                "tx": tx,
-                "tx_id": coinbase_tx_id,
-                "outputs": coinbase_outputs
-            }
-            break
-    
-    # Now process all transactions (they've already been validated)
-    for raw in full_transactions:
-        if raw is None:
-            continue
-        tx = raw
-        if tx.get("txid") == "genesis_tx":
-            logging.debug("[SYNC] Genesis transaction detected")
-            continue
-
-        # Skip coinbase (already processed above)
-        if validator._is_coinbase_transaction(tx):
-            continue
-
-        # Ensure transaction has txid (for blocks received via gossip)
-        if "txid" not in tx:
-            from blockchain.blockchain import serialize_transaction, sha256d
-            raw_tx = serialize_transaction(tx)
-            tx["txid"] = sha256d(bytes.fromhex(raw_tx))[::-1].hex()
-            logging.info(f"[SYNC] Added missing txid to transaction: {tx['txid']}")
-        
-        txid = tx["txid"]
-        
-        inputs = tx.get("inputs", [])
-        outputs = tx.get("outputs", [])
-
-        batch.put(f"tx:{txid}".encode(), json.dumps(tx).encode())
-
-        # Mark spent UTXOs
-        for inp in inputs:
-            if "txid" not in inp and "prev_txid" not in inp:
-                continue
-            # Handle both formats
-            inp_txid = inp.get('txid') or inp.get('prev_txid')
-            inp_index = inp.get('utxo_index', inp.get('prev_index', 0))
-            
-            spent_key = f"utxo:{inp_txid}:{inp_index}".encode()
-            if spent_key in db:
-                utxo_rec = json.loads(db.get(spent_key).decode())
-                utxo_rec["spent"] = True
-                batch.put(spent_key, json.dumps(utxo_rec).encode())
-                
-                # Remove from wallet index
-                if 'receiver' in utxo_rec:
-                    wallet_index_key = f"wallet_utxos:{utxo_rec['receiver']}".encode()
-                    if wallet_index_key in db:
-                        wallet_utxos = json.loads(db.get(wallet_index_key).decode())
-                        utxo_key = f"utxo:{inp_txid}:{inp_index}"
-                        if utxo_key in wallet_utxos:
-                            wallet_utxos.remove(utxo_key)
-                            batch.put(wallet_index_key, json.dumps(wallet_utxos).encode())
-
-        # Create new UTXOs
-        for out in outputs:
-            # Create proper UTXO record with all necessary fields
-            utxo_record = {
-                "txid": txid,
-                "utxo_index": out.get('utxo_index', 0),
-                "sender": out.get('sender', ''),
-                "receiver": out.get('receiver', ''),
-                "amount": str(out.get('amount', '0')),  # Ensure string to avoid scientific notation
-                "spent": False  # New UTXOs are always unspent
-            }
-            out_key = f"utxo:{txid}:{out.get('utxo_index', 0)}".encode()
-            batch.put(out_key, json.dumps(utxo_record).encode())
-            
-            # Add to wallet index
-            if out.get('receiver'):
-                wallet_index_key = f"wallet_utxos:{out['receiver']}".encode()
-                wallet_utxos = []
-                if wallet_index_key in db:
-                    wallet_utxos = json.loads(db.get(wallet_index_key).decode())
-                utxo_key = f"utxo:{txid}:{out.get('utxo_index', 0)}"
-                if utxo_key not in wallet_utxos:
-                    wallet_utxos.append(utxo_key)
-                    batch.put(wallet_index_key, json.dumps(wallet_utxos).encode())
-
-    # Store coinbase transaction and outputs
-    if coinbase_data is not None:
-        batch.put(f"tx:{coinbase_data['tx_id']}".encode(), json.dumps(coinbase_data['tx']).encode())
-        for output_key, utxo in coinbase_data['outputs']:
-            batch.put(output_key, json.dumps(utxo).encode())
-            
-            # Add coinbase outputs to wallet index
-            if 'receiver' in utxo:
-                wallet_index_key = f"wallet_utxos:{utxo['receiver']}".encode()
-                wallet_utxos = []
-                if wallet_index_key in db:
-                    wallet_utxos = json.loads(db.get(wallet_index_key).decode())
-                # Extract UTXO key from output_key
-                utxo_key = output_key.decode()
-                if utxo_key not in wallet_utxos:
-                    wallet_utxos.append(utxo_key)
-                    batch.put(wallet_index_key, json.dumps(wallet_utxos).encode())
-    
-    calculated_root = calculate_merkle_root(tx_ids)
-    if calculated_root != block_merkle_root:
-        raise ValueError(
-            f"Merkle root mismatch at height {height}: {calculated_root} != {block_merkle_root}")
-
-
-    block_record = {
-        "height": height,
-        "block_hash": block_hash,
-        "previous_hash": prev_hash,
-        "tx_ids": tx_ids,
-        "nonce": nonce,
-        "timestamp": timestamp,
-        "miner_address": miner_address,
-        "merkle_root": calculated_root,
-        "version": version,
-        "bits": bits,
-    }
-    
-    # Store the block (ChainManager already validated it)
-    block_key = f"block:{block_hash}".encode()
-    batch.put(block_key, json.dumps(block_record).encode())
-    
-    db.write(batch)
-    logging.info("[SYNC] Stored block %s (height %s) successfully", block_hash, height)
-    
-    # Update the height index
-    height_index = get_height_index()
-    height_index.add_block_to_index(height, block_hash)
-    
-    # Invalidate height cache since we added a new block
-    invalidate_height_cache()
-    
-    # Remove transactions from mempool
-    # Skip the first tx_id as it's the coinbase transaction
-    
-    # Remove confirmed transactions using mempool manager
-    logging.info(f"[SYNC] Block has tx_ids: {tx_ids}")
-    
-    # If tx_ids is empty but we have full_transactions, extract tx_ids from them
-    if not tx_ids and full_transactions:
-        tx_ids = []
-        for tx in full_transactions:
-            if tx and "txid" in tx:
-                tx_ids.append(tx["txid"])
-            elif tx and validator._is_coinbase_transaction(tx):
-                # Coinbase should have txid, if not it's an error
-                logging.error(f"[SYNC] Coinbase transaction missing txid in block {height}")
-        logging.info(f"[SYNC] Extracted tx_ids from full_transactions: {tx_ids}")
-    
-    confirmed_txids = tx_ids[1:] if len(tx_ids) > 1 else []  # Skip coinbase (first transaction)
-    
-    # Track which transactions were actually in our mempool before removal
-    confirmed_from_mempool = []
-    for txid in confirmed_txids:
-        if mempool_manager.get_transaction(txid) is not None:
-            confirmed_from_mempool.append(txid)
-            logging.debug(f"[SYNC] Transaction {txid} was in our mempool")
-        else:
-            logging.debug(f"[SYNC] Transaction {txid} not in mempool (might be from another node)")
-    
-    # Now remove them
-    mempool_manager.remove_confirmed_transactions(confirmed_txids)
-    
-    if confirmed_from_mempool:
-        logging.info(f"[SYNC] Removed {len(confirmed_from_mempool)} transactions from mempool after block {block_hash}")
-    
-    # Emit confirmation events for transactions that were in mempool
-    for txid in confirmed_from_mempool:
-        # Get transaction data
-        tx_key = f"tx:{txid}".encode()
-        if tx_key in db:
-            tx_data = json.loads(db.get(tx_key).decode())
-            # Extract transaction details for the event
-            sender = None
-            receiver = None
-            for output in tx_data.get("outputs", []):
-                if output.get("sender"):
-                    sender = output["sender"]
-                if output.get("receiver"):
-                    receiver = output["receiver"]
-            
-            # Emit transaction confirmed event
-            asyncio.create_task(event_bus.emit(EventTypes.TRANSACTION_CONFIRMED, {
-                'txid': txid,
-                'transaction': {
-                    'id': txid,
-                    'hash': txid,
-                    'sender': sender,
-                    'receiver': receiver,
-                    'blockHeight': height,
-                },
-                'blockHeight': height,
-                'confirmed_from_mempool': True
-            }, source='sync'))
-            
-            logging.info(f"[SYNC] Emitted TRANSACTION_CONFIRMED event for {txid}")
-    
-    # Emit events for all database operations
-    # Emit transaction events
-    for txid in tx_ids:
-        tx_key = f"tx:{txid}".encode()
-        if tx_key in db:
-            emit_database_event(tx_key, db.get(tx_key))
-    
-    # Emit UTXO events - use full_transactions instead of undefined block_transactions
-    for tx in full_transactions:
-        if tx and "txid" in tx:
-            txid = tx["txid"]
-            for out in tx.get("outputs", []):
-                out_key = f"utxo:{txid}:{out.get('utxo_index', 0)}".encode()
-                if out_key in db:
-                    emit_database_event(out_key, db.get(out_key))
-    
-    # Emit block event
-    emit_database_event(block_key, db.get(block_key))
 
 async def get_blockchain_info() -> Dict:
     """Get current blockchain information"""
@@ -626,6 +407,126 @@ async def _check_orphan_chains_for_missing_blocks(gossip_client=None):
         else:
             logging.warning("[SYNC] No gossip client available to request missing blocks")
 
+# Track blocks with missing UTXOs to avoid infinite retry loops
+_missing_utxo_blocks = {}  # block_hash -> {"height": int, "attempts": int, "missing_utxos": set()}
+_max_backtrack_attempts = 3  # Maximum times to try requesting earlier blocks
+
+async def _handle_missing_utxo(block: dict, missing_utxo: str):
+    """
+    Handle a block that failed due to missing UTXO by requesting earlier blocks.
+    """
+    block_hash = block.get("block_hash")
+    block_height = block.get("height", 0)
+
+    # Track this failed block
+    if block_hash not in _missing_utxo_blocks:
+        _missing_utxo_blocks[block_hash] = {
+            "height": block_height,
+            "attempts": 0,
+            "missing_utxos": set()
+        }
+
+    _missing_utxo_blocks[block_hash]["missing_utxos"].add(missing_utxo)
+    _missing_utxo_blocks[block_hash]["attempts"] += 1
+
+    # First, try to request the specific missing transaction
+    if ":" in missing_utxo and _missing_utxo_blocks[block_hash]["attempts"] == 1:
+        missing_txid = missing_utxo.split(":")[0]
+        logging.info(f"[SYNC] Attempting to request missing transaction {missing_txid}")
+
+        from gossip.gossip import get_gossip_node
+        gossip_client = get_gossip_node()
+
+        if gossip_client:
+            txs = await request_specific_transactions([missing_txid], gossip_client)
+            if txs:
+                logging.info(f"[SYNC] Successfully received missing transaction {missing_txid}, storing it")
+                # Store the transaction in the database
+                db = get_db()
+                for tx in txs:
+                    tx_key = f"tx:{missing_txid}".encode()
+                    db[tx_key] = json.dumps(tx).encode()
+
+                    # Also update UTXO set if needed
+                    from blockchain.utxo_manager import get_utxo_manager
+                    utxo_manager = get_utxo_manager()
+
+                    # Process transaction outputs to add UTXOs
+                    for i, output in enumerate(tx.get("outputs", [])):
+                        utxo_id = f"{missing_txid}:{i}"
+                        utxo_data = {
+                            "txid": missing_txid,
+                            "index": i,
+                            "amount": output.get("amount", 0),
+                            "script_pubkey": output.get("script_pubkey", ""),
+                            "height": block_height - 1,  # Assume it's from a previous block
+                            "spent": False
+                        }
+                        utxo_manager.add_utxo(utxo_id, utxo_data)
+
+                logging.info(f"[SYNC] Retrying block {block_hash} after fetching missing transaction")
+                # Retry processing the block
+                await process_blocks_from_peer([block])
+                return
+
+    # Check if we've tried too many times
+    if _missing_utxo_blocks[block_hash]["attempts"] >= _max_backtrack_attempts:
+        logging.error(f"[SYNC] Block {block_hash} at height {block_height} has failed {_max_backtrack_attempts} times due to missing UTXOs")
+        logging.error(f"[SYNC] Missing UTXOs: {_missing_utxo_blocks[block_hash]['missing_utxos']}")
+        logging.error(f"[SYNC] This node needs a full resync from an earlier point or from genesis")
+        return
+
+    # Calculate how far back to request
+    # Start by requesting 10 blocks before the failed block
+    backtrack_depth = 10 * _missing_utxo_blocks[block_hash]["attempts"]  # Increase depth with each attempt
+    start_height = max(0, block_height - backtrack_depth)
+
+    logging.info(f"[SYNC] Attempting to get earlier blocks from height {start_height} to {block_height - 1} (attempt {_missing_utxo_blocks[block_hash]['attempts']})")
+
+    # Request earlier blocks
+    from gossip.gossip import get_gossip_node
+    gossip_client = get_gossip_node()
+
+    if gossip_client:
+        try:
+            # Request blocks from earlier height
+            blocks_request = {
+                "type": "get_blocks",
+                "start_height": start_height,
+                "end_height": block_height - 1
+            }
+
+            # Find a peer to request from
+            all_peers = list(gossip_client.dht_peers.union(gossip_client.client_peers))
+            if all_peers:
+                import random
+                peer = random.choice(all_peers)
+
+                logging.info(f"[SYNC] Requesting blocks {start_height} to {block_height - 1} from peer {peer}")
+
+                reader, writer = await asyncio.open_connection(peer[0], peer[1])
+                writer.write((json.dumps(blocks_request) + "\n").encode('utf-8'))
+                await writer.drain()
+
+                # Read response
+                response = await reader.readline()
+                if response:
+                    msg = json.loads(response.decode('utf-8'))
+                    if msg.get("type") == "blocks_response":
+                        blocks = msg.get("blocks", [])
+                        if blocks:
+                            logging.info(f"[SYNC] Received {len(blocks)} earlier blocks, processing them first")
+                            # Process these earlier blocks first
+                            await process_blocks_from_peer(blocks)
+                        else:
+                            logging.warning(f"[SYNC] No blocks received for range {start_height} to {block_height - 1}")
+
+                writer.close()
+                await writer.wait_closed()
+
+        except Exception as e:
+            logging.error(f"[SYNC] Failed to request earlier blocks: {e}")
+
 async def request_specific_blocks(block_hashes: List[str], gossip_client=None) -> Optional[List[dict]]:
     """
     Request specific blocks by hash from peers.
@@ -633,7 +534,7 @@ async def request_specific_blocks(block_hashes: List[str], gossip_client=None) -
     """
     if not block_hashes:
         return None
-    
+
     if not gossip_client:
         logging.error("[SYNC] No gossip client provided for block requests")
         return None
@@ -684,30 +585,71 @@ async def request_specific_blocks(block_hashes: List[str], gossip_client=None) -
         logging.warning(f"[SYNC] Failed to receive any of the {len(block_hashes)} requested blocks")
         return None
 
-async def detect_and_handle_fork(blocks: List[dict]) -> bool:
+async def request_specific_transactions(tx_ids: List[str], gossip_client=None) -> Optional[List[dict]]:
     """
-    Detect if received blocks indicate we're on a different fork.
-    Returns True if a fork was detected and handled.
+    Request specific transactions by ID from peers.
+    Returns the transactions if successful, None otherwise.
     """
-    cm = await get_chain_manager()
-    fork_detected = False
-    
-    for block in blocks:
-        height = block.get("height", 0)
-        block_hash = block.get("block_hash")
-        prev_hash = block.get("previous_hash")
-        
-        # Check if we have a different block at this height
-        our_block_at_height = await cm.detect_fork_at_height(height)
-        
-        if our_block_at_height and our_block_at_height != block_hash:
-            # We have a different block at this height - fork detected!
-            logging.warning(f"[SYNC] Fork detected at height {height}!")
-            logging.warning(f"[SYNC] Our block: {our_block_at_height}")
-            logging.warning(f"[SYNC] Their block: {block_hash}")
-            fork_detected = True
-            
-            # The chain manager will handle reorganization when orphan chains are evaluated
-            # We just need to ensure the blocks are added as orphans
-    
-    return fork_detected
+    if not tx_ids:
+        return None
+
+    if not gossip_client:
+        logging.error("[SYNC] No gossip client provided for transaction requests")
+        return None
+
+    logging.info(f"[SYNC] Requesting {len(tx_ids)} specific transactions from peers")
+
+    # Try to request from multiple peers
+    peers = list(gossip_client.dht_peers | gossip_client.client_peers)
+    if not peers:
+        logging.warning("[SYNC] No peers available to request transactions from")
+        return None
+
+    received_txs = []
+
+    # Try up to 3 different peers
+    for peer in peers[:3]:
+        try:
+            logging.info(f"[SYNC] Requesting transactions from peer {peer}")
+
+            # Create connection
+            reader, writer = await asyncio.open_connection(peer[0], peer[1])
+
+            # Send request
+            request_msg = {
+                "type": "get_transactions",
+                "tx_ids": tx_ids,
+                "timestamp": int(time.time() * 1000)
+            }
+            writer.write((json.dumps(request_msg) + "\n").encode('utf-8'))
+            await writer.drain()
+
+            # Read response
+            response_data = await reader.readline()
+            if response_data:
+                response = json.loads(response_data.decode('utf-8'))
+                if response.get("type") == "transactions_response":
+                    txs = response.get("transactions", [])
+                    if txs:
+                        logging.info(f"[SYNC] Received {len(txs)} transactions from peer {peer}")
+                        received_txs.extend(txs)
+
+                        # If we got all requested transactions, return
+                        if len(received_txs) >= len(tx_ids):
+                            writer.close()
+                            await writer.wait_closed()
+                            return received_txs[:len(tx_ids)]
+
+            writer.close()
+            await writer.wait_closed()
+
+        except Exception as e:
+            logging.warning(f"[SYNC] Failed to request transactions from peer {peer}: {e}")
+            continue
+
+    if received_txs:
+        logging.info(f"[SYNC] Received {len(received_txs)} out of {len(tx_ids)} requested transactions")
+        return received_txs
+    else:
+        logging.warning(f"[SYNC] Failed to receive any of the {len(tx_ids)} requested transactions")
+        return None

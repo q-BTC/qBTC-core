@@ -13,7 +13,8 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 
 from errors.exceptions import (
-    BlockchainError, RateLimitError
+    BlockchainError, RateLimitError, ValidationError as CustomValidationError,
+    InsufficientFundsError, InvalidSignatureError
 )
 
 logger = logging.getLogger(__name__)
@@ -190,13 +191,22 @@ async def generic_exception_handler(request: Request, exc: Exception) -> JSONRes
 def setup_error_handlers(app):
     """Setup all error handlers for FastAPI app"""
     
-    # Add middleware for correlation ID
-    app.middleware("http")(add_correlation_id_middleware)
+    # REMOVED correlation ID middleware to prevent header conflicts
+    # The correlation ID middleware was potentially interfering with CORS
+    # app.middleware("http")(add_correlation_id_middleware)
     
     # Add exception handlers
+    # Handle our custom validation errors with blockchain handler
+    app.add_exception_handler(CustomValidationError, blockchain_error_handler)
+    app.add_exception_handler(InsufficientFundsError, blockchain_error_handler)
+    app.add_exception_handler(InvalidSignatureError, blockchain_error_handler)
     app.add_exception_handler(BlockchainError, blockchain_error_handler)
+    
+    # Handle Pydantic validation errors
     app.add_exception_handler(RequestValidationError, validation_error_handler)
     app.add_exception_handler(ValidationError, validation_error_handler)
+    
+    # Handle other errors
     app.add_exception_handler(HTTPException, http_exception_handler)
     app.add_exception_handler(RateLimitError, rate_limit_error_handler)
     app.add_exception_handler(Exception, generic_exception_handler)

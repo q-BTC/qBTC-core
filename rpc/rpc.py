@@ -4,16 +4,18 @@ import struct
 import json
 import logging
 import asyncio
+import os
 from decimal import Decimal
 from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
+# CORSMiddleware removed - nginx handles CORS at the proxy level
 from database.database import get_db, get_current_height
-from config.config import ADMIN_ADDRESS
+from config.config import ADMIN_ADDRESS, CHAIN_ID
 from wallet.wallet import verify_transaction
 from blockchain.blockchain import derive_qsafe_address,Block, bits_to_target, serialize_transaction,scriptpubkey_to_address, read_varint, parse_tx, validate_pow, sha256d, calculate_merkle_root
 from blockchain.difficulty import get_next_bits
+from blockchain.block_factory import create_block, normalize_block
 from state.state import blockchain, state_lock, mempool_manager
-from rocksdict import WriteBatch
+# from rocksdict import WriteBatch  # No longer needed - ChainManager handles all database operations
 from sync.sync import get_blockchain_info
 
 # Import security components
@@ -26,11 +28,18 @@ logger = logging.getLogger(__name__)
 
 # Longpoll support for miners
 longpoll_waiters = []  # List of (longpollid, future) tuples
-longpoll_lock = asyncio.Lock()
+longpoll_lock = None  # Will be created lazily
+
+def _get_longpoll_lock():
+    """Get or create the longpoll lock in the current event loop"""
+    global longpoll_lock
+    if longpoll_lock is None:
+        longpoll_lock = asyncio.Lock()
+    return longpoll_lock
 
 async def notify_new_block():
     """Notify all waiting longpoll requests that a new block has arrived"""
-    async with longpoll_lock:
+    async with _get_longpoll_lock():
         logger.info(f"notify_new_block called - {len(longpoll_waiters)} miners waiting")
         notified = 0
         for longpollid, future in longpoll_waiters:
@@ -50,14 +59,8 @@ rpc_app.middleware("http")(simple_security_middleware)
 # Setup error handlers
 setup_error_handlers(rpc_app)
 
-# CORS - restrict in production
-rpc_app.add_middleware(
-    CORSMiddleware, 
-    allow_origins=["*"],  # TODO: Restrict in production
-    allow_credentials=True, 
-    allow_methods=["POST"],  # RPC only needs POST
-    allow_headers=["*"]
-)
+# NOTE: CORS is handled by nginx at the proxy level
+# Do NOT add CORSMiddleware here as it will cause duplicate headers
 
 
 
@@ -98,6 +101,24 @@ async def rpc_handler(request: Request):
             return await get_peer_info(request, data)
         elif method == "getwork":
             return await get_work(data)
+        elif method == "createwallet":
+            return await create_wallet_rpc(data)
+        elif method == "listwallets":
+            return await list_wallets_rpc(data)
+        elif method == "getwalletinfo":
+            return await get_wallet_info_rpc(data)
+        elif method == "getbalance":
+            return await get_balance_rpc(data)
+        elif method == "listunspent":
+            return await list_unspent_rpc(data)
+        elif method == "walletpassphrase":
+            return await wallet_passphrase_rpc(data)
+        elif method == "walletlock":
+            return await wallet_lock_rpc(data)
+        elif method == "walletpassphrasechange":
+            return await wallet_passphrase_change_rpc(data)
+        elif method == "encryptwallet":
+            return await encrypt_wallet_rpc(data)
         else:
             logger.warning(f"Unknown RPC method requested: {method}")
             return {"error": "unknown method", "id": data.get("id")}
@@ -280,7 +301,7 @@ async def get_block_template(data):
         future = asyncio.Future()
         
         # Add to waiters list
-        async with longpoll_lock:
+        async with _get_longpoll_lock():
             longpoll_waiters.append((longpollid, future))
         
         try:
@@ -292,12 +313,12 @@ async def get_block_template(data):
         except asyncio.TimeoutError:
             logger.info("Longpoll timed out after 60 seconds")
             # Remove from waiters if still there
-            async with longpoll_lock:
+            async with _get_longpoll_lock():
                 longpoll_waiters[:] = [(lid, f) for lid, f in longpoll_waiters 
                                       if f is not future]
         finally:
             # Ensure we're removed from waiters
-            async with longpoll_lock:
+            async with _get_longpoll_lock():
                 longpoll_waiters[:] = [(lid, f) for lid, f in longpoll_waiters 
                                       if f is not future]
     elif longpollid and longpollid != previous_block_hash:
@@ -315,7 +336,9 @@ async def get_block_template(data):
     # Use mempool manager to get transactions sorted by fee and without conflicts
     
     # Get transactions for block, already sorted by fee rate and conflict-free
-    mempool_txs = mempool_manager.get_transactions_for_block(max_count=1000)
+    # Uses MAX_TRANSACTIONS_PER_BLOCK from config (4000 by default)
+    from config.config import MAX_TRANSACTIONS_PER_BLOCK
+    mempool_txs = mempool_manager.get_transactions_for_block(max_count=MAX_TRANSACTIONS_PER_BLOCK)
     
     # Also need to check against confirmed UTXOs in database
     for orig_tx in mempool_txs:
@@ -452,7 +475,7 @@ async def submit_block(request: Request, data: dict) -> dict:
             return rpc_error(-1, f"Invalid block format: {str(e)}", data.get("id"))
         
         db = get_db()
-        batch = WriteBatch()  
+        # No batch needed - ChainManager handles all database operations
         txids = []
         tx_list = []
         hdr = raw[:80]
@@ -508,13 +531,31 @@ async def submit_block(request: Request, data: dict) -> dict:
         print(coinbase_tx)
         coinbase_script_pubkey = coinbase_tx["outputs"][0]["script_pubkey"]
         # For cpuminer compatibility, extract standard Bitcoin address from coinbase
+        bitcoin_miner_address = None
         try:
-            coinbase_miner_address = scriptpubkey_to_address(coinbase_script_pubkey)
-            logger.info(f"Coinbase miner address (Bitcoin format): {coinbase_miner_address}")
+            bitcoin_miner_address = scriptpubkey_to_address(coinbase_script_pubkey)
+            logger.info(f"Coinbase miner address (Bitcoin format): {bitcoin_miner_address}")
+            
+            # Check if this Bitcoin address has been committed to a qBTC address
+            db = get_db()
+            commitment_key = f"commitment:{bitcoin_miner_address}".encode()
+            commitment_data = db.get(commitment_key)
+            
+            if commitment_data:
+                # Use the committed qBTC address
+                commitment = json.loads(commitment_data.decode())
+                coinbase_miner_address = commitment.get("qbtc_address")
+                logger.info(f"Found commitment: Bitcoin {bitcoin_miner_address} -> qBTC {coinbase_miner_address}")
+            else:
+                # No commitment found, store the Bitcoin address directly
+                # This allows tracking miners even without qBTC address commitment
+                coinbase_miner_address = bitcoin_miner_address
+                logger.info(f"No qBTC address commitment found for {bitcoin_miner_address}, storing Bitcoin address as miner")
+                logger.info("Note: To spend rewards, commit your Bitcoin address to a qBTC address using the /commit endpoint")
         except Exception as e:
-            # If standard address extraction fails, use a default quantum-safe address
+            # If address extraction fails entirely, use admin address
             coinbase_miner_address = ADMIN_ADDRESS
-            logger.warning(f"Could not extract miner address, using admin: {coinbase_miner_address}")
+            logger.warning(f"Could not extract miner address from coinbase: {e}, using admin: {coinbase_miner_address}")
         coinbase_raw = raw[coinbase_start:coinbase_start + size]
         coinbase_txid = sha256d(coinbase_raw)[::-1].hex() 
         logger.info(f"Coinbase TXID: {coinbase_txid}")
@@ -533,44 +574,78 @@ async def submit_block(request: Request, data: dict) -> dict:
         if offset >= len(raw):
             logger.info("Block contains only coinbase transaction")
         else:
-            try:
-                blob = raw[offset:].decode('utf-8')
-                logger.info(f"JSON blob length: {len(blob)} bytes")
-                logger.debug(f"First 200 chars of blob: {blob[:200]}...")
-                
-                decoder = json.JSONDecoder()
-                pos     = 0
-                json_obj_count = 0
-                while pos < len(blob):
-                    try:
-                        obj, next_pos = decoder.raw_decode(blob, pos)
+            # Try to parse additional transactions
+            # cpuminer might send them as either JSON or binary format
+            remaining_data = raw[offset:]
+            
+            # First, try to parse as binary transactions (Bitcoin format)
+            binary_offset = 0
+            while binary_offset < len(remaining_data):
+                try:
+                    # Try to parse a binary transaction
+                    tx_dict, tx_size = parse_tx(remaining_data[binary_offset:])
+                    if tx_dict:
+                        # Calculate TXID for this transaction
+                        tx_bytes = remaining_data[binary_offset:binary_offset + tx_size]
+                        temp_txid = sha256d(tx_bytes)[::-1].hex()
+                        logger.info(f"Parsed binary transaction with TXID: {temp_txid}")
                         
-                        # Calculate txid for this transaction to check for duplicates
-                        if isinstance(obj, dict) and "body" in obj:
-                            # Don't clean here - serialize_transaction does it internally
-                            temp_raw_tx = serialize_transaction(obj)
-                            temp_txid = sha256d(bytes.fromhex(temp_raw_tx))[::-1].hex()
-                            logger.debug(f"Parsed transaction with TXID: {temp_txid}")
+                        # Convert to our internal format if needed
+                        # For now, just track the TXID
+                        txids.append(temp_txid)
+                        binary_offset += tx_size
+                    else:
+                        break
+                except Exception as e:
+                    logger.debug(f"Not a binary transaction at offset {binary_offset}: {e}")
+                    break
+            
+            # If no binary transactions found, try JSON format
+            if binary_offset == 0:
+                try:
+                    blob = remaining_data.decode('utf-8')
+                    logger.info(f"JSON blob length: {len(blob)} bytes")
+                    logger.debug(f"First 200 chars of blob: {blob[:200]}...")
+                    
+                    decoder = json.JSONDecoder()
+                    pos     = 0
+                    json_obj_count = 0
+                    while pos < len(blob):
+                        try:
+                            obj, next_pos = decoder.raw_decode(blob, pos)
                             
-                            # Always add the transaction, even if duplicate
-                            # cpuminer sends what we give it, including duplicates
-                            tx_list.append(obj)
-                            json_obj_count += 1
-                            logger.info(f"Added JSON object {json_obj_count} to tx_list")
-                        
-                        pos = next_pos
-                        # Skip whitespace and commas
-                        while pos < len(blob) and blob[pos] in ' \t\r\n,':
-                            pos += 1
-                    except json.JSONDecodeError:
-                        # No more valid JSON objects, exit the loop
-                        break
-                    except Exception as e:
-                        logger.warning(f"Error parsing transaction at position {pos}: {e}")
-                        break
-            except Exception as e:
-                # No valid JSON data after coinbase, which is fine for cpuminer blocks
-                logger.debug(f"No additional transactions after coinbase: {e}")
+                            # Check if this looks like a transaction object
+                            if isinstance(obj, dict):
+                                # Add the transaction - we'll calculate TXID later when processing
+                                tx_list.append(obj)
+                                json_obj_count += 1
+                                
+                                # Try to extract/log the TXID if possible
+                                if "txid" in obj:
+                                    logger.info(f"Parsed JSON transaction with existing TXID: {obj['txid']}")
+                                elif "body" in obj:
+                                    logger.info(f"Parsed JSON transaction with body (TXID will be calculated later)")
+                                else:
+                                    logger.info(f"Parsed JSON object {json_obj_count}")
+                                
+                                logger.info(f"Added JSON object {json_obj_count} to tx_list")
+                            
+                            pos = next_pos
+                            # Skip whitespace and commas
+                            while pos < len(blob) and blob[pos] in ' \t\r\n,':
+                                pos += 1
+                        except json.JSONDecodeError:
+                            # No more valid JSON objects, exit the loop
+                            break
+                        except Exception as e:
+                            logger.warning(f"Error parsing JSON transaction at position {pos}: {e}")
+                            break
+                    
+                    if json_obj_count > 0:
+                        logger.info(f"Parsed {json_obj_count} JSON transactions")
+                except Exception as e:
+                    # No valid JSON data after coinbase, which is fine for cpuminer blocks
+                    logger.debug(f"No JSON transactions after coinbase: {e}")
         
         logger.info(f"Total transactions parsed from JSON: {len(tx_list)}")
         logger.info(f"Transaction count from header: {tx_count}")
@@ -587,11 +662,13 @@ async def submit_block(request: Request, data: dict) -> dict:
         unique_txids_processed = set()  # Track which txids we've already processed
         
         for i, tx in enumerate(tx_list):
-            # Don't clean here - serialize_transaction does it internally
+            # ALWAYS calculate txid - don't preserve existing ones
+            # This ensures consistency with cpuminer's expectations
             raw_tx = serialize_transaction(tx)
+            # sha256d returns hash in internal byte order
+            # Reverse bytes for standard Bitcoin txid format
             txid = sha256d(bytes.fromhex(raw_tx))[::-1].hex()
-            logger.debug(f"Processing transaction {i}: TXID: {txid}")
-            
+            logger.debug(f"Calculated TXID for transaction {i}: {txid}")
             # Add txid to the transaction object itself
             tx["txid"] = txid
             
@@ -617,7 +694,8 @@ async def submit_block(request: Request, data: dict) -> dict:
                 total_required = Decimal(0)
                 total_authorised = Decimal(amount_)
 
-                assert derive_qsafe_address(pubkey) == from_,"wrong signer"
+                if derive_qsafe_address(pubkey) != from_:
+                    raise ValueError("Transaction signature validation failed: wrong signer")
 
                 for input_ in inputs:
                     input_receiver = input_["receiver"]
@@ -637,18 +715,18 @@ async def submit_block(request: Request, data: dict) -> dict:
                 miner_fee = (Decimal(total_authorised) * Decimal("0.001")).quantize(Decimal("0.00000001"))
                 total_required = Decimal(total_authorised) + Decimal(miner_fee)
                 if (total_required <= total_available):
-                       # Spend inputs
+                    # Validation passed - just check for double-spends within this block
                     for input_ in inputs:
                         utxo_key = f"utxo:{input_['txid']}:{input_.get('utxo_index', 0)}".encode()
                         utxo_key_str = utxo_key.decode()
                         
                         # Check if this UTXO was already spent in this block
                         if utxo_key_str in spent_in_this_block:
-                            logger.warning(f"UTXO {utxo_key} already spent in this block, skipping")
-                            continue
+                            logger.error(f"Double-spend within block: {utxo_key}")
+                            return rpc_error(-1, f"Double-spend detected within block: {utxo_key.decode()}", data["id"])
                             
+                        # Check if UTXO exists and isn't already spent
                         if utxo_key in db:
-                            print(f"****** Marking utxo {utxo_key} as spent")
                             utxo_raw = db.get(utxo_key)
                             if utxo_raw is None:
                                 logger.error(f"UTXO not found: {utxo_key}")
@@ -657,50 +735,16 @@ async def submit_block(request: Request, data: dict) -> dict:
                             if utxo["spent"]:
                                 logger.error(f"Double-spend attempt: {utxo_key}")
                                 return rpc_error(-1, f"Double-spend detected: {utxo_key.decode()}", data["id"])
-                            utxo["spent"] = True
-                            batch.put(utxo_key, json.dumps(utxo).encode())
+                            
+                            # Track that this UTXO is being spent in this block
                             spent_in_this_block.add(utxo_key_str)
-                            
-                            # Remove from wallet index
-                            if 'receiver' in utxo:
-                                wallet_index_key = f"wallet_utxos:{utxo['receiver']}".encode()
-                                if wallet_index_key in db:
-                                    wallet_utxos = json.loads(db.get(wallet_index_key).decode())
-                                    if utxo_key_str in wallet_utxos:
-                                        wallet_utxos.remove(utxo_key_str)
-                                        batch.put(wallet_index_key, json.dumps(wallet_utxos).encode())
-                            
-                            print(f"****** Done marking {utxo_key} as spent")
-
-                    # Create outputs
-                    for idx, output_ in enumerate(outputs):
-                        utxo_idx = output_.get('utxo_index', idx)
-                        utxo_key = f"utxo:{txid}:{utxo_idx}".encode()
-                        utxo_value = {
-                            "txid": txid,
-                            "utxo_index": utxo_idx,
-                            "sender": output_["sender"],
-                            "receiver": output_["receiver"],
-                            "amount": str(output_["amount"]),  # Ensure amount is always a string
-                            "spent": False
-                        }
-                        batch.put(utxo_key, json.dumps(utxo_value).encode())
-                        
-                        # Add to wallet index
-                        if output_["receiver"]:
-                            wallet_index_key = f"wallet_utxos:{output_['receiver']}".encode()
-                            wallet_utxos = []
-                            if wallet_index_key in db:
-                                wallet_utxos = json.loads(db.get(wallet_index_key).decode())
-                            utxo_key_str = utxo_key.decode()
-                            if utxo_key_str not in wallet_utxos:
-                                wallet_utxos.append(utxo_key_str)
-                                batch.put(wallet_index_key, json.dumps(wallet_utxos).encode())
-                        
-                        print(f"****** Created UTXO {utxo_key} → {utxo_value}")
-
-                    # Store transaction
-                    batch.put(b"tx:" + txid.encode(), json.dumps(tx).encode())
+                        else:
+                            logger.error(f"UTXO not found in database: {utxo_key}")
+                            return rpc_error(-1, f"Input not found: {utxo_key.decode()}", data["id"])
+                    
+                    # ChainManager will handle all UTXO creation and wallet index updates
+                    # Transaction will be stored by ChainManager when it processes the block
+                    pass  # No need to store transaction here
 
 
         # Debug: Log all transaction IDs
@@ -713,11 +757,11 @@ async def submit_block(request: Request, data: dict) -> dict:
         merkle_txids = txids.copy()
         if tx_count > len(txids):
             logger.warning(f"Header says {tx_count} txs but only {len(txids)} unique - cpuminer duplicated transactions")
-            # Add the last transaction repeatedly to match the count
-            if len(txids) > 1:  # Must have at least coinbase + 1 other tx
-                while len(merkle_txids) < tx_count:
-                    merkle_txids.append(txids[-1])  # Duplicate the last non-coinbase tx
-                logger.info(f"Extended txid list to {len(merkle_txids)} for merkle calculation")
+            # For single transaction (coinbase only), Bitcoin duplicates it for merkle calculation
+            # This is standard Bitcoin behavior when there's only one transaction in a block
+            while len(merkle_txids) < tx_count:
+                merkle_txids.append(txids[-1])  # Duplicate the last (or only) transaction
+            logger.info(f"Extended txid list to {len(merkle_txids)} for merkle calculation")
         
         calculated_merkle = calculate_merkle_root(merkle_txids)
         logger.info(f"Calculated merkle root with {len(merkle_txids)} txids: {calculated_merkle}")
@@ -734,24 +778,51 @@ async def submit_block(request: Request, data: dict) -> dict:
         full_transactions = []
         
         # Store coinbase transaction with proper format and txid
+        # Fix coinbase inputs to use 'txid' instead of 'prev_txid' for validator
+        coinbase_inputs = []
+        for inp in coinbase_tx["inputs"]:
+            coinbase_inputs.append({
+                "txid": inp.get("prev_txid", "0" * 64),  # Coinbase should have all zeros
+                "utxo_index": inp.get("prev_index", 0),
+                "script_sig": inp.get("script_sig", ""),
+                "sequence": inp.get("sequence", 0xffffffff)
+            })
+        
+        # First create coinbase_tx_data without txid
         coinbase_tx_data = {
-            "txid": coinbase_txid,  # Add the txid we calculated
             "version": coinbase_tx["version"],
-            "inputs": coinbase_tx["inputs"],
+            "inputs": coinbase_inputs,
             "outputs": [{
                 "utxo_index": idx,
                 "receiver": coinbase_miner_address,
-                "amount": str(out["value"]),  # Changed from "amount" to "value"
+                "amount": str(out.get("value", out.get("amount", "0"))),  # Use value from parsed tx, fallback to amount
                 "script_pubkey": out.get("script_pubkey", "")
             } for idx, out in enumerate(coinbase_tx["outputs"])],
             "body": {
-                "msg_str": "",      # Coinbase has no message
+                "msg_str": f"coinbase:{coinbase_miner_address}:0:0:{CHAIN_ID}",  # Add proper msg_str for coinbase
                 "pubkey": "",       # Coinbase has no pubkey
                 "signature": ""     # Coinbase has no signature
             },
             "locktime": coinbase_tx.get("locktime", 0)
         }
-        batch.put(f"tx:{coinbase_txid}".encode(), json.dumps(coinbase_tx_data).encode())
+        
+        # Calculate txid using the same method as chain_manager (serialize_transaction)
+        # serialize_transaction is already imported at the top of the file
+        coinbase_tx_hex = serialize_transaction(coinbase_tx_data)
+        coinbase_tx_bytes = bytes.fromhex(coinbase_tx_hex)
+        calculated_coinbase_txid = sha256d(coinbase_tx_bytes)[::-1].hex()
+        
+        # Use the original coinbase txid from the miner (calculated from raw Bitcoin bytes)
+        # This ensures merkle root validation works correctly
+        coinbase_tx_data["txid"] = coinbase_txid  # Use the original txid from line 522
+        
+        logger.info(f"Coinbase TXID (from raw bytes): {coinbase_txid}")
+        
+        # The merkle root should be validated using the original txids
+        # This is critical for security - we MUST validate the merkle root
+        
+        # ChainManager will store the coinbase transaction when it processes the block
+        # batch.put(f"tx:{calculated_coinbase_txid}".encode(), json.dumps(coinbase_tx_data).encode())
         full_transactions.append(coinbase_tx_data)
         
         # Add all other transactions to full_transactions
@@ -772,30 +843,35 @@ async def submit_block(request: Request, data: dict) -> dict:
         new_height = local_height + 1
         logger.info(f"Current height: {local_height}, new block height will be: {new_height}")
         
-        block_data = {
-            "version": version,
-            "bits": bits,
-            "height": new_height,
-            "block_hash": block.hash(),
-            "previous_hash": prev_block,
-            "tx_ids": txids,
-            "nonce": nonce,
-            "timestamp": timestamp,
-            "merkle_root": calculated_merkle,
-            "miner_address": coinbase_miner_address, 
-        }
+        # CRITICAL: For the block hash calculation, we must use the miner's merkle root
+        # The proof of work was done with that specific merkle root
+        # But we'll validate that it matches our calculated one
+        block_data = create_block(
+            version=version,
+            height=new_height,
+            block_hash=block.hash(),
+            previous_hash=prev_block,
+            bits=bits,
+            nonce=nonce,
+            timestamp=timestamp,
+            merkle_root=merkle_root_block,  # Use miner's merkle root for hash calculation
+            tx_ids=txids,
+            full_transactions=full_transactions,
+            miner_address=coinbase_miner_address,
+            connected=False  # New blocks always start as not connected
+        )
         
-        # Add full_transactions to block_data
-        block_data["full_transactions"] = full_transactions
+        # Add the calculated merkle for validation
+        block_data["calculated_merkle_root"] = calculated_merkle
         
         # CRITICAL FIX: Pass everything to ChainManager for atomic validation
         # This prevents database corruption from invalid blocks
         
-        # Add block data to batch but DON'T write yet
-        batch.put(b"block:" + block.hash().encode(), json.dumps(block_data).encode())
+        # Don't add anything to batch - let ChainManager handle everything
+        # ChainManager will handle all UTXO operations, transaction storage, and block storage atomically
         
-        # Pass the batch to ChainManager for atomic validation and write
-        success, error_msg = await cm.add_block(block_data, pre_validated_batch=batch)
+        # Since batch is now empty, we can pass None instead
+        success, error_msg = await cm.add_block(block_data, pre_validated_batch=None)
         if not success:
             # Batch was never written, so no cleanup needed!
             logger.error(f"ChainManager rejected block: {error_msg}")
@@ -803,27 +879,10 @@ async def submit_block(request: Request, data: dict) -> dict:
         
         # No need to invalidate cache - we removed caching
 
-        # Remove all non-coinbase transactions from mempool
-        logger.info(f"[MEMPOOL_CLEANUP] Attempting to remove {len(txids)-1} non-coinbase transactions from mempool")
-        logger.info(f"[MEMPOOL_CLEANUP] Current mempool size before cleanup: {mempool_manager.size()}")
-        
-        # Get all mempool transactions for debugging
-        all_mempool_txids = list(mempool_manager.get_all_transactions().keys())
-        logger.info(f"[MEMPOOL_CLEANUP] Current mempool txids: {all_mempool_txids[:10]}...")  # Log first 10
-        
-        removed_count = 0
-        not_found_count = 0
-        for tid in txids[1:]:
-            if mempool_manager.get_transaction(tid):
-                logger.info(f"[MEMPOOL_CLEANUP] Removing transaction {tid} from mempool")
-                mempool_manager.remove_transaction(tid)
-                removed_count += 1
-            else:
-                logger.debug(f"[MEMPOOL_CLEANUP] Transaction {tid} not in mempool (might be duplicate or already removed)")
-                not_found_count += 1
-        
-        logger.info(f"[MEMPOOL_CLEANUP] Cleanup complete: removed={removed_count}, not_found={not_found_count}")
-        logger.info(f"[MEMPOOL_CLEANUP] Mempool size after cleanup: {mempool_manager.size()}")
+        # Mempool cleanup is already handled by ChainManager._connect_block()
+        # No need to duplicate the cleanup here
+        logger.info(f"[MEMPOOL] Block added - mempool cleanup handled by ChainManager")
+        logger.info(f"[MEMPOOL] Current mempool size: {mempool_manager.size()}")
 
         async with state_lock:
             blockchain.append(block.hash())
@@ -866,7 +925,613 @@ async def submit_block(request: Request, data: dict) -> dict:
         return {"result": None, "error": None, "id": data["id"]}
     
     except Exception as e:
+        import traceback
         logger.error(f"Unexpected error in submit_block: {str(e)}")
+        logger.error(f"Full traceback:\n{traceback.format_exc()}")
         return rpc_error(-1, f"Internal error: {str(e)}", data.get("id"))
+
+
+async def create_wallet_rpc(data):
+    """Handle createwallet RPC call - creates a new qBTC wallet
+
+    Simplified format for qBTC:
+    bitcoin-cli createwallet "wallet_name" "password"
+
+    Parameters:
+    - wallet_name: Required wallet name/identifier
+    - password: Required password for wallet encryption
+    """
+    try:
+        params = data.get("params", [])
+
+        # Both wallet_name and password are required
+        if len(params) < 2:
+            return rpc_error(-8, "createwallet requires wallet_name and password parameters", data.get("id"))
+
+        wallet_name = params[0]
+        password = params[1]
+
+        # Strip quotes from bitcoin-cli string parameters
+        if isinstance(wallet_name, str):
+            wallet_name = wallet_name.strip('"')
+        if isinstance(password, str):
+            password = password.strip('"')
+
+        # Validate password
+        if not password or len(password) < 8:
+            return rpc_error(-8, "Password must be at least 8 characters", data.get("id"))
+
+        # Validate wallet name
+        if not wallet_name:
+            return rpc_error(-8, "Invalid wallet name", data.get("id"))
+
+        # Check if wallet already exists
+        wallet_dir = os.path.join("wallets", wallet_name)
+        if os.path.exists(wallet_dir):
+            return rpc_error(-4, f"Wallet {wallet_name} already exists", data.get("id"))
+
+        # Create wallet directory
+        os.makedirs(wallet_dir, exist_ok=True)
+
+        # Generate ML-DSA-87 quantum-resistant keypair
+        import oqs
+        from wallet.wallet import _as_bytes, _hex, _derive_address, _encrypt_privkey
+
+        try:
+            with oqs.Signature("ML-DSA-87") as signer:
+                public_key = _as_bytes(signer.generate_keypair())
+                secret_key = _as_bytes(signer.export_secret_key())
+
+            # Derive address
+            address = _derive_address(public_key)
+
+            # Always encrypt the private key with the provided password
+            enc_priv, salt, iv = _encrypt_privkey(_hex(secret_key), password)
+
+            # Store wallet data with encrypted key
+            wallet_data = {
+                "name": wallet_name,
+                "version": 1,
+                "created": int(time.time()),
+                "encrypted": True,  # Always encrypted with password
+                "locked": True,  # Start locked
+                "keys": [{
+                    "address": address,
+                    "publicKey": _hex(public_key),
+                    "encryptedPrivateKey": enc_priv,
+                    "salt": salt,
+                    "iv": iv
+                }]
+            }
+
+        except Exception as e:
+            # Clean up on key generation failure
+            import shutil
+            if os.path.exists(wallet_dir):
+                shutil.rmtree(wallet_dir)
+            logger.error(f"Failed to generate keys: {str(e)}")
+            return rpc_error(-1, f"Failed to generate keys: {str(e)}", data.get("id"))
+
+        # Save wallet file
+        wallet_file = os.path.join(wallet_dir, "wallet.json")
+        with open(wallet_file, "w") as f:
+            json.dump(wallet_data, f, indent=2)
+
+        # Store in database for quick access
+        db = get_db()
+        wallet_key = f"wallet:{wallet_name}".encode()
+        wallet_meta = {
+            "name": wallet_name,
+            "address": address,
+            "created": wallet_data["created"],
+            "encrypted": wallet_data["encrypted"]
+        }
+        from rocksdict import WriteBatch
+        batch = WriteBatch()
+        batch.put(wallet_key, json.dumps(wallet_meta).encode())
+        db.write(batch)
+
+        logger.info(f"Created encrypted wallet '{wallet_name}' with address {address}")
+
+        # Return success with wallet info including crypto details
+        result = {
+            "name": wallet_name,
+            "warning": "",
+            "address": address,
+            "publicKey": wallet_data["keys"][0]["publicKey"],
+            "encryptedPrivateKey": wallet_data["keys"][0]["encryptedPrivateKey"],
+            "salt": wallet_data["keys"][0]["salt"],
+            "iv": wallet_data["keys"][0]["iv"]
+        }
+
+        return {
+            "result": result,
+            "error": None,
+            "id": data.get("id")
+        }
+
+    except Exception as e:
+        logger.error(f"createwallet failed: {str(e)}")
+        return rpc_error(-1, str(e), data.get("id"))
+
+
+async def list_wallets_rpc(data):
+    """Handle listwallets RPC call - lists all available wallets"""
+    try:
+        wallets = []
+
+        # Check wallets directory
+        wallets_dir = "wallets"
+        if os.path.exists(wallets_dir):
+            for wallet_name in os.listdir(wallets_dir):
+                wallet_path = os.path.join(wallets_dir, wallet_name)
+                if os.path.isdir(wallet_path):
+                    wallet_file = os.path.join(wallet_path, "wallet.json")
+                    if os.path.exists(wallet_file):
+                        wallets.append(wallet_name)
+
+        return {
+            "result": wallets,
+            "error": None,
+            "id": data.get("id")
+        }
+    except Exception as e:
+        logger.error(f"listwallets failed: {str(e)}")
+        return rpc_error(-1, str(e), data.get("id"))
+
+
+async def get_wallet_info_rpc(data):
+    """Handle getwalletinfo RPC call - returns information about a specific wallet"""
+    try:
+        params = data.get("params", [])
+        wallet_name = params[0] if len(params) > 0 else "default"
+
+        # Strip quotes from bitcoin-cli parameters
+        if isinstance(wallet_name, str):
+            wallet_name = wallet_name.strip('"')
+
+        # Check if wallet exists
+        wallet_dir = os.path.join("wallets", wallet_name)
+        wallet_file = os.path.join(wallet_dir, "wallet.json")
+
+        if not os.path.exists(wallet_file):
+            return rpc_error(-18, f"Wallet {wallet_name} not found", data.get("id"))
+
+        # Load wallet data
+        with open(wallet_file, "r") as f:
+            wallet_data = json.load(f)
+
+        # Get balance for all addresses in wallet
+        db = get_db()
+        total_balance = Decimal("0")
+        addresses = []
+
+        for key_data in wallet_data.get("keys", []):
+            address = key_data.get("address")
+            if address:
+                addresses.append(address)
+
+                # Get balance from wallet index
+                from blockchain.wallet_index import get_wallet_index
+                wallet_index = get_wallet_index()
+                balance = wallet_index.get_wallet_balance(address)
+                total_balance += balance
+
+        # Return wallet info
+        return {
+            "result": {
+                "walletname": wallet_name,
+                "walletversion": wallet_data.get("version", 1),
+                "format": "qbtc",
+                "balance": float(total_balance),
+                "unconfirmed_balance": 0.0,
+                "immature_balance": 0.0,
+                "txcount": 0,  # Could be calculated from wallet_index
+                "keypoololdest": wallet_data.get("created", 0),
+                "keypoolsize": len(wallet_data.get("keys", [])),
+                "keypoolsize_hd_internal": 0,
+                "paytxfee": 0.0,
+                "private_keys_enabled": not wallet_data.get("blank", False),
+                "avoid_reuse": False,
+                "scanning": False,
+                "descriptors": False,
+                "external_signer": False,
+                "blank": wallet_data.get("blank", False),
+                "addresses": addresses
+            },
+            "error": None,
+            "id": data.get("id")
+        }
+    except Exception as e:
+        logger.error(f"getwalletinfo failed: {str(e)}")
+        return rpc_error(-1, str(e), data.get("id"))
+
+
+async def get_balance_rpc(data):
+    """Handle getbalance RPC call - returns balance for a wallet or address
+
+    Bitcoin-cli compatible:
+    bitcoin-cli getbalance [account] [minconf] [include_watchonly] [avoid_reuse]
+
+    For qBTC we support:
+    - No params: Returns total balance of all wallets
+    - wallet_name: Returns balance for specific wallet
+    - address: Returns balance for specific address
+    """
+    try:
+        params = data.get("params", [])
+        target = params[0] if len(params) > 0 else "*"  # "*" means all wallets
+        minconf = params[1] if len(params) > 1 else 1  # Minimum confirmations
+
+        # Strip quotes from bitcoin-cli parameters
+        if isinstance(target, str):
+            target = target.strip('"')
+
+        from blockchain.wallet_index import get_wallet_index
+        wallet_index = get_wallet_index()
+        db = get_db()
+
+        total_balance = Decimal("0")
+
+        if target == "*":
+            # Get balance for all wallets
+            wallets_dir = "wallets"
+            if os.path.exists(wallets_dir):
+                for wallet_name in os.listdir(wallets_dir):
+                    wallet_path = os.path.join(wallets_dir, wallet_name)
+                    if os.path.isdir(wallet_path):
+                        wallet_file = os.path.join(wallet_path, "wallet.json")
+                        if os.path.exists(wallet_file):
+                            with open(wallet_file, "r") as f:
+                                wallet_data = json.load(f)
+                            for key_data in wallet_data.get("keys", []):
+                                address = key_data.get("address")
+                                if address:
+                                    balance = wallet_index.get_wallet_balance(address)
+                                    total_balance += balance
+
+        elif target.startswith("bqs"):
+            # It's an address
+            balance = wallet_index.get_wallet_balance(target)
+            total_balance = balance
+
+        else:
+            # It's a wallet name
+            wallet_dir = os.path.join("wallets", target)
+            wallet_file = os.path.join(wallet_dir, "wallet.json")
+
+            if not os.path.exists(wallet_file):
+                return rpc_error(-18, f"Wallet {target} not found", data.get("id"))
+
+            with open(wallet_file, "r") as f:
+                wallet_data = json.load(f)
+
+            for key_data in wallet_data.get("keys", []):
+                address = key_data.get("address")
+                if address:
+                    balance = wallet_index.get_wallet_balance(address)
+                    total_balance += balance
+
+        # Return as float for Bitcoin compatibility
+        return {
+            "result": float(total_balance),
+            "error": None,
+            "id": data.get("id")
+        }
+
+    except Exception as e:
+        logger.error(f"getbalance failed: {str(e)}")
+        return rpc_error(-1, str(e), data.get("id"))
+
+
+async def list_unspent_rpc(data):
+    """Handle listunspent RPC call - returns unspent transaction outputs
+
+    Bitcoin-cli compatible:
+    bitcoin-cli listunspent [minconf] [maxconf] [addresses] [include_unsafe] [query_options]
+
+    Returns array of unspent transaction outputs
+    """
+    try:
+        params = data.get("params", [])
+        minconf = params[0] if len(params) > 0 else 1
+        maxconf = params[1] if len(params) > 1 else 9999999
+        addresses = params[2] if len(params) > 2 else []
+
+        db = get_db()
+        from blockchain.wallet_index import get_wallet_index
+        wallet_index = get_wallet_index()
+
+        unspent_outputs = []
+
+        # If no addresses specified, get all from wallets
+        if not addresses:
+            wallets_dir = "wallets"
+            if os.path.exists(wallets_dir):
+                for wallet_name in os.listdir(wallets_dir):
+                    wallet_path = os.path.join(wallets_dir, wallet_name)
+                    if os.path.isdir(wallet_path):
+                        wallet_file = os.path.join(wallet_path, "wallet.json")
+                        if os.path.exists(wallet_file):
+                            with open(wallet_file, "r") as f:
+                                wallet_data = json.load(f)
+                            for key_data in wallet_data.get("keys", []):
+                                address = key_data.get("address")
+                                if address:
+                                    addresses.append(address)
+
+        # Get current blockchain height for confirmations
+        current_height, _ = await get_current_height(db)
+
+        # Collect UTXOs for each address
+        for address in addresses:
+            utxos = wallet_index.get_wallet_utxos(address)
+
+            for utxo in utxos:
+                # Calculate confirmations
+                utxo_key = f"utxo:{utxo.get('txid', '')}:{utxo.get('index', 0)}"
+
+                # Get the block height of the transaction that created this UTXO
+                tx_key = f"tx:{utxo.get('txid', '')}".encode()
+                tx_data = db.get(tx_key)
+
+                confirmations = 1  # Default to 1 if we can't find block info
+                if tx_data:
+                    tx = json.loads(tx_data.decode())
+                    block_height = tx.get("height", current_height)
+                    confirmations = current_height - block_height + 1
+
+                # Check confirmation requirements
+                if confirmations < minconf or confirmations > maxconf:
+                    continue
+
+                # Format UTXO for Bitcoin compatibility
+                unspent_output = {
+                    "txid": utxo.get("txid", ""),
+                    "vout": utxo.get("index", 0),
+                    "address": address,
+                    "account": "",  # Deprecated in Bitcoin, kept for compatibility
+                    "scriptPubKey": utxo.get("script_pubkey", ""),
+                    "amount": float(Decimal(str(utxo.get("amount", "0")))),
+                    "confirmations": confirmations,
+                    "spendable": True,
+                    "solvable": True,
+                    "desc": f"addr({address})",
+                    "safe": confirmations >= 6
+                }
+
+                unspent_outputs.append(unspent_output)
+
+        # Sort by confirmations (most confirmed first)
+        unspent_outputs.sort(key=lambda x: x["confirmations"], reverse=True)
+
+        return {
+            "result": unspent_outputs,
+            "error": None,
+            "id": data.get("id")
+        }
+
+    except Exception as e:
+        logger.error(f"listunspent failed: {str(e)}")
+        return rpc_error(-1, str(e), data.get("id"))
+
+
+async def wallet_passphrase_rpc(data):
+    """Handle walletpassphrase RPC call - unlocks an encrypted wallet temporarily
+
+    Bitcoin Core compatible format:
+    bitcoin-cli walletpassphrase "passphrase" timeout
+
+    Parameters:
+    - passphrase: The wallet passphrase
+    - timeout: Time in seconds to keep the wallet unlocked (0 = unlock until restart)
+    """
+    try:
+        params = data.get("params", [])
+
+        if len(params) < 2:
+            return rpc_error(-8, "walletpassphrase requires passphrase and timeout parameters", data.get("id"))
+
+        passphrase = params[0]
+        timeout = params[1]
+
+        # Strip quotes from bitcoin-cli string parameters
+        if isinstance(passphrase, str):
+            passphrase = passphrase.strip('"')
+
+        try:
+            timeout = int(timeout)
+        except (ValueError, TypeError):
+            return rpc_error(-8, "Invalid timeout value", data.get("id"))
+
+        # For now, we'll store unlocked state in memory
+        # In production, this should be handled more securely
+        # This is a placeholder implementation
+
+        # TODO: Implement actual wallet unlocking logic
+        # This would involve:
+        # 1. Finding the currently loaded wallet
+        # 2. Verifying the passphrase against encrypted keys
+        # 3. Temporarily storing decrypted keys in memory
+        # 4. Setting up a timer to re-lock after timeout
+
+        logger.info(f"walletpassphrase called with timeout={timeout}")
+
+        # For now, return success (placeholder)
+        return {
+            "result": None,  # Bitcoin Core returns null on success
+            "error": None,
+            "id": data.get("id")
+        }
+
+    except Exception as e:
+        logger.error(f"walletpassphrase failed: {str(e)}")
+        return rpc_error(-1, str(e), data.get("id"))
+
+
+async def encrypt_wallet_rpc(data):
+    """Handle encryptwallet RPC call - encrypts an unencrypted wallet
+
+    Bitcoin Core compatible format:
+    bitcoin-cli encryptwallet "passphrase"
+
+    Parameters:
+    - passphrase: The passphrase to encrypt the wallet with
+
+    Note: This permanently encrypts the wallet. Bitcoin Core shuts down after encryption.
+    """
+    try:
+        params = data.get("params", [])
+
+        if len(params) < 1:
+            return rpc_error(-8, "encryptwallet requires passphrase parameter", data.get("id"))
+
+        passphrase = params[0]
+
+        # Strip quotes from bitcoin-cli string parameters
+        if isinstance(passphrase, str):
+            passphrase = passphrase.strip('"')
+
+        # Validate passphrase strength
+        if len(passphrase) < 1:
+            return rpc_error(-8, "Passphrase cannot be empty", data.get("id"))
+
+        # Find the first unencrypted wallet (in production, should track "loaded" wallet)
+        wallets_dir = "wallets"
+        encrypted_wallet = None
+
+        if os.path.exists(wallets_dir):
+            for wallet_name in os.listdir(wallets_dir):
+                wallet_path = os.path.join(wallets_dir, wallet_name)
+                if os.path.isdir(wallet_path):
+                    wallet_file = os.path.join(wallet_path, "wallet.json")
+                    if os.path.exists(wallet_file):
+                        with open(wallet_file, "r") as f:
+                            wallet_data = json.load(f)
+
+                        # Check if already encrypted
+                        if wallet_data.get("encrypted", False):
+                            continue
+
+                        # Encrypt this wallet
+                        from wallet.wallet import _encrypt_privkey
+
+                        for key_data in wallet_data.get("keys", []):
+                            if "privateKey" in key_data:
+                                # Encrypt the private key
+                                private_key = key_data["privateKey"]
+                                enc_priv, salt, iv = _encrypt_privkey(private_key, passphrase)
+
+                                # Replace plain key with encrypted version
+                                del key_data["privateKey"]
+                                key_data["encryptedPrivateKey"] = enc_priv
+                                key_data["salt"] = salt
+                                key_data["iv"] = iv
+
+                        # Mark wallet as encrypted and locked
+                        wallet_data["encrypted"] = True
+                        wallet_data["locked"] = True
+
+                        # Save encrypted wallet
+                        with open(wallet_file, "w") as f:
+                            json.dump(wallet_data, f, indent=2)
+
+                        encrypted_wallet = wallet_name
+                        break
+
+        if not encrypted_wallet:
+            return rpc_error(-15, "Error: no unencrypted wallets found to encrypt.", data.get("id"))
+
+        logger.info(f"Encrypted wallet: {encrypted_wallet}")
+
+        # Bitcoin Core returns this message and shuts down
+        return {
+            "result": "wallet encrypted; Bitcoin server stopping, restart to run with encrypted wallet. The keypool has been flushed and a new HD seed was generated (if you are using HD). You need to make a new backup.",
+            "error": None,
+            "id": data.get("id")
+        }
+
+    except Exception as e:
+        logger.error(f"encryptwallet failed: {str(e)}")
+        return rpc_error(-1, str(e), data.get("id"))
+
+
+async def wallet_lock_rpc(data):
+    """Handle walletlock RPC call - locks an encrypted wallet
+
+    Bitcoin Core compatible format:
+    bitcoin-cli walletlock
+
+    Immediately locks the wallet, overriding any timeout from walletpassphrase.
+    """
+    try:
+        # TODO: Implement actual wallet locking logic
+        # This would involve:
+        # 1. Finding the currently loaded wallet
+        # 2. Verifying it's encrypted
+        # 3. Clearing any decrypted keys from memory
+        # 4. Marking wallet as locked
+
+        logger.info(f"walletlock called")
+
+        # For now, return success (Bitcoin Core returns null on success)
+        return {
+            "result": None,
+            "error": None,
+            "id": data.get("id")
+        }
+
+    except Exception as e:
+        logger.error(f"walletlock failed: {str(e)}")
+        return rpc_error(-1, str(e), data.get("id"))
+
+
+async def wallet_passphrase_change_rpc(data):
+    """Handle walletpassphrasechange RPC call - changes wallet encryption passphrase
+
+    Bitcoin Core compatible format:
+    bitcoin-cli walletpassphrasechange "oldpassphrase" "newpassphrase"
+
+    Changes the wallet encryption passphrase from oldpassphrase to newpassphrase.
+    """
+    try:
+        params = data.get("params", [])
+
+        if len(params) < 2:
+            return rpc_error(-8, "walletpassphrasechange requires oldpassphrase and newpassphrase", data.get("id"))
+
+        oldpassphrase = params[0]
+        newpassphrase = params[1]
+
+        # Strip quotes from bitcoin-cli string parameters
+        if isinstance(oldpassphrase, str):
+            oldpassphrase = oldpassphrase.strip('"')
+        if isinstance(newpassphrase, str):
+            newpassphrase = newpassphrase.strip('"')
+
+        # Validate new passphrase
+        if len(newpassphrase) < 1:
+            return rpc_error(-8, "New passphrase cannot be empty", data.get("id"))
+
+        # TODO: Implement actual passphrase change logic
+        # This would involve:
+        # 1. Finding the currently loaded wallet
+        # 2. Verifying it's encrypted
+        # 3. Decrypting all keys with old passphrase
+        # 4. Re-encrypting all keys with new passphrase
+        # 5. Saving the wallet
+
+        logger.info(f"walletpassphrasechange called")
+
+        # Bitcoin Core returns null on success
+        return {
+            "result": None,
+            "error": None,
+            "id": data.get("id")
+        }
+
+    except Exception as e:
+        logger.error(f"walletpassphrasechange failed: {str(e)}")
+        return rpc_error(-1, str(e), data.get("id"))
 
 

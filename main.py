@@ -2,6 +2,7 @@
 
 import asyncio
 import argparse
+import os
 import uvicorn
 from web.web import app
 from rpc.rpc import rpc_app
@@ -93,6 +94,10 @@ if __name__ == "__main__":
                         help='Enable websocket transaction broadcasting (optional for validators, mandatory for bootstrap)')
     
     args = parser.parse_args()
+    
+    # Check environment variable for broadcast_transactions
+    if os.getenv('BROADCAST_TRANSACTIONS', '').lower() == 'true':
+        args.broadcast_transactions = True
     
     # Make transaction broadcasting mandatory for bootstrap nodes
     if args.bootstrap:

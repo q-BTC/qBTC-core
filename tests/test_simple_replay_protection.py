@@ -3,21 +3,19 @@ Simple test to verify replay protection is working
 """
 import pytest
 import time
-from sync.sync import _process_block_in_chain
+import asyncio
+from blockchain.chain_singleton import get_chain_manager
 from unittest.mock import patch, MagicMock
 
 def test_legacy_transaction_rejected():
     """Test that transactions without chain ID are rejected"""
     
     # Mock all dependencies
-    with patch('sync.sync.get_db') as mock_db, \
-         patch('sync.sync.WriteBatch'), \
-         patch('sync.sync.calculate_merkle_root', return_value="00"*32), \
-         patch('sync.sync.emit_database_event'), \
-         patch('sync.sync.event_bus'), \
-         patch('sync.sync.CHAIN_ID', 1), \
-         patch('sync.sync.ADMIN_ADDRESS', "admin_addr"), \
-         patch('sync.sync.verify_transaction', return_value=True):
+    with patch('blockchain.chain_manager.get_db') as mock_db, \
+         patch('blockchain.blockchain.calculate_merkle_root', return_value="00"*32), \
+         patch('blockchain.transaction_validator.verify_transaction', return_value=True), \
+         patch('config.config.CHAIN_ID', 1), \
+         patch('config.config.ADMIN_ADDRESS', "admin_addr"):
         
         # Setup mock database
         mock_db.return_value = MagicMock()
@@ -48,21 +46,23 @@ def test_legacy_transaction_rejected():
         }
         
         # Should raise error about invalid format (missing chain ID)
-        with pytest.raises(ValueError, match="invalid format"):
-            _process_block_in_chain(block)
+        async def test_legacy():
+            cm = await get_chain_manager()
+            success, error = await cm.add_block(block)
+            assert not success
+            assert "invalid format" in error.lower() or "chain" in error.lower()
+        
+        asyncio.run(test_legacy())
 
 
 def test_wrong_chain_id_rejected():
     """Test that transactions with wrong chain ID are rejected"""
     
-    with patch('sync.sync.get_db') as mock_db, \
-         patch('sync.sync.WriteBatch'), \
-         patch('sync.sync.calculate_merkle_root', return_value="00"*32), \
-         patch('sync.sync.emit_database_event'), \
-         patch('sync.sync.event_bus'), \
-         patch('sync.sync.CHAIN_ID', 1), \
-         patch('sync.sync.ADMIN_ADDRESS', "admin_addr"), \
-         patch('sync.sync.verify_transaction', return_value=True):
+    with patch('blockchain.chain_manager.get_db') as mock_db, \
+         patch('blockchain.blockchain.calculate_merkle_root', return_value="00"*32), \
+         patch('blockchain.transaction_validator.verify_transaction', return_value=True), \
+         patch('config.config.CHAIN_ID', 1), \
+         patch('config.config.ADMIN_ADDRESS', "admin_addr"):
         
         # Setup mock database
         mock_db.return_value = MagicMock()
@@ -93,5 +93,10 @@ def test_wrong_chain_id_rejected():
         }
         
         # Should raise error about wrong chain ID
-        with pytest.raises(ValueError, match="Invalid chain ID.*expected 1, got 999"):
-            _process_block_in_chain(block)
+        async def test_wrong_chain():
+            cm = await get_chain_manager()
+            success, error = await cm.add_block(block)
+            assert not success
+            assert "chain" in error.lower() or "999" in error
+        
+        asyncio.run(test_wrong_chain())

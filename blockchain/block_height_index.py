@@ -61,8 +61,12 @@ class BlockHeightIndex:
     
     def add_block_to_index(self, height: int, block_hash: str):
         """Add a block to the height index"""
+        from rocksdict import WriteBatch
+        
         height_key = f"height:{height:08d}".encode()
-        self.db.put(height_key, block_hash.encode())
+        batch = WriteBatch()
+        batch.put(height_key, block_hash.encode())
+        self.db.write(batch)
         
         # Add to cache
         self._add_to_cache(height, block_hash)
@@ -78,9 +82,13 @@ class BlockHeightIndex:
     
     def remove_block_from_index(self, height: int):
         """Remove a block from the height index (used during reorgs)"""
+        from rocksdict import WriteBatch
+        
         height_key = f"height:{height:08d}".encode()
         if height_key in self.db:
-            self.db.delete(height_key)
+            batch = WriteBatch()
+            batch.delete(height_key)
+            self.db.write(batch)
             
         # Remove from cache
         if height in self._memory_cache:
@@ -116,11 +124,17 @@ class BlockHeightIndex:
             try:
                 cached_index = await self.redis_cache.get_height_index()
                 if cached_index:
-                    # Restore index to database
+                    from rocksdict import WriteBatch
+                    
+                    # Restore index to database atomically
+                    batch = WriteBatch()
                     for height, block_hash in cached_index.items():
                         height_key = f"height:{height:08d}".encode()
-                        self.db.put(height_key, block_hash.encode())
+                        batch.put(height_key, block_hash.encode())
                         self._add_to_cache(height, block_hash)
+                    
+                    # Write all updates atomically
+                    self.db.write(batch)
                     
                     elapsed = time.time() - start_time
                     logger.info(f"Block height index restored from Redis cache in {elapsed:.2f}s with {len(cached_index)} blocks")
@@ -130,8 +144,11 @@ class BlockHeightIndex:
         
         # Build index from database
         logger.info("Building height index from database (this may take a while)...")
+        from rocksdict import WriteBatch
+        
         count = 0
         height_index = {}
+        batch = WriteBatch()
         
         for key, value in self.db.items():
             if key.startswith(b"block:"):
@@ -140,12 +157,21 @@ class BlockHeightIndex:
                 block_hash = block_data.get("block_hash")
                 
                 if height is not None and block_hash:
-                    self.add_block_to_index(height, block_hash)
+                    height_key = f"height:{height:08d}".encode()
+                    batch.put(height_key, block_hash.encode())
+                    self._add_to_cache(height, block_hash)
                     height_index[height] = block_hash
                     count += 1
                     
+                    # Write batch every 1000 blocks to avoid memory issues
                     if count % 1000 == 0:
+                        self.db.write(batch)
+                        batch = WriteBatch()  # Start new batch
                         logger.info(f"Indexed {count} blocks...")
+        
+        # Write any remaining entries
+        if count % 1000 != 0:
+            self.db.write(batch)
         
         # Cache the height index to Redis
         if self.redis_cache and height_index:

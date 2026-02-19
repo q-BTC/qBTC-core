@@ -81,8 +81,8 @@ class TransactionValidator:
             return False
         
         first_input = inputs[0]
-        # Check for coinbase pattern: txid or prev_txid is all zeros
-        txid = first_input.get("txid") or first_input.get("prev_txid", "")
+        # Check for coinbase pattern: txid is all zeros
+        txid = first_input.get("txid", "")
         return txid == "0" * 64
     
     def _validate_transaction(self, tx: dict, height: int, 
@@ -135,7 +135,14 @@ class TransactionValidator:
             # Parse and validate message string
             parts = msg_str.split(":")
             
-            # MANDATORY: All transactions must have exactly 5 parts including chain ID
+            # Check if this is a coinbase transaction (special msg_str format)
+            if len(parts) == 5 and parts[0] == "coinbase":
+                # Coinbase format: "coinbase:miner_address:0:0:chain_id"
+                from_, to_, amount_str, time_str, tx_chain_id = "coinbase", parts[1], parts[2], parts[3], parts[4]
+                # Skip further validation for coinbase
+                return True, None, Decimal("0")
+            
+            # MANDATORY: All non-coinbase transactions must have exactly 5 parts including chain ID
             if len(parts) != 5:
                 return False, f"Transaction {txid} invalid format - must have sender:receiver:amount:timestamp:chain_id", Decimal("0")
             
@@ -260,13 +267,13 @@ class TransactionValidator:
         
         # Check sufficient balance (skip for genesis block initial distribution)
         if height > 1 and grand_total_required > total_available:
-            return False, f"Insufficient balance in tx {txid}: available {total_available} < required {grand_total_required}", Decimal("0")
+            return False, f"Insufficient balance in tx {txid}: available {str(total_available)} < required {str(grand_total_required)}", Decimal("0")
         
         # Verify exact payment amount
         # For self-transfers, we already set total_to_recipient = total_authorized above
         # so we skip this check for self-transfers
         if height > 1 and not is_self_transfer and total_to_recipient != total_authorized:
-            return False, f"Invalid tx {txid}: authorized amount {total_authorized} != amount sent to recipient {total_to_recipient}", Decimal("0")
+            return False, f"Invalid tx {txid}: authorized amount {str(total_authorized)} != amount sent to recipient {str(total_to_recipient)}", Decimal("0")
         
         # Verify signature (skip only for genesis transaction)
         # All non-genesis, non-coinbase transactions MUST have valid signatures
@@ -282,18 +289,24 @@ class TransactionValidator:
         
         return True, None, tx_fee
     
-    def validate_coinbase_transaction(self, coinbase_tx: dict, height: int, 
+    def validate_coinbase_transaction(self, coinbase_tx: dict, height: int,
                                     total_fees: Decimal) -> Tuple[bool, Optional[str]]:
         """
         Validate coinbase transaction amount against block reward rules.
+        Implements Bitcoin-proportional emission with 50% mining supply.
         Returns (is_valid, error_message)
         """
-        # Calculate block subsidy with halving schedule
-        halvings = height // 210000
+        from config.config import HALVING_INTERVAL, INITIAL_BLOCK_REWARD
+
+        # Calculate block subsidy with Bitcoin-proportional halving schedule
+        # 12,600,000 blocks = 4 years at 10-second blocks
+        halvings = height // HALVING_INTERVAL
         if halvings >= 64:
             block_subsidy = Decimal("0")
         else:
-            block_subsidy = Decimal("50") / (2 ** halvings) * Decimal("100000000")  # In satoshis
+            # Initial reward: 0.4167 qBTC (maintains Bitcoin's emission rate for 50% supply)
+            initial_subsidy = Decimal(str(INITIAL_BLOCK_REWARD)) * Decimal("100000000")  # Convert to satoshis
+            block_subsidy = initial_subsidy / (2 ** halvings)
         
         # Maximum allowed coinbase output
         max_coinbase_amount = block_subsidy + total_fees
@@ -307,9 +320,10 @@ class TransactionValidator:
                 return False, "Invalid amount in coinbase output"
         
         logger.info(f"Validating coinbase at height {height}: output={total_coinbase_output}, "
-                   f"subsidy={block_subsidy}, fees={total_fees}, max={max_coinbase_amount}")
+                   f"subsidy={block_subsidy}, fees={total_fees}, max={max_coinbase_amount}, "
+                   f"halvings={halvings}")
         
         if total_coinbase_output > max_coinbase_amount:
-            return False, f"Coinbase output {total_coinbase_output} exceeds maximum allowed {max_coinbase_amount}"
+            return False, f"Coinbase output {str(total_coinbase_output)} exceeds maximum allowed {str(max_coinbase_amount)}"
         
         return True, None

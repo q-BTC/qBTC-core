@@ -17,7 +17,7 @@ async def startup(args=None):
     try:
         # Initialize database
         from database.database import set_db, get_db
-        db_path = os.environ.get('ROCKSDB_PATH', './ledger.rocksdb')
+        db_path = os.environ.get('ROCKSDB_PATH', '/app/db')
         set_db(db_path)
         db = get_db()
         logger.info(f"Database initialized at {db_path}")
@@ -30,6 +30,7 @@ async def startup(args=None):
         # Initialize blockchain components
         from blockchain.chain_singleton import get_chain_manager
         from blockchain.blockchain import Block, sha256d, calculate_merkle_root
+        from blockchain.block_factory import create_block, create_genesis_block
         from config.config import GENESIS_ADDRESS, ADMIN_ADDRESS
         import time
         
@@ -59,19 +60,40 @@ async def startup(args=None):
                 asyncio.create_task(rebuild_index_async())
             else:
                 logger.info(f"Height index is up to date (indexed: {latest_indexed}, chain: {best_height})")
+            
+            # Check wallet indexes and rebuild if needed
+            logger.info("Checking wallet indexes...")
+            from blockchain.wallet_index import get_wallet_index
+            wallet_index = get_wallet_index()
+            
+            # Quick check: see if we have any wallet indexes at all
+            stats = wallet_index.get_statistics()
+
+            # DO NOT count all transactions - this is O(N)!
+            # The wallet index will be built incrementally as needed
+            if stats["wallet_tx_lists"] == 0:
+                logger.info("No wallet indexes found. Will be built incrementally as transactions arrive.")
+                # DO NOT rebuild! Indexes will be created incrementally
+            else:
+                logger.info(f"Wallet indexes present: {stats['wallet_tx_lists']} wallets indexed")
         
         # Check if database is truly empty (no blocks at all)
         has_any_blocks = False
         try:
             # Quick check for genesis block instead of iterating all keys
             genesis_key = b"block:" + ("0" * 64).encode()
-            if db.get(genesis_key) is not None:
+            logger.info(f"[DEBUG] Checking for genesis key: {genesis_key}")
+            # Check if genesis block actually exists and has data
+            genesis_data = db.get(genesis_key)
+            if genesis_data is not None and genesis_data != b'':
+                logger.info(f"[DEBUG] Genesis key exists with data length: {len(genesis_data)}")
                 has_any_blocks = True
             else:
                 # Only check first few keys as a fallback
                 key_count = 0
                 for key, _ in db.items():
                     if key.startswith(b"block:"):
+                        logger.info(f"[DEBUG] Found block key: {key}")
                         has_any_blocks = True
                         break
                     key_count += 1
@@ -79,7 +101,9 @@ async def startup(args=None):
                         break
         except Exception as e:
             logger.warning(f"Could not check database for existing blocks: {e}")
-            
+
+        logger.info(f"[DEBUG] has_any_blocks={has_any_blocks} after checking database")
+
         if not has_any_blocks:
             # Database is completely empty - decide what to do based on node type
             if args and args.bootstrap:
@@ -87,6 +111,7 @@ async def startup(args=None):
                 logger.info("Bootstrap server starting with empty database - creating genesis block...")
                 
                 # Create genesis transaction (21M coins to admin)
+                # First create transaction without txid
                 genesis_tx = {
                     "version": 1,
                     "inputs": [{
@@ -105,9 +130,14 @@ async def startup(args=None):
                         "msg_str": "",  # No message for genesis
                         "pubkey": "",   # No pubkey for genesis
                         "signature": "" # No signature for genesis
-                    },
-                    "txid": sha256d(f"genesis_tx_{ADMIN_ADDRESS}".encode()).hex()
+                    }
                 }
+                
+                # Calculate txid using same method as chain_manager
+                from blockchain.blockchain import serialize_transaction
+                tx_hex = serialize_transaction(genesis_tx)
+                tx_bytes = bytes.fromhex(tx_hex)
+                genesis_tx["txid"] = sha256d(tx_bytes)[::-1].hex()
                 
                 # Import MAX_TARGET_BITS to ensure genesis uses same difficulty as subsequent blocks
                 from blockchain.difficulty import MAX_TARGET_BITS
@@ -125,19 +155,28 @@ async def startup(args=None):
                 # Genesis block has special all-zeros hash
                 genesis_block_hash = "0" * 64
                 
-                # Genesis block doesn't need PoW
-                genesis_block_data = {
-                    "version": genesis_block.version,
-                    "previous_hash": genesis_block.prev_block_hash,
-                    "merkle_root": genesis_block.merkle_root,
-                    "timestamp": genesis_block.timestamp,
-                    "bits": genesis_block.bits,
-                    "nonce": genesis_block.nonce,
-                    "block_hash": genesis_block_hash,
-                    "height": 0,
-                    "tx_ids": [genesis_tx["txid"]],
-                    "full_transactions": [genesis_tx]
-                }
+                # Genesis block doesn't need PoW - use factory for consistency
+                # Calculate initial difficulty for genesis
+                from blockchain.blockchain import bits_to_target
+                from decimal import Decimal
+                target = bits_to_target(genesis_block.bits)
+                initial_difficulty = Decimal(2**256) / Decimal(target)
+                
+                genesis_block_data = create_block(
+                    version=genesis_block.version,
+                    height=0,
+                    block_hash=genesis_block_hash,
+                    previous_hash=genesis_block.prev_block_hash,
+                    bits=genesis_block.bits,
+                    nonce=genesis_block.nonce,
+                    timestamp=genesis_block.timestamp,
+                    merkle_root=genesis_block.merkle_root,
+                    tx_ids=[genesis_tx["txid"]],
+                    full_transactions=[genesis_tx],
+                    miner_address=None,  # No specific miner for genesis
+                    connected=False,  # Will be connected when it becomes best tip
+                    cumulative_difficulty=str(initial_difficulty)  # Genesis has its own difficulty
+                )
                 
                 # Add genesis block to chain
                 success, error = await cm.add_block(genesis_block_data)
@@ -241,10 +280,16 @@ async def startup(args=None):
                 logger.warning(f"Could not set gossip node in web module: {e}")
             
             logger.info("Gossip server started")
-            
+
             # Reduced wait time - networking can initialize in parallel
             await asyncio.sleep(0.5)
             logger.info("Networking components initialized")
+
+            # Initialize explorer index on startup (incremental only, no rebuild)
+            logger.info("Initializing explorer transaction index...")
+            from blockchain.explorer_index import get_explorer_index
+            explorer_index = get_explorer_index(rebuild=False)  # Don't rebuild on startup!
+            logger.info("Explorer index ready")
         else:
             logger.error("Network configuration required but no args provided")
             raise RuntimeError("Cannot start node without networking configuration")

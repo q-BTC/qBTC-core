@@ -12,6 +12,7 @@ from database.database import get_db, invalidate_height_cache
 from blockchain.blockchain import Block, validate_pow, bits_to_target, sha256d
 from blockchain.difficulty import get_next_bits, validate_block_bits, validate_block_timestamp, MAX_FUTURE_TIME, MAX_TARGET_BITS
 from blockchain.transaction_validator import TransactionValidator
+from blockchain.block_factory import normalize_block, validate_block_structure
 from rocksdict import WriteBatch
 from state.state import mempool_manager
 from blockchain.block_height_index import get_height_index
@@ -39,6 +40,7 @@ class ChainManager:
         self.orphan_timestamps: Dict[str, int] = {}  # hash -> timestamp when added
         self.block_index: Dict[str, dict] = {}  # hash -> block metadata
         self.chain_tips: Set[str] = set()  # Set of chain tip hashes
+        self._check_and_recover_from_incomplete_reorg()
         self.orphan_chains: Dict[str, List[str]] = {}  # tip_hash -> list of block hashes in chain
         self.orphan_roots: Dict[str, str] = {}  # block_hash -> root block hash of orphan chain
         self.MAX_ORPHAN_BLOCKS = 100  # Maximum number of orphan blocks to keep
@@ -52,6 +54,52 @@ class ChainManager:
         # Note: _initialize_index() must be called separately after initialization
         # as it's now an async method. Call await chain_manager.initialize() after creating instance.
     
+    def _check_and_recover_from_incomplete_reorg(self):
+        """Check for and recover from incomplete reorganization on startup"""
+        try:
+            # Check for reorganization marker
+            reorg_marker = self.db.get(b"chain:last_reorg")
+            if reorg_marker:
+                reorg_data = json.loads(reorg_marker.decode())
+                logger.warning(f"Found incomplete reorganization marker: {reorg_data}")
+                
+                # Check if current tip matches expected result
+                current_tip_data = self.db.get(b"chain:best_tip")
+                if current_tip_data:
+                    current_tip = json.loads(current_tip_data.decode())
+                    
+                    # If tip doesn't match the expected reorg result, we may have crashed mid-reorg
+                    if current_tip["hash"] != reorg_data["to_tip"]:
+                        logger.critical(f"CRITICAL: Detected incomplete reorganization! Current tip: {current_tip['hash']}, Expected: {reorg_data['to_tip']}")
+                        
+                        # Verify blockchain consistency
+                        # This is a simplified check - in production, you'd want more comprehensive validation
+                        try:
+                            # Try to validate the current tip
+                            block_key = f"block:{current_tip['hash']}".encode()
+                            block_data = self.db.get(block_key)
+                            if not block_data:
+                                logger.critical(f"Current tip block {current_tip['hash']} not found in database!")
+                                # Attempt to revert to the original tip
+                                if reorg_data.get("from_tip"):
+                                    logger.info(f"Attempting to revert to original tip: {reorg_data['from_tip']}")
+                                    batch = WriteBatch()
+                                    batch.put(b"chain:best_tip", json.dumps({
+                                        "hash": reorg_data["from_tip"],
+                                        "height": reorg_data.get("from_height", 0)
+                                    }).encode())
+                                    self.db.write(batch)
+                        except Exception as e:
+                            logger.error(f"Failed to validate current chain state: {e}")
+                    else:
+                        logger.info("Reorganization appears to have completed successfully")
+                        # Clear the marker atomically
+                        cleanup_batch = WriteBatch()
+                        cleanup_batch.delete(b"chain:last_reorg")
+                        self.db.write(cleanup_batch)
+        except Exception as e:
+            logger.error(f"Error checking for incomplete reorganization: {e}")
+    
     async def initialize(self):
         """Initialize the chain manager - must be called after __init__"""
         await self._initialize_index()
@@ -64,17 +112,39 @@ class ChainManager:
         # Try to load from Redis cache first
         if self.redis_cache:
             try:
-                cached_index = await self.redis_cache.get_chain_index()
+                cached_index = self.redis_cache.get_chain_index()
                 if cached_index and isinstance(cached_index, dict):
                     # Validate cache structure
                     block_index = cached_index.get("block_index", {})
                     chain_tips = cached_index.get("chain_tips", [])
                     
                     if isinstance(block_index, dict) and isinstance(chain_tips, list):
-                        self.block_index = block_index
-                        self.chain_tips = set(chain_tips)
+                        # Clean the cached index - remove blocks that don't exist in database
+                        cleaned_index = {}
+                        for block_hash, block_info in block_index.items():
+                            block_key = f"block:{block_hash}".encode()
+                            if self.db.get(block_key):
+                                cleaned_index[block_hash] = block_info
+                            else:
+                                logger.warning(f"Removing orphaned block {block_hash[:16]}... at height {block_info.get('height', '?')} from index (not in database)")
+
+                        self.block_index = cleaned_index
+                        # Update chain tips based on cleaned index
+                        self._update_chain_tips()
                         elapsed = time.time() - start_time
                         logger.info(f"Chain index loaded from Redis cache in {elapsed:.2f}s with {len(self.block_index)} blocks and {len(self.chain_tips)} tips")
+
+                        # Re-cache the cleaned index
+                        if len(cleaned_index) != len(block_index):
+                            logger.info(f"Re-caching cleaned index (removed {len(block_index) - len(cleaned_index)} orphaned blocks)")
+                            cache_data = {
+                                "block_index": self.block_index,
+                                "chain_tips": list(self.chain_tips)
+                            }
+                            try:
+                                self.redis_cache.set_chain_index(cache_data)
+                            except Exception as e:
+                                logger.warning(f"Failed to re-cache cleaned index: {e}")
                         return
                     else:
                         logger.warning("Invalid cache structure, rebuilding from database")
@@ -85,32 +155,36 @@ class ChainManager:
         logger.info("Building chain index from database (this may take a while)...")
         block_count = 0
         cumulative_difficulties = {}
-        
+
         # Load all blocks into index
         for key, value in self.db.items():
             if key.startswith(b"block:"):
                 block_data = json.loads(value.decode())
                 block_hash = block_data["block_hash"]
-                
+
                 # Try to get cumulative difficulty from block data first
                 if "cumulative_difficulty" in block_data:
                     cumulative_difficulty = Decimal(block_data["cumulative_difficulty"])
+                    # Always add to cumulative_difficulties for caching
+                    cumulative_difficulties[block_hash] = cumulative_difficulty
                 else:
                     # Try Redis cache
                     cached_difficulty = None
                     if self.redis_cache:
                         try:
-                            cached_difficulty = await self.redis_cache.get_cumulative_difficulty(block_hash)
+                            cached_difficulty = self.redis_cache.get_cumulative_difficulty(block_hash)
                         except:
                             pass
-                    
+
                     if cached_difficulty:
                         cumulative_difficulty = Decimal(cached_difficulty)
+                        # Add to cumulative_difficulties for caching
+                        cumulative_difficulties[block_hash] = cumulative_difficulty
                     else:
                         # Fall back to calculating (for old blocks without stored difficulty)
                         cumulative_difficulty = await self._get_cumulative_difficulty(block_hash)
                         cumulative_difficulties[block_hash] = cumulative_difficulty
-                
+
                 self.block_index[block_hash] = {
                     "height": block_data["height"],
                     "previous_hash": block_data["previous_hash"],
@@ -118,7 +192,7 @@ class ChainManager:
                     "bits": block_data["bits"],
                     "cumulative_difficulty": cumulative_difficulty
                 }
-                
+
                 block_count += 1
                 if block_count % 1000 == 0:
                     logger.info(f"Processed {block_count} blocks...")
@@ -134,12 +208,16 @@ class ChainManager:
                     "block_index": self.block_index,
                     "chain_tips": list(self.chain_tips)
                 }
-                await self.redis_cache.set_chain_index(cache_data)
+                self.redis_cache.set_chain_index(cache_data)
                 
-                # Batch cache cumulative difficulties
+                # Cache cumulative difficulties individually
                 if cumulative_difficulties:
-                    await self.redis_cache.batch_set_cumulative_difficulties(cumulative_difficulties)
-                    
+                    logger.info(f"Caching {len(cumulative_difficulties)} cumulative difficulties to Redis")
+                    for block_hash, difficulty in cumulative_difficulties.items():
+                        self.redis_cache.set_cumulative_difficulty(block_hash, difficulty)
+                else:
+                    logger.info("No cumulative difficulties to cache")
+
                 logger.info("Chain index cached to Redis")
             except Exception as e:
                 logger.warning(f"Failed to cache chain index: {e}")
@@ -153,27 +231,106 @@ class ChainManager:
             # Find and set the best chain tip
             best_tip, best_height = await self.get_best_chain_tip()
             if best_tip:
-                self.db.put(tip_key, json.dumps({
+                batch = WriteBatch()
+                batch.put(tip_key, json.dumps({
                     "hash": best_tip,
                     "height": best_height
                 }).encode())
+                self.db.write(batch)
                 logger.info(f"Initialized chain:best_tip to {best_tip} at height {best_height}")
     
-    def _update_chain_tips(self):
-        """Update the set of chain tips"""
-        # Start with all blocks as potential tips
-        potential_tips = set(self.block_index.keys())
-        
-        # Remove any block that is a parent of another block
+    async def _is_block_connected(self, block_hash: str) -> bool:
+        """
+        Check if a block is connected to the genesis block.
+        Returns True if the block has a valid chain back to genesis.
+        """
+        if not block_hash or block_hash == "00" * 32:
+            return False
+
+        # Genesis block itself is always connected
+        if block_hash == "0" * 64:
+            return True
+
+        current = block_hash
+        visited = set()
+
+        while current and current != "00" * 32:
+            # Avoid infinite loops
+            if current in visited:
+                logger.warning(f"Cycle detected in chain at block {current[:16]}...")
+                return False
+            visited.add(current)
+
+            # Check if block exists in index
+            if current not in self.block_index:
+                # Check if it's in the database
+                block_key = f"block:{current}".encode()
+                if not self.db.get(block_key):
+                    logger.debug(f"Block {current[:16]}... not found in chain")
+                    return False
+                # Block exists in DB but not in index - this shouldn't happen
+                logger.warning(f"Block {current[:16]}... in DB but not in index")
+                return False
+
+            # Get parent
+            block_info = self.block_index[current]
+            prev_hash = block_info.get("previous_hash")
+
+            # Check if we reached genesis
+            if prev_hash == "00" * 32:
+                # This block's parent is genesis, so it's connected
+                return True
+
+            # Move to parent
+            current = prev_hash
+
+        # If we exit the loop without finding genesis, it's not connected
+        return False
+
+    def _update_chain_tips(self, pending_block_hash=None):
+        """Update the set of chain tips - only includes blocks that exist in database
+
+        Args:
+            pending_block_hash: Optional hash of a block that's about to be written to DB
+                               This block should be considered as existing for tip calculation
+        """
+        # Build a set of all blocks that have children (these cannot be tips)
+        # This is O(n) instead of O(n²)
+        blocks_with_children = set()
+
+        # First pass: find all blocks that are parents of other blocks
         for block_hash, block_info in self.block_index.items():
-            prev_hash = block_info["previous_hash"]
-            # Don't remove genesis (all zeros) from tips
-            if prev_hash in potential_tips and prev_hash != "0" * 64:
-                potential_tips.discard(prev_hash)
-        
+            # Check if this block exists in database or is pending
+            if block_hash == pending_block_hash:
+                # This block is about to be written, consider it as existing
+                prev_hash = block_info.get("previous_hash")
+                if prev_hash and prev_hash != "0" * 64:
+                    blocks_with_children.add(prev_hash)
+            else:
+                block_key = f"block:{block_hash}".encode()
+                if self.db.get(block_key):
+                    # This block exists, so its parent has a child
+                    prev_hash = block_info.get("previous_hash")
+                    if prev_hash and prev_hash != "0" * 64:
+                        blocks_with_children.add(prev_hash)
+
+        # Second pass: identify tips (blocks that exist but have no children)
+        potential_tips = set()
+
+        for block_hash in self.block_index.keys():
+            # Skip genesis block (it's never a chain tip)
+            if block_hash == "0" * 64:
+                continue
+
+            # Check if block exists in database
+            if block_hash == pending_block_hash or self.db.get(f"block:{block_hash}".encode()):
+                # Block exists and has no children = it's a tip
+                if block_hash not in blocks_with_children:
+                    potential_tips.add(block_hash)
+
         old_tips = self.chain_tips.copy() if hasattr(self, 'chain_tips') else set()
         self.chain_tips = potential_tips
-        
+
         # Log changes in chain tips
         if old_tips != self.chain_tips:
             logger.info(f"Chain tips updated: {len(self.chain_tips)} tips")
@@ -181,7 +338,31 @@ class ChainManager:
                 if tip in self.block_index:
                     info = self.block_index[tip]
                     logger.info(f"  Tip: {tip[:16]}... height={info['height']} difficulty={info.get('cumulative_difficulty', 'unknown')}")
-    
+
+    def _update_chain_tips_incremental(self, new_block_hash, parent_hash):
+        """Incrementally update chain tips when adding a single new block.
+        This is O(1) instead of O(n) for the full recalculation.
+
+        Args:
+            new_block_hash: The hash of the newly added block
+            parent_hash: The parent hash of the new block
+        """
+        if not hasattr(self, 'chain_tips'):
+            self.chain_tips = set()
+
+        # The new block becomes a tip
+        self.chain_tips.add(new_block_hash)
+
+        # Its parent is no longer a tip (if it was one)
+        if parent_hash in self.chain_tips and parent_hash != "0" * 64:
+            self.chain_tips.discard(parent_hash)
+            logger.debug(f"Removed {parent_hash[:16]}... from tips (now has child {new_block_hash[:16]}...)")
+
+        logger.info(f"Chain tips incrementally updated: {len(self.chain_tips)} tips")
+        if new_block_hash in self.block_index:
+            info = self.block_index[new_block_hash]
+            logger.info(f"  New tip: {new_block_hash[:16]}... height={info['height']}")
+
     async def _get_cumulative_difficulty(self, block_hash: str) -> Decimal:
         """Calculate cumulative difficulty from genesis to this block"""
         # First check if the block itself has stored cumulative difficulty
@@ -228,10 +409,11 @@ class ChainManager:
         # Get parent's cumulative difficulty
         parent_cumulative = Decimal(0)
         
-        if parent_hash and parent_hash != "00" * 32:  # Not genesis
+        if parent_hash:  # If there's a parent (even if it's genesis)
             # First check if parent is in our index
             if parent_hash in self.block_index:
-                parent_cumulative = self.block_index[parent_hash]["cumulative_difficulty"]
+                parent_cumulative = Decimal(str(self.block_index[parent_hash]["cumulative_difficulty"]))
+                logger.debug(f"Found parent {parent_hash[:16]} in index with cumulative difficulty {parent_cumulative}")
             else:
                 # Load parent from database
                 parent_key = f"block:{parent_hash}".encode()
@@ -269,44 +451,59 @@ class ChainManager:
         # Try Redis cache first
         if self.redis_cache:
             try:
-                cached_best = await self.redis_cache.get_best_chain_info()
+                cached_best = self.redis_cache.get_best_chain_info()
                 if cached_best:
-                    return cached_best["block_hash"], cached_best["height"]
+                    # Verify the cached tip is actually connected
+                    if await self._is_block_connected(cached_best["block_hash"]):
+                        return cached_best["block_hash"], cached_best["height"]
+                    else:
+                        logger.warning(f"Cached best chain tip {cached_best['block_hash'][:16]}... is not connected!")
             except Exception as e:
                 logger.debug(f"Failed to get best chain from Redis: {e}")
-        
-        # Calculate best chain tip
+
+        # Calculate best chain tip - only from CONNECTED blocks
         best_tip = None
         best_difficulty = Decimal(0)
         best_height = 0
-        
+
         logger.debug(f"Calculating best chain tip from {len(self.chain_tips)} tips")
-        
+
         for tip_hash in self.chain_tips:
             tip_info = self.block_index.get(tip_hash)
             if not tip_info:
                 logger.warning(f"Tip {tip_hash} not found in block index!")
                 continue
-                
+
+            # Check if this tip is actually connected to genesis
+            if not await self._is_block_connected(tip_hash):
+                logger.debug(f"Tip {tip_hash[:16]}... at height {tip_info['height']} is orphaned, skipping")
+                continue
+
             difficulty = tip_info.get("cumulative_difficulty")
-            logger.debug(f"Tip {tip_hash[:16]}... height={tip_info['height']} difficulty={difficulty}")
-            
+            logger.debug(f"Connected tip {tip_hash[:16]}... height={tip_info['height']} difficulty={difficulty}")
+
+            # Convert difficulty to Decimal if it's a string
+            if difficulty:
+                if isinstance(difficulty, str):
+                    difficulty = Decimal(difficulty)
+
             if difficulty and difficulty > best_difficulty:
                 best_difficulty = difficulty
                 best_tip = tip_hash
                 best_height = tip_info["height"]
-        
+
         if not best_tip:
-            # No tips found, return -1 for empty blockchain
-            logger.warning("No valid chain tips found, returning empty blockchain state")
-            return "00" * 32, -1
+            # No connected tips found, return -1 for empty blockchain
+            # Return empty string to avoid confusion with genesis hash "00" * 32
+            logger.warning("No valid connected chain tips found, returning empty blockchain state")
+            return "", -1
         
         logger.debug(f"Best chain tip: {best_tip[:16]}... at height {best_height} with difficulty {best_difficulty}")
         
         # Cache the result
         if self.redis_cache:
             try:
-                await self.redis_cache.set_best_chain_info({
+                self.redis_cache.set_best_chain_info({
                     "block_hash": best_tip,
                     "height": best_height,
                     "difficulty": str(best_difficulty)
@@ -322,6 +519,32 @@ class ChainManager:
         """Set whether we're in initial sync mode"""
         self.is_syncing = syncing
         logger.info(f"Sync mode set to: {syncing}")
+    
+    def get_best_chain_tip_sync(self) -> Tuple[str, int]:
+        """
+        Synchronous version of get_best_chain_tip for testing
+        Returns (block_hash, height)
+        """
+        # Calculate best chain tip
+        best_tip = None
+        best_difficulty = Decimal(0)
+        best_height = 0
+        
+        for tip_hash in self.chain_tips:
+            tip_info = self.block_index.get(tip_hash)
+            if not tip_info:
+                continue
+                
+            difficulty = tip_info.get("cumulative_difficulty", Decimal(0))
+            if isinstance(difficulty, str):
+                difficulty = Decimal(difficulty)
+            
+            if difficulty > best_difficulty:
+                best_difficulty = difficulty
+                best_tip = tip_hash
+                best_height = tip_info["height"]
+        
+        return best_tip, best_height
     
     async def add_block(self, block_data: dict, pre_validated_batch: WriteBatch = None) -> Tuple[bool, Optional[str]]:
         """
@@ -345,6 +568,17 @@ class ChainManager:
         prev_hash = block_data["previous_hash"]
         height = block_data["height"]
         
+        # Check block size limit (transaction count)
+        from config.config import MAX_TRANSACTIONS_PER_BLOCK
+        tx_count = len(block_data.get("tx_ids", []))
+        if tx_count > 1:  # Only check if block has more than just coinbase
+            # Subtract 1 for coinbase transaction (which is always allowed)
+            non_coinbase_tx_count = tx_count - 1
+            if non_coinbase_tx_count > MAX_TRANSACTIONS_PER_BLOCK:
+                logger.error(f"Block {block_hash} exceeds maximum transaction limit")
+                logger.error(f"Block has {non_coinbase_tx_count} non-coinbase transactions, max allowed: {MAX_TRANSACTIONS_PER_BLOCK}")
+                return False, f"Block exceeds maximum transaction limit: {non_coinbase_tx_count} > {MAX_TRANSACTIONS_PER_BLOCK}"
+        
         # Check if block already exists
         if block_hash in self.block_index:
             return True, None  # Already have this block
@@ -366,6 +600,25 @@ class ChainManager:
         
         # Special handling for genesis block
         is_genesis = block_hash == "0" * 64 and height == 0
+        
+        # Validate block hash matches the actual hash (except for genesis)
+        if not is_genesis:
+            # Calculate the actual block hash using the Block class for consistency
+            block_obj = Block(
+                block_data['version'],
+                block_data['previous_hash'],
+                block_data['merkle_root'],
+                block_data['timestamp'],
+                block_data['bits'],
+                block_data['nonce']
+            )
+            calculated_hash = block_obj.hash()
+            
+            if calculated_hash != block_hash:
+                logger.error(f"[CHAIN_MANAGER] Block hash mismatch!")
+                logger.error(f"[CHAIN_MANAGER] Claimed hash: {block_hash}")
+                logger.error(f"[CHAIN_MANAGER] Calculated hash: {calculated_hash}")
+                return False, f"Invalid block hash: claimed {block_hash}, actual {calculated_hash}"
         
         # Always validate PoW (except for genesis)
         if not is_genesis and not validate_pow(block_obj):
@@ -468,17 +721,74 @@ class ChainManager:
             
             # Validate all non-coinbase transactions
             logger.info(f"About to validate block with {len(block_data.get('full_transactions', []))} full_transactions")
+            
+            # First, validate that all transaction hashes match their claimed txids
+            from blockchain.blockchain import serialize_transaction
+            tx_ids = block_data.get("tx_ids", [])
             for i, tx in enumerate(block_data.get('full_transactions', [])):
-                if tx and 'txid' not in tx:
-                    logger.error(f"[CHAIN_MANAGER] Transaction at index {i} missing txid!")
-                    logger.error(f"[CHAIN_MANAGER] Transaction keys: {list(tx.keys()) if tx else 'None'}")
+                if tx:
+                    if 'txid' not in tx:
+                        logger.error(f"[CHAIN_MANAGER] Transaction at index {i} missing txid!")
+                        logger.error(f"[CHAIN_MANAGER] Transaction keys: {list(tx.keys())}")
+                        return False, "Transaction missing txid"
+                    
+                    claimed_txid = tx['txid']  # Get txid for all transactions
+                    
+                    # Skip hash validation for coinbase transactions 
+                    # Coinbase comes from cpuminer with different hash calculation
+                    if self.validator._is_coinbase_transaction(tx):
+                        logger.info(f"[CHAIN_MANAGER] Skipping hash validation for coinbase transaction")
+                    else:
+                        # Validate the transaction hash matches the claimed txid for regular transactions
+                        try:
+                            tx_hex = serialize_transaction(tx)  # Returns hex string
+                            tx_bytes = bytes.fromhex(tx_hex)  # Convert hex to bytes
+                            calculated_txid = sha256d(tx_bytes)[::-1].hex()  # Hash, reverse bytes, and convert to hex
+                            if calculated_txid != claimed_txid:
+                                logger.error(f"[CHAIN_MANAGER] Transaction hash mismatch! Index: {i}")
+                                logger.error(f"[CHAIN_MANAGER] Claimed: {claimed_txid}, Calculated: {calculated_txid}")
+                                logger.error(f"[CHAIN_MANAGER] Block {block_hash} rejected due to invalid transaction hash")
+                                return False, f"Transaction {i} has invalid hash: claimed {claimed_txid}, actual {calculated_txid}"
+                        except Exception as e:
+                            logger.error(f"[CHAIN_MANAGER] Failed to validate transaction hash: {e}")
+                            return False, f"Failed to validate transaction {i} hash: {e}"
+                    
+                    # Also verify it matches the tx_ids array if present
+                    if i < len(tx_ids) and tx_ids[i] != claimed_txid:
+                        logger.error(f"[CHAIN_MANAGER] Transaction txid doesn't match tx_ids array!")
+                        logger.error(f"[CHAIN_MANAGER] tx.txid: {claimed_txid}, tx_ids[{i}]: {tx_ids[i]}")
+                        return False, f"Transaction {i} txid mismatch with tx_ids array"
+            
+            # Validate merkle root matches the transactions
+            if "merkle_root" in block_data and "tx_ids" in block_data:
+                from blockchain.blockchain import calculate_merkle_root
+                
+                # If we have a pre-calculated merkle root (from submitblock), use it
+                # Otherwise calculate it from tx_ids
+                if "calculated_merkle_root" in block_data:
+                    calculated_merkle = block_data["calculated_merkle_root"]
+                else:
+                    calculated_merkle = calculate_merkle_root(block_data["tx_ids"])
+                    
+                claimed_merkle = block_data["merkle_root"]
+                
+                if calculated_merkle != claimed_merkle:
+                    logger.error(f"[CHAIN_MANAGER] Merkle root mismatch in block {block_hash}!")
+                    logger.error(f"[CHAIN_MANAGER] Claimed merkle: {claimed_merkle}")
+                    logger.error(f"[CHAIN_MANAGER] Calculated merkle: {calculated_merkle}")
+                    logger.error(f"[CHAIN_MANAGER] Transaction IDs: {block_data['tx_ids']}")
+                    return False, f"Invalid merkle root: claimed {claimed_merkle}, actual {calculated_merkle}"
+            else:
+                logger.error(f"[CHAIN_MANAGER] Block {block_hash} missing merkle_root or tx_ids!")
+                return False, "Block missing required merkle_root or tx_ids field"
+            
             is_valid, error_msg, total_fees = self.validator.validate_block_transactions(block_data)
             
             # Reset skip_time_validation after validation
             if self.is_syncing:
                 self.validator.skip_time_validation = False
             if not is_valid:
-                logger.error(f"Block {block_hash} rejected: {error_msg}")
+                logger.error(f"Block {block_hash} rejected: {str(error_msg)}")
                 
                 # Import mempool manager to clean up invalid transactions
                 from state.state import mempool_manager
@@ -498,7 +808,7 @@ class ChainManager:
                     if removed_txids:
                         logger.info(f"[ChainManager] Removed {len(removed_txids)} invalid transactions from mempool after block validation failure")
                 
-                return False, error_msg
+                return False, str(error_msg)
             
             # Find and validate coinbase transaction
             coinbase_tx = None
@@ -512,31 +822,77 @@ class ChainManager:
                     coinbase_tx, height, total_fees
                 )
                 if not is_valid:
-                    logger.error(f"Block {block_hash} rejected: invalid coinbase - {error_msg}")
-                    return False, f"Invalid coinbase transaction: {error_msg}"
+                    logger.error(f"Block {block_hash} rejected: invalid coinbase - {str(error_msg)}")
+                    return False, f"Invalid coinbase transaction: {str(error_msg)}"
         
         # Now that validation has passed and we have the parent, calculate cumulative difficulty
         # We know parent exists because orphan blocks are handled above
         cumulative_difficulty = await self._get_cumulative_difficulty_for_new_block(prev_hash, block_data["bits"])
         
-        # Add cumulative difficulty to block data before storing
+        # Add cumulative difficulty and connected status to block data before storing
         block_data["cumulative_difficulty"] = str(cumulative_difficulty)
+        block_data["connected"] = False  # All new blocks start as disconnected
         
-        # Store the block with cumulative difficulty
+        # Normalize block structure for consistent field ordering
+        block_data = normalize_block(block_data, add_defaults=False)
+        
+        # Store the block with cumulative difficulty and connected status using WriteBatch for atomicity
         block_key = f"block:{block_hash}".encode()
-        if block_key not in self.db:
-            logger.info(f"Storing new block {block_hash} at height {height} with cumulative difficulty {cumulative_difficulty}")
-            self.db.put(block_key, json.dumps(block_data).encode())
-            
+
+        # Special handling for genesis block - always store it
+        if block_hash == "0" * 64 and height == 0:
+            logger.info(f"Storing genesis block with hash {block_hash}")
+            # Always store genesis, don't check if it exists
+            store_block = True
+        else:
+            # For non-genesis blocks, check if they already exist
+            store_block = block_key not in self.db
+
+        logger.info(f"[DEBUG] store_block={store_block} for block {block_hash}")
+
+        # For genesis block and blocks that will become the new tip immediately,
+        # we'll store and connect in one atomic operation
+        is_genesis_becoming_tip = (store_block and block_hash == "0" * 64 and height == 0)
+
+        if store_block and not is_genesis_becoming_tip:
+            # Normal block storage - just store, don't connect yet
+            logger.info(f"Storing new block {block_hash} at height {height} with cumulative difficulty {cumulative_difficulty}, connected=False")
+
+            # Use WriteBatch for atomic storage of block and its transactions
+            batch = WriteBatch()
+            batch.put(block_key, json.dumps(block_data).encode())
+
             # Also store transactions separately for fork blocks
             # This ensures they're available during reorganization
             if "full_transactions" in block_data:
                 for tx in block_data["full_transactions"]:
                     if tx and "txid" in tx:
                         tx_key = f"tx:{tx['txid']}".encode()
-                        if tx_key not in self.db:
-                            self.db.put(tx_key, json.dumps(tx).encode())
-                            logger.debug(f"Stored transaction {tx['txid']} from block {block_hash}")
+                        # Always add to batch - the batch write is atomic
+                        # Don't check if it exists, as that would check the old state
+                        batch.put(tx_key, json.dumps(tx).encode())
+                        logger.debug(f"Storing transaction {tx['txid']} from block {block_hash}")
+
+                        # Update explorer index for non-coinbase transactions
+                        inputs = tx.get("inputs", [])
+                        is_coinbase = len(inputs) == 1 and inputs[0].get("txid", "") == "0" * 64
+                        if not is_coinbase:
+                            from blockchain.explorer_index import get_explorer_index
+                            explorer_index = get_explorer_index()
+                            explorer_index.add_transaction(tx['txid'], tx.get('timestamp', 0), is_coinbase)
+
+            # Write the batch atomically
+            logger.info(f"[DEBUG] About to write batch for block {block_hash}")
+            try:
+                self.db.write(batch)
+                logger.info(f"[DEBUG] Batch write completed for block {block_hash}")
+            except Exception as e:
+                logger.error(f"[DEBUG] Batch write failed for block {block_hash}: {e}")
+                raise
+            logger.debug(f"Block {block_hash} and its transactions stored atomically")
+        elif is_genesis_becoming_tip:
+            # For genesis, we'll store it when we connect it below
+            logger.info(f"Genesis block will be stored and connected atomically")
         
         # Use the cumulative difficulty we already calculated and stored
         # cumulative_difficulty is already calculated above
@@ -555,25 +911,30 @@ class ChainManager:
         # Cache cumulative difficulty to Redis
         if self.redis_cache:
             try:
-                await self.redis_cache.set_cumulative_difficulty(block_hash, cumulative_difficulty)
+                self.redis_cache.set_cumulative_difficulty(block_hash, cumulative_difficulty)
             except Exception as e:
                 logger.debug(f"Failed to cache cumulative difficulty: {e}")
         
         # Check if this creates a new chain tip or extends existing one
-        self._update_chain_tips()
+        # Incrementally update chain tips for the new block
+        # This is much more efficient than recalculating all tips
+        self._update_chain_tips_incremental(block_hash, prev_hash)
         
         # Force recalculation of best chain tip after adding new block
         # Clear any cached best tip to ensure fresh calculation
         if self.redis_cache:
             try:
-                await self.redis_cache.delete_best_chain_info()
+                self.redis_cache.delete_best_chain_info()
             except:
                 pass
         
         # Check if we need to reorganize
         current_tip, current_height = await self.get_best_chain_tip()
         
-        if block_hash == current_tip:
+        # Special case for genesis block: if blockchain is empty (height -1) and this is height 0
+        is_genesis_becoming_tip = (current_height == -1 and height == 0)
+        
+        if block_hash == current_tip or is_genesis_becoming_tip:
             # This block became the new best tip
             logger.info(f"New best chain tip: {block_hash} at height {height}")
             
@@ -581,7 +942,7 @@ class ChainManager:
             if self.redis_cache:
                 try:
                     # Update chain index entry for new block
-                    await self.redis_cache.update_chain_index_entry(block_hash, {
+                    self.redis_cache.update_chain_index_entry(block_hash, {
                         "height": height,
                         "previous_hash": block_data["previous_hash"],
                         "timestamp": block_data["timestamp"],
@@ -591,10 +952,10 @@ class ChainManager:
                     })
                     
                     # Update height index
-                    await self.redis_cache.update_height_index_entry(height, block_hash)
+                    self.redis_cache.update_height_index_entry(height, block_hash)
                     
                     # Update best chain info
-                    await self.redis_cache.set_best_chain_info({
+                    self.redis_cache.set_best_chain_info({
                         "block_hash": block_hash,
                         "height": height,
                         "timestamp": block_data["timestamp"],
@@ -613,15 +974,32 @@ class ChainManager:
             else:
                 # Normal path: create our own batch
                 batch = WriteBatch()
+
+                # If this is genesis becoming tip and we haven't stored it yet,
+                # store it in the same batch as connection
+                if is_genesis_becoming_tip:
+                    logger.info(f"Storing genesis block {block_hash} atomically with connection")
+                    batch.put(block_key, json.dumps(block_data).encode())
+
+                    # Also store genesis transaction
+                    if "full_transactions" in block_data:
+                        for tx in block_data["full_transactions"]:
+                            if tx and "txid" in tx:
+                                tx_key = f"tx:{tx['txid']}".encode()
+                                batch.put(tx_key, json.dumps(tx).encode())
+                                logger.info(f"Storing genesis transaction {tx['txid']}")
+
                 self._connect_block(block_data, batch)
                 self.db.write(batch)
             
-            # Update chain:best_tip in database
+            # Update chain:best_tip in database atomically
             tip_key = b"chain:best_tip"
-            self.db.put(tip_key, json.dumps({
+            tip_batch = WriteBatch()
+            tip_batch.put(tip_key, json.dumps({
                 "hash": block_hash,
                 "height": height
             }).encode())
+            self.db.write(tip_batch)
             
             # CRITICAL: Invalidate height cache so next call gets fresh data
             invalidate_height_cache()
@@ -901,8 +1279,12 @@ class ChainManager:
             if not block_data:
                 # Not in orphans, check if it's in main chain
                 if current_hash in self.block_index:
-                    # Found connection point!
-                    return block_data.get("height", min_height)
+                    # Found connection point! Get height from main chain
+                    main_block_key = f"block:{current_hash}".encode()
+                    main_block_data = self.db.get(main_block_key)
+                    if main_block_data:
+                        main_block = json.loads(main_block_data.decode())
+                        return main_block.get("height", min_height)
                 break
             
             # Update minimum height seen
@@ -953,17 +1335,21 @@ class ChainManager:
             height -= 1
         
         # Actually disconnect the blocks
-        with WriteBatch(db=self.db) as batch:
-            for block_hash, block_data in blocks_to_disconnect:
-                logger.info(f"[REWIND] Disconnecting block {block_hash} at height {block_data.get('height')}")
-                self._disconnect_block(block_data, batch)
-            
-            # Update best block to the new tip
-            new_tip_hash = blocks_to_disconnect[-1][1].get("previous_hash")
-            if new_tip_hash:
-                batch.put(b"best_block_hash", new_tip_hash.encode())
-                self.current_tip = new_tip_hash
-                logger.warning(f"[REWIND] New chain tip: {new_tip_hash} at height {target_height}")
+        batch = WriteBatch()
+        utxo_backups = {}  # Track UTXO states for potential rollback
+        for block_hash, block_data in blocks_to_disconnect:
+            logger.info(f"[REWIND] Disconnecting block {block_hash} at height {block_data.get('height')}")
+            self._disconnect_block(block_hash, batch, utxo_backups)
+        
+        # Update best block to the new tip
+        new_tip_hash = blocks_to_disconnect[-1][1].get("previous_hash")
+        if new_tip_hash:
+            batch.put(b"best_block_hash", new_tip_hash.encode())
+            self.current_tip = new_tip_hash
+            logger.warning(f"[REWIND] New chain tip: {new_tip_hash} at height {target_height}")
+        
+        # Write the batch atomically
+        self.db.write(batch)
         
         # Invalidate height cache
         invalidate_height_cache()
@@ -1117,6 +1503,19 @@ class ChainManager:
             "block_states": {}
         }
         
+        # Write a reorganization marker BEFORE starting (separate write for recovery)
+        reorg_marker_key = b"chain:last_reorg"
+        marker_batch = WriteBatch()
+        marker_batch.put(reorg_marker_key, json.dumps({
+            "from_tip": current_tip,
+            "to_tip": new_tip_hash,
+            "timestamp": time.time(),
+            "blocks_to_disconnect": len(blocks_to_disconnect),
+            "blocks_to_connect": len(blocks_to_connect),
+            "status": "in_progress"
+        }).encode())
+        self.db.write(marker_batch)
+        
         # Start database transaction
         batch = WriteBatch()
         
@@ -1130,22 +1529,9 @@ class ChainManager:
                 self._disconnect_block(block_hash, batch, backup_state["utxo_backups"])
             
             # Phase 2: Validate and connect blocks from new chain
-            # First, collect all UTXOs that will be spent in new chain
+            # DO NOT pre-collect spent UTXOs - this causes issues with validation
+            # Each block's validation will handle its own spent UTXO tracking
             new_chain_spent_utxos = set()
-            for block_hash in blocks_to_connect:
-                block_key = f"block:{block_hash}".encode()
-                block_data = self.db.get(block_key)
-                if not block_data:
-                    raise ValueError(f"Block {block_hash} not found during reorg")
-                
-                block_dict = json.loads(block_data.decode())
-                
-                # Collect spent UTXOs from this block's transactions
-                for tx in self._get_block_transactions(block_dict):
-                    for inp in tx.get("inputs", []):
-                        if "txid" in inp and inp["txid"] != "00" * 32:  # Skip coinbase
-                            utxo_key = f"{inp['txid']}:{inp.get('utxo_index', 0)}"
-                            new_chain_spent_utxos.add(utxo_key)
             
             # Now connect blocks with UTXO tracking
             for block_hash in blocks_to_connect:
@@ -1175,15 +1561,29 @@ class ChainManager:
                 # Connect with new chain UTXO tracking
                 self._connect_block_safe(block_dict, batch, new_chain_spent_utxos)
             
-            # Phase 3: Commit the reorganization atomically
-            self.db.write(batch)
-            
-            # Update chain state
+            # Phase 3: Update chain state in the same batch for atomicity
             key = b"chain:best_tip"
-            self.db.put(key, json.dumps({
+            batch.put(key, json.dumps({
                 "hash": new_tip_hash,
                 "height": self.block_index[new_tip_hash]["height"]
             }).encode())
+            
+            # Commit the reorganization atomically - ALL changes in one write
+            self.db.write(batch)
+            
+            # Update the reorganization marker to completed status (separate write is OK here)
+            # If we crash after batch write but before this, recovery will see the reorg
+            # completed successfully by checking if tip matches expected result
+            completion_batch = WriteBatch()
+            completion_batch.put(reorg_marker_key, json.dumps({
+                "from_tip": current_tip,
+                "to_tip": new_tip_hash,
+                "timestamp": time.time(),
+                "blocks_disconnected": len(blocks_to_disconnect),
+                "blocks_connected": len(blocks_to_connect),
+                "status": "completed"
+            }).encode())
+            self.db.write(completion_batch)
             
             logger.info(f"Chain reorganization complete. New tip: {new_tip_hash}")
             
@@ -1192,20 +1592,20 @@ class ChainManager:
                 try:
                     # Update cache for disconnected blocks
                     for block_hash in blocks_to_disconnect:
-                        await self.redis_cache.remove_chain_index_entry(block_hash)
+                        self.redis_cache.remove_chain_index_entry(block_hash)
                         if block_hash in self.block_index:
                             height = self.block_index[block_hash]["height"]
-                            await self.redis_cache.remove_height_index_entry(height)
+                            self.redis_cache.remove_height_index_entry(height)
                     
                     # Update cache for connected blocks
                     for block_hash in blocks_to_connect:
                         if block_hash in self.block_index:
                             block_info = self.block_index[block_hash]
-                            await self.redis_cache.update_chain_index_entry(block_hash, block_info)
-                            await self.redis_cache.update_height_index_entry(block_info["height"], block_hash)
+                            self.redis_cache.update_chain_index_entry(block_hash, block_info)
+                            self.redis_cache.update_height_index_entry(block_info["height"], block_hash)
                     
                     # Update best chain info
-                    await self.redis_cache.set_best_chain_info({
+                    self.redis_cache.set_best_chain_info({
                         "block_hash": new_tip_hash,
                         "height": self.block_index[new_tip_hash]["height"],
                         "timestamp": self.block_index[new_tip_hash]["timestamp"],
@@ -1220,6 +1620,25 @@ class ChainManager:
             logger.error(f"Reorganization failed: {e}")
             # Rollback is automatic since we haven't committed the batch
             logger.info("Reorganization rolled back due to error")
+            
+            # Verify chain state is still consistent
+            try:
+                current_best = self.db.get(b"chain:best_tip")
+                if current_best:
+                    best_data = json.loads(current_best.decode())
+                    if best_data["hash"] != current_tip:
+                        logger.critical(f"CRITICAL: Chain tip inconsistent after failed reorg! Expected {current_tip}, got {best_data['hash']}")
+                        # Attempt to restore original tip
+                        restore_batch = WriteBatch()
+                        restore_batch.put(b"chain:best_tip", json.dumps({
+                            "hash": current_tip,
+                            "height": backup_state["height"]
+                        }).encode())
+                        self.db.write(restore_batch)
+                        logger.info(f"Restored original chain tip: {current_tip}")
+            except Exception as verify_error:
+                logger.critical(f"Failed to verify chain state after reorg failure: {verify_error}")
+            
             return False
     
     def _find_common_ancestor(self, hash1: str, hash2: str) -> Optional[str]:
@@ -1227,20 +1646,27 @@ class ChainManager:
         # Get ancestors of both blocks
         ancestors1 = set()
         current = hash1
-        while current and current != "00" * 32:
+        while current:
             ancestors1.add(current)
             if current in self.block_index:
                 current = self.block_index[current]["previous_hash"]
+                # Include genesis block as a potential ancestor
+                if current == "00" * 32:
+                    ancestors1.add(current)
+                    break
             else:
                 break
         
         # Walk up hash2's chain until we find common ancestor
         current = hash2
-        while current and current != "00" * 32:
+        while current:
             if current in ancestors1:
                 return current
             if current in self.block_index:
                 current = self.block_index[current]["previous_hash"]
+                # Check genesis as common ancestor
+                if current == "00" * 32 and current in ancestors1:
+                    return current
             else:
                 break
         
@@ -1282,17 +1708,20 @@ class ChainManager:
     def _disconnect_block(self, block_hash: str, batch: WriteBatch, utxo_backups: Dict[str, bytes]):
         """Disconnect a block from the active chain (revert its effects)"""
         logger.info(f"Disconnecting block {block_hash}")
-        
+
         # Load block data
         block_key = f"block:{block_hash}".encode()
         block_data = json.loads(self.db.get(block_key).decode())
-        
+
         # Get full transactions to re-add to mempool
         full_transactions = self._get_block_transactions(block_data)
-        
+
         # Revert all transactions in this block
         for txid in block_data.get("tx_ids", []):
             self._revert_transaction(txid, batch, utxo_backups)
+            # Remove tx_block index entry
+            tx_block_key = f"tx_block:{txid}".encode()
+            batch.delete(tx_block_key)
         
         # Re-add non-coinbase transactions back to mempool
         # (they might be valid again after reorg)
@@ -1312,6 +1741,8 @@ class ChainManager:
         
         # Mark block as disconnected (don't delete - might reconnect later)
         block_data["connected"] = False
+        # Normalize before storing
+        block_data = normalize_block(block_data, add_defaults=False)
         batch.put(block_key, json.dumps(block_data).encode())
         
         # Remove from height index during disconnection
@@ -1321,10 +1752,10 @@ class ChainManager:
     def _connect_block(self, block_data: dict, batch: WriteBatch):
         """Connect a block to the active chain (apply its effects)"""
         logger.info(f"Connecting block {block_data['block_hash']} at height {block_data['height']}")
-        
+
         # Get full transactions - either from block_data or by loading from DB
         full_transactions = block_data.get("full_transactions", [])
-        
+
         # If full_transactions is empty but we have tx_ids, load the transactions
         if not full_transactions and "tx_ids" in block_data:
             logger.info(f"Loading {len(block_data['tx_ids'])} transactions for block {block_data['block_hash']}")
@@ -1337,6 +1768,13 @@ class ChainManager:
                     full_transactions.append(tx)
                 else:
                     logger.warning(f"Transaction {txid} not found in database during block connection")
+
+        # Create tx_block index for O(1) lookups
+        block_height = block_data.get('height', 0)
+        block_hash = block_data.get('block_hash', '')
+        for txid in block_data.get("tx_ids", []):
+            tx_block_key = f"tx_block:{txid}".encode()
+            batch.put(tx_block_key, json.dumps({"height": block_height, "hash": block_hash}).encode())
         
         # Process all transactions in the block
         for tx in full_transactions:
@@ -1367,6 +1805,8 @@ class ChainManager:
         
         # Mark block as connected
         block_data["connected"] = True
+        # Normalize before storing
+        block_data = normalize_block(block_data, add_defaults=False)
         block_key = f"block:{block_data['block_hash']}".encode()
         batch.put(block_key, json.dumps(block_data).encode())
         
@@ -1380,9 +1820,16 @@ class ChainManager:
         Ensures UTXOs aren't restored if they're spent elsewhere in new chain
         """
         logger.info(f"Safely connecting block {block_data['block_hash']} at height {block_data['height']}")
-        
+
         # Get full transactions
         full_transactions = self._get_block_transactions(block_data)
+
+        # Create tx_block index for O(1) lookups
+        block_height = block_data.get('height', 0)
+        block_hash = block_data.get('block_hash', '')
+        for txid in block_data.get("tx_ids", []):
+            tx_block_key = f"tx_block:{txid}".encode()
+            batch.put(tx_block_key, json.dumps({"height": block_height, "hash": block_hash}).encode())
         
         # Track UTXOs spent within this block to prevent double-spending within same block
         block_spent_utxos = set()
@@ -1464,12 +1911,18 @@ class ChainManager:
         
         # Mark block as connected
         block_data["connected"] = True
+        # Normalize before storing
+        block_data = normalize_block(block_data, add_defaults=False)
         block_key = f"block:{block_data['block_hash']}".encode()
         batch.put(block_key, json.dumps(block_data).encode())
         
         # Update the height index
         height_index = get_height_index()
         height_index.add_block_to_index(block_data["height"], block_data["block_hash"])
+        
+        # Update new_chain_spent_utxos with UTXOs spent in this block
+        # This tracks all UTXOs spent across the entire new chain
+        new_chain_spent_utxos.update(block_spent_utxos)
     
     def _revert_transaction(self, txid: str, batch: WriteBatch, utxo_backups: Dict[str, bytes] = None):
         """Revert a transaction's effects on the UTXO set"""
@@ -1499,19 +1952,14 @@ class ChainManager:
                     
                     utxo = json.loads(current_utxo_data.decode())
                     utxo["spent"] = False
+                    # Increment version when reverting
+                    utxo["version"] = utxo.get("version", 0) + 1
+                    # Clear spending info
+                    utxo.pop("spent_at_height", None)
+                    utxo.pop("spent_by_tx", None)
                     batch.put(utxo_key, json.dumps(utxo).encode())
                     
-                    # Re-add to wallet index
-                    if 'receiver' in utxo:
-                        wallet_index_key = f"wallet_utxos:{utxo['receiver']}".encode()
-                        wallet_utxos = []
-                        wallet_index_data = self.db.get(wallet_index_key)
-                        if wallet_index_data:
-                            wallet_utxos = json.loads(wallet_index_data.decode())
-                        utxo_key_str = utxo_key.decode()
-                        if utxo_key_str not in wallet_utxos:
-                            wallet_utxos.append(utxo_key_str)
-                            batch.put(wallet_index_key, json.dumps(wallet_utxos).encode())
+                    # Wallet indexes handled by wallet_index.update_for_new_transaction()
         
         # Remove outputs created by this transaction
         for idx, out in enumerate(tx.get("outputs", [])):
@@ -1523,17 +1971,8 @@ class ChainManager:
                 backup_key = f"{txid}:{idx}"
                 utxo_backups[backup_key] = current_data
                 
-                # Remove from wallet index
+                # Wallet indexes handled by wallet_index.update_for_new_transaction()
                 utxo = json.loads(current_data.decode())
-                if 'receiver' in utxo:
-                    wallet_index_key = f"wallet_utxos:{utxo['receiver']}".encode()
-                    wallet_index_data = self.db.get(wallet_index_key)
-                    if wallet_index_data:
-                        wallet_utxos = json.loads(wallet_index_data.decode())
-                        utxo_key_str = utxo_key.decode()
-                        if utxo_key_str in wallet_utxos:
-                            wallet_utxos.remove(utxo_key_str)
-                            batch.put(wallet_index_key, json.dumps(wallet_utxos).encode())
             
             batch.delete(utxo_key)
     
@@ -1554,8 +1993,9 @@ class ChainManager:
         
         logger.debug(f"Applying transaction {txid}")
         
-        # Mark inputs as spent (skip for coinbase)
-        if not is_coinbase:
+        # Mark inputs as spent (skip for coinbase and genesis)
+        # Genesis transaction has a special input that shouldn't be marked as spent
+        if not is_coinbase and height > 0:  # Skip input processing for genesis block (height 0)
             for inp in tx.get("inputs", []):
                 if "txid" in inp and inp["txid"] != "00" * 32:
                     utxo_key = f"utxo:{inp['txid']}:{inp.get('utxo_index', 0)}".encode()
@@ -1563,18 +2003,13 @@ class ChainManager:
                     if utxo_data:
                         utxo = json.loads(utxo_data.decode())
                         utxo["spent"] = True
+                        # Increment version for optimistic locking
+                        utxo["version"] = utxo.get("version", 0) + 1
+                        utxo["spent_at_height"] = height
+                        utxo["spent_by_tx"] = txid
                         batch.put(utxo_key, json.dumps(utxo).encode())
                         
-                        # Remove from wallet index
-                        if 'receiver' in utxo:
-                            wallet_index_key = f"wallet_utxos:{utxo['receiver']}".encode()
-                            wallet_index_data = self.db.get(wallet_index_key)
-                            if wallet_index_data:
-                                wallet_utxos = json.loads(wallet_index_data.decode())
-                                utxo_key_str = utxo_key.decode()
-                                if utxo_key_str in wallet_utxos:
-                                    wallet_utxos.remove(utxo_key_str)
-                                    batch.put(wallet_index_key, json.dumps(wallet_utxos).encode())
+                        # Wallet indexes handled by wallet_index.update_for_new_transaction()
         
         # Create new UTXOs (including for coinbase!)
         for idx, out in enumerate(tx.get("outputs", [])):
@@ -1585,28 +2020,26 @@ class ChainManager:
                 "sender": "coinbase" if is_coinbase else out.get('sender', ''),
                 "receiver": out.get('receiver', ''),
                 "amount": str(out.get('amount', '0')),  # Ensure string to avoid scientific notation
-                "spent": False  # New UTXOs are always unspent
+                "spent": False,  # New UTXOs are always unspent
+                "version": 0,  # Initial version for optimistic locking
+                "created_at_height": height,
+                "created_by_block": None  # Will be set by the block processor
             }
             utxo_key = f"utxo:{txid}:{idx}".encode()
             batch.put(utxo_key, json.dumps(utxo_record).encode())
             
-            # Add to wallet index
-            if out.get('receiver'):
-                wallet_index_key = f"wallet_utxos:{out['receiver']}".encode()
-                wallet_utxos = []
-                wallet_index_data = self.db.get(wallet_index_key)
-                if wallet_index_data:
-                    wallet_utxos = json.loads(wallet_index_data.decode())
-                utxo_key_str = utxo_key.decode()
-                if utxo_key_str not in wallet_utxos:
-                    wallet_utxos.append(utxo_key_str)
-                    batch.put(wallet_index_key, json.dumps(wallet_utxos).encode())
+            # Wallet indexes are updated after transaction is stored (see below)
             
             if is_coinbase:
                 logger.info(f"Created coinbase UTXO: {utxo_key.decode()} for {out.get('receiver')} amount: {out.get('amount')}")
         
         # Store transaction
         batch.put(f"tx:{txid}".encode(), json.dumps(tx).encode())
+        
+        # Update wallet indexes for efficient lookups
+        from blockchain.wallet_index import get_wallet_index
+        wallet_index = get_wallet_index()
+        wallet_index.update_for_new_transaction(tx, batch)
     
     def _validate_transaction_for_reorg(self, tx: dict, block_spent_utxos: Set[str], 
                                        new_chain_spent_utxos: Set[str]) -> bool:
@@ -1740,30 +2173,23 @@ class ChainManager:
         
         logger.debug(f"Safely applying transaction {txid}")
         
-        # Mark inputs as spent (skip if already spent in new chain)
-        for inp in tx.get("inputs", []):
-            if "txid" in inp and inp["txid"] != "00" * 32:
-                utxo_key = f"{inp['txid']}:{inp.get('utxo_index', 0)}"
-                
-                # Skip if this UTXO is already marked as spent in new chain
-                if utxo_key not in new_chain_spent_utxos:
-                    utxo_db_key = f"utxo:{utxo_key}".encode()
-                    utxo_data = self.db.get(utxo_db_key)
-                    if utxo_data:
-                        utxo = json.loads(utxo_data.decode())
-                        utxo["spent"] = True
-                        batch.put(utxo_db_key, json.dumps(utxo).encode())
+        # Mark inputs as spent (skip if already spent in new chain, skip for coinbase/genesis)
+        # Genesis transaction (height 0) has special inputs that shouldn't be marked as spent
+        if not is_coinbase and height > 0:  # Skip input processing for genesis block
+            for inp in tx.get("inputs", []):
+                if "txid" in inp and inp["txid"] != "00" * 32:
+                    utxo_key = f"{inp['txid']}:{inp.get('utxo_index', 0)}"
+                    
+                    # Skip if this UTXO is already marked as spent in new chain
+                    if utxo_key not in new_chain_spent_utxos:
+                        utxo_db_key = f"utxo:{utxo_key}".encode()
+                        utxo_data = self.db.get(utxo_db_key)
+                        if utxo_data:
+                            utxo = json.loads(utxo_data.decode())
+                            utxo["spent"] = True
+                            batch.put(utxo_db_key, json.dumps(utxo).encode())
                         
-                        # Remove from wallet index
-                        if 'receiver' in utxo:
-                            wallet_index_key = f"wallet_utxos:{utxo['receiver']}".encode()
-                            wallet_index_data = self.db.get(wallet_index_key)
-                            if wallet_index_data:
-                                wallet_utxos = json.loads(wallet_index_data.decode())
-                                utxo_db_key_str = utxo_db_key.decode()
-                                if utxo_db_key_str in wallet_utxos:
-                                    wallet_utxos.remove(utxo_db_key_str)
-                                    batch.put(wallet_index_key, json.dumps(wallet_utxos).encode())
+                        # Wallet indexes handled by wallet_index.update_for_new_transaction()
         
         # Create new UTXOs (including for coinbase!)
         for idx, out in enumerate(tx.get("outputs", [])):
@@ -1774,28 +2200,26 @@ class ChainManager:
                 "sender": "coinbase" if is_coinbase else out.get('sender', ''),
                 "receiver": out.get('receiver', ''),
                 "amount": str(out.get('amount', '0')),  # Ensure string to avoid scientific notation
-                "spent": False  # New UTXOs are always unspent
+                "spent": False,  # New UTXOs are always unspent
+                "version": 0,  # Initial version for optimistic locking
+                "created_at_height": height,
+                "created_by_block": None  # Will be set by the block processor
             }
             utxo_key = f"utxo:{txid}:{idx}".encode()
             batch.put(utxo_key, json.dumps(utxo_record).encode())
             
-            # Add to wallet index
-            if out.get('receiver'):
-                wallet_index_key = f"wallet_utxos:{out['receiver']}".encode()
-                wallet_utxos = []
-                wallet_index_data = self.db.get(wallet_index_key)
-                if wallet_index_data:
-                    wallet_utxos = json.loads(wallet_index_data.decode())
-                utxo_key_str = utxo_key.decode()
-                if utxo_key_str not in wallet_utxos:
-                    wallet_utxos.append(utxo_key_str)
-                    batch.put(wallet_index_key, json.dumps(wallet_utxos).encode())
+            # Wallet indexes are updated after transaction is stored (see below)
             
             if is_coinbase:
                 logger.info(f"Created coinbase UTXO during reorg: {utxo_key.decode()} for {out.get('receiver')} amount: {out.get('amount')}")
         
         # Store transaction
         batch.put(f"tx:{txid}".encode(), json.dumps(tx).encode())
+        
+        # Update wallet indexes for efficient lookups
+        from blockchain.wallet_index import get_wallet_index
+        wallet_index = get_wallet_index()
+        wallet_index.update_for_new_transaction(tx, batch)
     
     async def get_block_by_hash(self, block_hash: str) -> Optional[dict]:
         """Get a block by its hash"""
@@ -1820,33 +2244,6 @@ class ChainManager:
                 break
         
         return False
-    
-    async def detect_fork_at_height(self, height: int) -> Optional[str]:
-        """
-        Detect if we have a different block at the given height than what's expected.
-        Returns the hash of our block at that height if it exists, None otherwise.
-        """
-        # Find our block at this height
-        best_tip, best_height = await self.get_best_chain_tip()
-        
-        if height > best_height:
-            return None  # We don't have a block at this height yet
-        
-        # Walk back from best tip to find block at target height
-        current = best_tip
-        current_height = best_height
-        
-        while current and current != "00" * 32 and current_height > height:
-            if current in self.block_index:
-                current = self.block_index[current]["previous_hash"]
-                current_height -= 1
-            else:
-                break
-        
-        if current_height == height:
-            return current
-        
-        return None
     
     async def request_missing_ancestor(self, orphan_hash: str) -> Optional[Tuple[str, int]]:
         """

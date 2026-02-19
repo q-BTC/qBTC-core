@@ -12,8 +12,10 @@ from dht.dht import push_blocks
 from sync.sync import process_blocks_from_peer
 from network.peer_reputation import peer_reputation_manager
 from log_utils import get_logger
+from gossip.broadcast_tracker import get_broadcast_tracker
 
 logger = get_logger(__name__)
+broadcast_tracker = get_broadcast_tracker()
 
 # Import NAT traversal
 try:
@@ -268,41 +270,94 @@ class GossipNode:
                 if blocks and len(blocks) > 0:
                     logger.info(f"First block keys: {list(blocks[0].keys())}")
                 
-                # Fix missing txid in transactions before processing
+                # Validate and fix missing txid in transactions before processing
+                from blockchain.blockchain import serialize_transaction, sha256d
+                blocks_to_process = []
                 for block in blocks:
+                    block_valid = True
                     if "full_transactions" in block and block["full_transactions"]:
                         tx_ids = block.get("tx_ids", [])
                         for i, tx in enumerate(block["full_transactions"]):
                             if tx and "txid" not in tx:
                                 # Try to get txid from tx_ids array
                                 if i < len(tx_ids):
-                                    tx["txid"] = tx_ids[i]
+                                    claimed_txid = tx_ids[i]
+                                    # Validate the txid matches the transaction hash
+                                    try:
+                                        tx_bytes = serialize_transaction(tx)
+                                        calculated_txid = sha256d(tx_bytes)
+                                        if calculated_txid != claimed_txid:
+                                            logger.error(f"Transaction hash mismatch! Claimed: {claimed_txid}, Calculated: {calculated_txid}")
+                                            logger.error(f"Block height: {block.get('height', 'unknown')}, tx index: {i}")
+                                            logger.error(f"Rejecting block {block.get('block_hash', 'unknown')} due to invalid transaction hash")
+                                            block_valid = False
+                                            break
+                                        tx["txid"] = claimed_txid
+                                    except Exception as e:
+                                        logger.error(f"Failed to validate transaction hash: {e}")
+                                        logger.error(f"Rejecting block {block.get('block_hash', 'unknown')} due to transaction validation error")
+                                        block_valid = False
+                                        break
                                 # Coinbase transactions should already have a txid from when they were mined
                                 elif tx.get("inputs") and len(tx["inputs"]) > 0 and tx["inputs"][0].get("txid") == "00" * 32:
                                     logger.error(f"Coinbase transaction missing txid in block {block.get('height', 0)}")
                                 else:
                                     logger.warning(f"Could not determine txid for transaction {i} in block {block.get('height', 'unknown')}")
+                    if block_valid:
+                        blocks_to_process.append(block)
+                blocks = blocks_to_process
                 
                 await process_blocks_from_peer(blocks)
                 
                 # If this is a new block announcement (not a sync response), propagate it
                 if is_new_block:
-                    logger.info(f"Propagating new block announcement to other peers")
-                    await self.randomized_broadcast(msg)
+                    # Check if we should broadcast this block
+                    if blocks and len(blocks) > 0:
+                        block_hash = blocks[0].get("block_hash", "")
+                        if block_hash and broadcast_tracker.should_broadcast("blocks_response", block_hash, from_peer):
+                            logger.info(f"Propagating new block {block_hash[:8]}... to other peers")
+                            # Mark the sender as having this block
+                            if from_peer:
+                                broadcast_tracker.mark_peer_has_block(block_hash, from_peer)
+                            await self.randomized_broadcast(msg)
+                        else:
+                            logger.debug(f"Skipping broadcast of block {block_hash[:8]}... (recently broadcast)")
         
         elif msg_type == "blocks_by_hash_response":
             logger.info(f"Received blocks_by_hash_response from {from_peer}")
             blocks = msg.get("blocks", [])
             if blocks:
                 logger.info(f"Processing {len(blocks)} blocks received by hash request")
-                # Fix missing txid in transactions before processing
+                # Validate and fix missing txid in transactions before processing
+                from blockchain.blockchain import serialize_transaction, sha256d
+                blocks_to_process = []
                 for block in blocks:
+                    block_valid = True
                     if "full_transactions" in block and block["full_transactions"]:
                         tx_ids = block.get("tx_ids", [])
                         for i, tx in enumerate(block["full_transactions"]):
                             if tx and "txid" not in tx:
                                 if i < len(tx_ids):
-                                    tx["txid"] = tx_ids[i]
+                                    claimed_txid = tx_ids[i]
+                                    # Validate the txid matches the transaction hash
+                                    try:
+                                        tx_bytes = serialize_transaction(tx)
+                                        calculated_txid = sha256d(tx_bytes)
+                                        if calculated_txid != claimed_txid:
+                                            logger.error(f"Transaction hash mismatch! Claimed: {claimed_txid}, Calculated: {calculated_txid}")
+                                            logger.error(f"Block height: {block.get('height', 'unknown')}, tx index: {i}")
+                                            logger.error(f"Rejecting block {block.get('block_hash', 'unknown')} due to invalid transaction hash")
+                                            block_valid = False
+                                            break
+                                        tx["txid"] = claimed_txid
+                                    except Exception as e:
+                                        logger.error(f"Failed to validate transaction hash: {e}")
+                                        logger.error(f"Rejecting block {block.get('block_hash', 'unknown')} due to transaction validation error")
+                                        block_valid = False
+                                        break
+                    if block_valid:
+                        blocks_to_process.append(block)
+                blocks = blocks_to_process
                 
                 await process_blocks_from_peer(blocks)
             else:
@@ -326,96 +381,130 @@ class GossipNode:
             start_height = msg.get("start_height")
             end_height = msg.get("end_height")
             if start_height is None or end_height is None:
+                logger.warning("get_blocks request missing start_height or end_height")
                 return
+            
+            # Validate range
+            if start_height < 0 or end_height < start_height:
+                logger.warning(f"Invalid block range: {start_height} to {end_height}")
+                return
+            
+            # Limit request size to prevent DoS
+            from config.config import MAX_BLOCKS_PER_SYNC_REQUEST
+            max_blocks = MAX_BLOCKS_PER_SYNC_REQUEST  # Default 500
+            if end_height - start_height + 1 > max_blocks:
+                logger.warning(f"Block request too large: {end_height - start_height + 1} blocks (max: {max_blocks})")
+                end_height = start_height + max_blocks - 1
 
             blocks = []
-
-            height_index = get_height_index()
-            
-            for h in range(start_height, end_height + 1):
-                # Use the efficient height index
-                block = height_index.get_block_by_height(h)
+            try:
+                height_index = get_height_index()
                 
-                if block:
-                    # Check if block already has full_transactions
-                    if "full_transactions" not in block or not block["full_transactions"]:
-                        expanded_txs = []
-                        for txid in block.get("tx_ids", []):
-                            tx_key = f"tx:{txid}".encode()
-                            if tx_key in db:
-                                tx_data = json.loads(db[tx_key].decode())
-                                # Ensure txid is in the transaction data
-                                if "txid" not in tx_data:
-                                    tx_data["txid"] = txid
-                                expanded_txs.append(tx_data)
-                            else:
-                                logger.warning(f"Transaction {txid} not found in DB for block at height {h}")
-
-                        # Skip legacy coinbase lookup - coinbase is already included in regular transactions
-                        # cb_key = f"tx:coinbase_{h}".encode()
-                        # if cb_key in db:
-                        #     cb_data = json.loads(db[cb_key].decode())
-                        #     # Ensure coinbase has txid
-                        #     if "txid" not in cb_data:
-                        #         cb_data["txid"] = f"coinbase_{h}"
-                        #     expanded_txs.append(cb_data)
-
-                        block["full_transactions"] = expanded_txs
-                    else:
-                        logger.info(f"Block at height {h} already has {len(block['full_transactions'])} full transactions")
-                        # IMPORTANT: Ensure all transactions have txid field even if block already has full_transactions
-                        tx_ids = block.get("tx_ids", [])
-                        for i, tx in enumerate(block.get("full_transactions", [])):
-                            if tx and "txid" not in tx and i < len(tx_ids):
-                                tx["txid"] = tx_ids[i]
+                for h in range(start_height, end_height + 1):
+                    # Use the efficient height index
+                    block = height_index.get_block_by_height(h)
                     
-                    # Make a deep copy to avoid modifying the original
-                    import copy
-                    blocks.append(copy.deepcopy(block))
+                    if block:
+                        # Check if block already has full_transactions
+                        if "full_transactions" not in block or not block["full_transactions"]:
+                            expanded_txs = []
+                            for txid in block.get("tx_ids", []):
+                                tx_key = f"tx:{txid}".encode()
+                                if tx_key in db:
+                                    tx_data = json.loads(db[tx_key].decode())
+                                    # Ensure txid is in the transaction data
+                                    if "txid" not in tx_data:
+                                        tx_data["txid"] = txid
+                                    expanded_txs.append(tx_data)
+                                else:
+                                    logger.warning(f"Transaction {txid} not found in DB for block at height {h}")
 
-            # Validate blocks before sending
-            for block in blocks:
-                if isinstance(block.get("height"), str) and len(block.get("height")) == 64:
-                    logger.error(f"CRITICAL: About to send block with hash in height field: {block}")
-                    # Skip this malformed block
-                    blocks = [b for b in blocks if b != block]
-            
-            # Check if response is too large and needs chunking
-            response = {"type": "blocks_response", "blocks": blocks}
-            response_json = json.dumps(response)
-            
-            # If response is larger than 50MB, use chunked protocol
-            if len(response_json) > 50 * 1024 * 1024:
-                # Split blocks into chunks
-                chunk_size = 10  # blocks per chunk
-                total_chunks = (len(blocks) + chunk_size - 1) // chunk_size
+                            # Skip legacy coinbase lookup - coinbase is already included in regular transactions
+                            # cb_key = f"tx:coinbase_{h}".encode()
+                            # if cb_key in db:
+                            #     cb_data = json.loads(db[cb_key].decode())
+                            #     # Ensure coinbase has txid
+                            #     if "txid" not in cb_data:
+                            #         cb_data["txid"] = f"coinbase_{h}"
+                            #     expanded_txs.append(cb_data)
+
+                            block["full_transactions"] = expanded_txs
+                        else:
+                            logger.info(f"Block at height {h} already has {len(block['full_transactions'])} full transactions")
+                            # IMPORTANT: Validate and ensure all transactions have txid field even if block already has full_transactions
+                            from blockchain.blockchain import serialize_transaction, sha256d
+                            tx_ids = block.get("tx_ids", [])
+                            for i, tx in enumerate(block.get("full_transactions", [])):
+                                if tx and "txid" not in tx and i < len(tx_ids):
+                                    claimed_txid = tx_ids[i]
+                                    # Validate the txid matches the transaction hash before sending
+                                    try:
+                                        tx_bytes = serialize_transaction(tx)
+                                        calculated_txid = sha256d(tx_bytes)
+                                        if calculated_txid != claimed_txid:
+                                            logger.error(f"Not sending block with invalid tx hash! Claimed: {claimed_txid}, Calculated: {calculated_txid}")
+                                            logger.error(f"Block height: {h}, tx index: {i}")
+                                            # Skip this transaction - don't add invalid txid
+                                            continue
+                                        tx["txid"] = claimed_txid
+                                    except Exception as e:
+                                        logger.error(f"Failed to validate transaction hash before sending: {e}")
+                                        # Skip this transaction
+                                        continue
+                        
+                        # Make a deep copy to avoid modifying the original
+                        import copy
+                        blocks.append(copy.deepcopy(block))
                 
-                # Send header first
-                header = {
-                    "type": "blocks_response_chunked",
-                    "total_chunks": total_chunks,
-                    "total_blocks": len(blocks)
-                }
-                writer.write((json.dumps(header) + "\n").encode('utf-8'))
-                await writer.drain()
+                # Validate blocks before sending  
+                for block in blocks:
+                    if isinstance(block.get("height"), str) and len(block.get("height")) == 64:
+                        logger.error(f"CRITICAL: About to send block with hash in height field: {block}")
+                        # Skip this malformed block
+                        blocks = [b for b in blocks if b != block]
                 
-                # Send each chunk
-                for chunk_num in range(total_chunks):
-                    start_idx = chunk_num * chunk_size
-                    end_idx = min((chunk_num + 1) * chunk_size, len(blocks))
-                    chunk_blocks = blocks[start_idx:end_idx]
+                # Check if response is too large and needs chunking
+                response = {"type": "blocks_response", "blocks": blocks}
+                response_json = json.dumps(response)
+                
+                # If response is larger than 50MB, use chunked protocol
+                if len(response_json) > 50 * 1024 * 1024:
+                    # Split blocks into chunks
+                    chunk_size = 10  # blocks per chunk
+                    total_chunks = (len(blocks) + chunk_size - 1) // chunk_size
                     
-                    chunk_data = {
-                        "chunk_num": chunk_num,
-                        "blocks": chunk_blocks
+                    # Send header first
+                    header = {
+                        "type": "blocks_response_chunked",
+                        "total_chunks": total_chunks,
+                        "total_blocks": len(blocks)
                     }
-                    writer.write((json.dumps(chunk_data) + "\n").encode('utf-8'))
+                    writer.write((json.dumps(header) + "\n").encode('utf-8'))
                     await writer.drain()
                     
-                logger.info(f"Sent {len(blocks)} blocks in {total_chunks} chunks")
-            else:
-                # Send as single response
-                writer.write((response_json + "\n").encode('utf-8'))
+                    # Send each chunk
+                    for chunk_num in range(total_chunks):
+                        start_idx = chunk_num * chunk_size
+                        end_idx = min((chunk_num + 1) * chunk_size, len(blocks))
+                        chunk_blocks = blocks[start_idx:end_idx]
+                        
+                        chunk_data = {
+                            "chunk_num": chunk_num,
+                            "blocks": chunk_blocks
+                        }
+                        writer.write((json.dumps(chunk_data) + "\n").encode('utf-8'))
+                        await writer.drain()
+                        
+                    logger.info(f"Sent {len(blocks)} blocks in {total_chunks} chunks")
+                else:
+                    # Send as single response
+                    writer.write((response_json + "\n").encode('utf-8'))
+                    await writer.drain()
+                    
+            except Exception as e:
+                logger.error(f"Error in get_blocks handler: {e}")
+                error_response = {"type": "error", "message": f"Failed to retrieve blocks: {str(e)}"}
+                writer.write((json.dumps(error_response) + "\n").encode('utf-8'))
                 await writer.drain()
 
         elif msg_type == "get_blocks_by_hash":
@@ -447,11 +536,26 @@ class GossipNode:
                                 logger.warning(f"Transaction {txid} not found in DB for block {block_hash}")
                         block_data["full_transactions"] = expanded_txs
                     else:
-                        # IMPORTANT: Ensure all transactions have txid field even if block already has full_transactions
+                        # IMPORTANT: Validate and ensure all transactions have txid field even if block already has full_transactions
+                        from blockchain.blockchain import serialize_transaction, sha256d
                         tx_ids = block_data.get("tx_ids", [])
                         for i, tx in enumerate(block_data.get("full_transactions", [])):
                             if tx and "txid" not in tx and i < len(tx_ids):
-                                tx["txid"] = tx_ids[i]
+                                claimed_txid = tx_ids[i]
+                                # Validate the txid matches the transaction hash before sending
+                                try:
+                                    tx_bytes = serialize_transaction(tx)
+                                    calculated_txid = sha256d(tx_bytes)
+                                    if calculated_txid != claimed_txid:
+                                        logger.error(f"Not sending block with invalid tx hash! Claimed: {claimed_txid}, Calculated: {calculated_txid}")
+                                        logger.error(f"Block hash: {block_hash}, tx index: {i}")
+                                        # Skip this transaction - don't add invalid txid
+                                        continue
+                                    tx["txid"] = claimed_txid
+                                except Exception as e:
+                                    logger.error(f"Failed to validate transaction hash before sending: {e}")
+                                    # Skip this transaction
+                                    continue
                     
                     blocks.append(block_data)
                 else:
@@ -462,7 +566,36 @@ class GossipNode:
             await writer.drain()
             logger.info(f"Sent {len(blocks)} blocks by hash")
 
-  
+        elif msg_type == "get_transactions":
+            # Request specific transactions by their IDs
+            tx_ids = msg.get("tx_ids", [])
+            if not tx_ids:
+                logger.warning("Received get_transactions with no tx_ids")
+                return
+
+            logger.info(f"Processing request for {len(tx_ids)} transactions")
+            transactions = []
+
+            for txid in tx_ids[:100]:  # Limit to 100 transactions per request
+                tx_key = f"tx:{txid}".encode()
+                if tx_key in db:
+                    try:
+                        tx_data = json.loads(db[tx_key].decode())
+                        # Ensure txid is in the transaction data
+                        if "txid" not in tx_data:
+                            tx_data["txid"] = txid
+                        transactions.append(tx_data)
+                    except Exception as e:
+                        logger.error(f"Failed to load transaction {txid}: {e}")
+                else:
+                    logger.debug(f"Transaction {txid} not found in database")
+
+            response = {"type": "transactions_response", "transactions": transactions}
+            writer.write((json.dumps(response) + "\n").encode('utf-8'))
+            await writer.drain()
+            logger.info(f"Sent {len(transactions)} transactions")
+
+
 
     async def randomized_broadcast(self, msg_dict):
         peers = self.dht_peers | self.client_peers 
@@ -509,6 +642,25 @@ class GossipNode:
             peers_to_send = list(peers)
             logger.info(f"Broadcasting transaction to ALL {len(peers_to_send)} peers")
         else:
+            # For blocks, filter out peers that already have it
+            if msg_type == "blocks_response":
+                blocks = msg_dict.get("blocks", [])
+                if blocks and len(blocks) > 0:
+                    block_hash = blocks[0].get("block_hash", "")
+                    if block_hash:
+                        # Filter out peers that we've recently sent this block to
+                        filtered_peers = [
+                            p for p in peers 
+                            if broadcast_tracker.should_send_to_peer(block_hash, str(p))
+                        ]
+                        if len(filtered_peers) < len(peers):
+                            logger.debug(f"Filtered {len(peers) - len(filtered_peers)} peers that already have block {block_hash[:8]}...")
+                        peers = filtered_peers
+            
+            if not peers:
+                logger.debug(f"No peers need {msg_type}")
+                return
+                
             num_peers = max(2, int(len(peers) ** 0.5))
             peers_to_send = random.sample(list(peers), min(len(peers), num_peers))
         

@@ -172,11 +172,21 @@ def parse_tx(raw: bytes, offset: int) -> (dict, int):
     return tx, total_size
 
 def scriptpubkey_to_address(script_pubkey_hex):
-    if not script_pubkey_hex.startswith("76a914") or not script_pubkey_hex.endswith("88ac"):
-        raise ValueError("Not a standard P2PKH scriptPubKey")
+    # Support P2PKH format (76a914...88ac)
+    if script_pubkey_hex.startswith("76a914") and script_pubkey_hex.endswith("88ac"):
+        pubkey_hash = script_pubkey_hex[6:-4]  # extract 20-byte pubkey hash
+        versioned = b'\x00' + bytes.fromhex(pubkey_hash)
+        checksum = hashlib.sha256(hashlib.sha256(versioned).digest()).digest()[:4]
+        address_bytes = versioned + checksum
+        return base58.b58encode(address_bytes).decode()
 
-    pubkey_hash = script_pubkey_hex[6:-4]  # extract 20-byte pubkey hash
-    versioned = b'\x00' + bytes.fromhex(pubkey_hash)
-    checksum = hashlib.sha256(hashlib.sha256(versioned).digest()).digest()[:4]
-    address_bytes = versioned + checksum
-    return base58.b58encode(address_bytes).decode()
+    # Support P2SH format (a914...87)
+    elif script_pubkey_hex.startswith("a914") and script_pubkey_hex.endswith("87"):
+        script_hash = script_pubkey_hex[4:-2]  # extract 20-byte script hash
+        versioned = b'\x05' + bytes.fromhex(script_hash)  # 0x05 prefix for P2SH
+        checksum = hashlib.sha256(hashlib.sha256(versioned).digest()).digest()[:4]
+        address_bytes = versioned + checksum
+        return base58.b58encode(address_bytes).decode()
+
+    else:
+        raise ValueError(f"Unsupported scriptPubKey format: {script_pubkey_hex[:10]}...")

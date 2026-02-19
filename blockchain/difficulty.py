@@ -1,6 +1,7 @@
 """
 Difficulty Adjustment Algorithm for qBTC
-Implements a Bitcoin-style difficulty adjustment with improvements
+Implements Bitcoin-proportional difficulty adjustment for enhanced security
+With 10-second blocks, adjusts every 120,960 blocks (2 weeks) to match Bitcoin's security model
 """
 import json
 import logging
@@ -84,8 +85,8 @@ def calculate_next_bits(
         actual_time = expected_time
     
     # Calculate adjustment ratio
-    # When blocks are fast (actual < expected), ratio > 1, so we need to decrease target
-    # When blocks are slow (actual > expected), ratio < 1, so we need to increase target
+    # When blocks are fast (actual < expected), ratio < 1, so we need to decrease target (increase difficulty)
+    # When blocks are slow (actual > expected), ratio > 1, so we need to increase target (decrease difficulty)
     ratio = actual_time / expected_time
     
     # Apply limits to prevent attacks
@@ -120,8 +121,10 @@ def calculate_next_bits(
     old_difficulty = (1 << 256) / current_target
     new_difficulty = (1 << 256) / new_target
     logger.info(
-        f"Difficulty adjustment: {old_difficulty:.2f} -> {new_difficulty:.2f} "
-        f"(ratio: {ratio:.2f}, actual: {actual_time}s, expected: {expected_time}s)"
+        f"Difficulty adjustment at height {block_count}: "
+        f"{old_difficulty:.2f} -> {new_difficulty:.2f} "
+        f"(ratio: {ratio:.2f}, actual: {actual_time}s, expected: {expected_time}s, "
+        f"interval: {DIFFICULTY_ADJUSTMENT_INTERVAL} blocks)"
     )
     
     return new_bits

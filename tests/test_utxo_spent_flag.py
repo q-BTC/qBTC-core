@@ -5,7 +5,6 @@ import json
 import pytest
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
-from sync.sync import _process_block_in_chain
 from blockchain.chain_manager import ChainManager
 
 def test_utxo_spent_flag_on_transaction_processing():

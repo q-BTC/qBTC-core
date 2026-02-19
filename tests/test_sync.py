@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib
 import time
 import pytest
+import asyncio
 
 sync_mod = importlib.import_module("sync.sync")      # actual module
 
@@ -46,7 +47,8 @@ def _make_block(height: int, prev: str, blk_hash: str) -> dict:
 
 # ───────────────────────── happy path ─────────────────────────
 @pytest.mark.stub_verify
-def test_process_blocks_happy(monkeypatch):
+@pytest.mark.asyncio
+async def test_process_blocks_happy(monkeypatch):
     db = FakeDB()
     db[b"block:00"*32] = b'{"height":0}'            # fake tip @ height-0
 
@@ -61,11 +63,29 @@ def test_process_blocks_happy(monkeypatch):
     
     # Mock ChainManager to avoid database initialization
     from unittest.mock import MagicMock
+    from unittest.mock import AsyncMock
     mock_chain_manager = MagicMock()
-    mock_chain_manager.add_block.return_value = (True, None)
-    mock_chain_manager.is_block_in_main_chain.return_value = True
-    mock_chain_manager.get_best_chain_tip.return_value = ("11"*32, 1)
-    monkeypatch.setattr("sync.sync.get_chain_manager", lambda: mock_chain_manager)
+    mock_chain_manager.add_block = AsyncMock(return_value=(True, None))
+    mock_chain_manager.is_block_in_main_chain = AsyncMock(return_value=True)
+    mock_chain_manager.get_best_chain_tip = AsyncMock(return_value=("11"*32, 1))
+    mock_chain_manager.set_sync_mode = MagicMock()
+    mock_chain_manager.try_connect_orphan_chain = AsyncMock(return_value=False)
+    
+    async def mock_get_chain_manager():
+        return mock_chain_manager
+    
+    monkeypatch.setattr("sync.sync.get_chain_manager", mock_get_chain_manager)
+    
+    # Mock SyncStateManager to avoid database initialization
+    mock_sync_manager = MagicMock()
+    mock_sync_manager.begin_sync_transaction = MagicMock(return_value="test-sync-id")
+    mock_sync_manager.record_block_processed = MagicMock()
+    mock_sync_manager.record_block_failed = MagicMock()
+    mock_sync_manager.record_mempool_removal = MagicMock()
+    mock_sync_manager.commit_sync_transaction = MagicMock(return_value=True)
+    mock_sync_manager.rollback_sync_transaction = MagicMock(return_value=True)
+    
+    monkeypatch.setattr("sync.sync.get_sync_state_manager", lambda: mock_sync_manager)
 
     # Replace WriteBatch with dummy
     monkeypatch.setattr("sync.sync.WriteBatch",
@@ -80,12 +100,13 @@ def test_process_blocks_happy(monkeypatch):
     monkeypatch.setattr("sync.sync.calculate_merkle_root",
                         lambda txids: "00"*32, raising=False)
 
-    result = sync_mod.process_blocks_from_peer([_make_block(1, "0"*64, "11"*32)])
+    result = await sync_mod.process_blocks_from_peer([_make_block(1, "0"*64, "11"*32)])
     assert result == True  # At least one block was accepted
 
 
 # ───────────────────── height-mismatch path ─────────────────────
-def test_process_blocks_height_mismatch(monkeypatch):
+@pytest.mark.asyncio
+async def test_process_blocks_height_mismatch(monkeypatch):
     db = FakeDB()
 
     monkeypatch.setattr("database.database.get_current_height",
@@ -97,12 +118,29 @@ def test_process_blocks_height_mismatch(monkeypatch):
     monkeypatch.setattr("sync.sync.get_db", lambda: db, raising=False)
     
     # Mock ChainManager - should accept orphan blocks
-    from unittest.mock import MagicMock
+    from unittest.mock import MagicMock, AsyncMock
     mock_chain_manager = MagicMock()
-    mock_chain_manager.add_block.return_value = (True, None)  # Accept as orphan
-    mock_chain_manager.is_block_in_main_chain.return_value = False  # Not in main chain
-    mock_chain_manager.get_best_chain_tip.return_value = ("0"*64, 0)  # Still at genesis
-    monkeypatch.setattr("sync.sync.get_chain_manager", lambda: mock_chain_manager)
+    mock_chain_manager.add_block = AsyncMock(return_value=(True, None))  # Accept as orphan
+    mock_chain_manager.is_block_in_main_chain = AsyncMock(return_value=False)  # Not in main chain
+    mock_chain_manager.get_best_chain_tip = AsyncMock(return_value=("0"*64, 0))  # Still at genesis
+    mock_chain_manager.set_sync_mode = MagicMock()
+    mock_chain_manager.try_connect_orphan_chain = AsyncMock(return_value=False)
+    
+    async def mock_get_chain_manager():
+        return mock_chain_manager
+    
+    monkeypatch.setattr("sync.sync.get_chain_manager", mock_get_chain_manager)
+    
+    # Mock SyncStateManager to avoid database initialization
+    mock_sync_manager = MagicMock()
+    mock_sync_manager.begin_sync_transaction = MagicMock(return_value="test-sync-id")
+    mock_sync_manager.record_block_processed = MagicMock()
+    mock_sync_manager.record_block_failed = MagicMock()
+    mock_sync_manager.record_mempool_removal = MagicMock()
+    mock_sync_manager.commit_sync_transaction = MagicMock(return_value=True)
+    mock_sync_manager.rollback_sync_transaction = MagicMock(return_value=True)
+    
+    monkeypatch.setattr("sync.sync.get_sync_state_manager", lambda: mock_sync_manager)
 
     monkeypatch.setattr("sync.sync.WriteBatch", DummyWriteBatch, raising=True)
     monkeypatch.setattr("blockchain.blockchain.validate_pow",
@@ -113,7 +151,7 @@ def test_process_blocks_height_mismatch(monkeypatch):
     monkeypatch.setattr("sync.sync.calculate_merkle_root",
                         lambda txids: "00"*32, raising=False)
 
-    result = sync_mod.process_blocks_from_peer([_make_block(5, "0"*64, "55"*32)])
+    result = await sync_mod.process_blocks_from_peer([_make_block(5, "0"*64, "55"*32)])
     assert result == True  # Block accepted as orphan
     # ChainManager accepts it but doesn't process it (orphan)
     assert mock_chain_manager.add_block.called
