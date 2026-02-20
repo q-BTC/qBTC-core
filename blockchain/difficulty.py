@@ -5,19 +5,20 @@ With 10-second blocks, adjusts every 120,960 blocks (2 weeks) to match Bitcoin's
 """
 import json
 import logging
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 from config.config import DIFFICULTY_ADJUSTMENT_INTERVAL, BLOCK_TIME_TARGET
 from blockchain.block_height_index import get_height_index
 
 logger = logging.getLogger(__name__)
 
 # Constants
-# Constants
 MAX_TARGET_BITS = 0x1f7fffff  # Minimum difficulty bits (very easy)
 MIN_TARGET_BITS = 0x1900ffff  # Maximum difficulty bits we'll allow
 MAX_ADJUSTMENT_FACTOR = 4  # Maximum 4x increase
 MIN_ADJUSTMENT_FACTOR = 0.25  # Maximum 4x decrease (1/4)
 
+# Median Time Past
+MTP_BLOCK_COUNT = 11  # Number of blocks to use for Median Time Past (matches Bitcoin)
 
 # Time constraints
 MAX_FUTURE_TIME = 2 * 60 * 60  # 2 hours in the future
@@ -274,35 +275,82 @@ def validate_block_bits(block_bits: int, expected_bits: int) -> bool:
     return True
 
 
-def validate_block_timestamp(timestamp: int, previous_timestamp: int, current_time: int) -> bool:
+def get_median_time_past(height: int, block_index: dict, db=None) -> Optional[int]:
+    """
+    Calculate the Median Time Past (MTP) for a given height.
+    MTP is the median of the timestamps of the last MTP_BLOCK_COUNT (11) blocks.
+
+    Args:
+        height: The height for which to compute MTP (uses blocks at heights height-1 down to height-11)
+        block_index: In-memory block index mapping hash -> block metadata
+        db: Database instance (fallback if block_index doesn't have timestamps)
+
+    Returns:
+        The median timestamp, or None if not enough blocks exist
+    """
+    if height < MTP_BLOCK_COUNT:
+        return None  # Not enough blocks to compute MTP
+
+    # Collect timestamps from the last MTP_BLOCK_COUNT blocks
+    # We need to find blocks by height, so use the height index
+    height_idx = get_height_index()
+    timestamps: List[int] = []
+
+    for h in range(height - MTP_BLOCK_COUNT, height):
+        block_info = height_idx.get_block_by_height(h)
+        if block_info and block_info.get("timestamp") is not None:
+            timestamps.append(block_info["timestamp"])
+        else:
+            # Fallback: search block_index for a block at this height
+            found = False
+            for bhash, binfo in block_index.items():
+                if binfo.get("height") == h and binfo.get("timestamp") is not None:
+                    timestamps.append(binfo["timestamp"])
+                    found = True
+                    break
+            if not found:
+                logger.warning(f"Cannot find block at height {h} for MTP calculation")
+                return None
+
+    if len(timestamps) < MTP_BLOCK_COUNT:
+        return None
+
+    timestamps.sort()
+    return timestamps[len(timestamps) // 2]
+
+
+def validate_block_timestamp(timestamp: int, previous_timestamp: int, current_time: int,
+                             median_time_past: Optional[int] = None) -> bool:
     """
     Validate block timestamp against rules
-    
+
     Args:
         timestamp: Block timestamp to validate
         previous_timestamp: Timestamp of previous block
         current_time: Current system time
-        
+        median_time_past: If provided, block timestamp must be > MTP
+
     Returns:
         True if valid, False otherwise
     """
+    # If MTP is provided, block timestamp must be strictly greater than MTP
+    if median_time_past is not None and timestamp <= median_time_past:
+        logger.warning(f"Block timestamp {timestamp} not greater than median time past {median_time_past}")
+        return False
+
     # Must be greater than previous block
     if timestamp <= previous_timestamp:
         logger.warning(f"Block timestamp {timestamp} not greater than previous {previous_timestamp}")
         return False
-    
+
     # Cannot be too far in the future
     if timestamp > current_time + MAX_FUTURE_TIME:
         logger.warning(f"Block timestamp {timestamp} too far in future (current: {current_time})")
         return False
-    
+
     # Cannot be too far in the past relative to previous block
     if timestamp < previous_timestamp - MAX_PAST_TIME:
         logger.warning(f"Block timestamp {timestamp} too far in past relative to previous")
         return False
-    
+
     return True
-
-
-# Import json here to avoid circular imports
-import json

@@ -49,3 +49,5 @@ MAX_TRANSACTIONS_PER_BLOCK = int(os.getenv("MAX_TRANSACTIONS_PER_BLOCK", "4000")
 MAX_MEMPOOL_TRANSACTIONS = int(os.getenv("MAX_MEMPOOL_TRANSACTIONS", "10000"))  # Max number of transactions
 MAX_MEMPOOL_SIZE_MB = int(os.getenv("MAX_MEMPOOL_SIZE_MB", "300"))  # Max mempool size in MB
 MIN_RELAY_FEE = float(os.getenv("MIN_RELAY_FEE", "0.00001"))  # Minimum fee to relay transaction
+# Maximum reorg depth - reject reorganizations deeper than this (matches Bitcoin's practical limit)
+MAX_REORG_DEPTH = 100

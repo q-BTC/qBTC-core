@@ -10,7 +10,7 @@ from typing import Dict, List, Set, Tuple, Optional
 import logging
 
 from wallet.wallet import verify_transaction
-from config.config import CHAIN_ID, TX_EXPIRATION_TIME, ADMIN_ADDRESS, GENESIS_ADDRESS
+from config.config import CHAIN_ID, TX_EXPIRATION_TIME, ADMIN_ADDRESS, GENESIS_ADDRESS, TOTAL_SUPPLY
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +20,7 @@ class TransactionValidator:
     
     def __init__(self, db):
         self.db = db
-        self.skip_time_validation = False
+        self.is_syncing = False
     
     def validate_block_transactions(self, block_data: dict) -> Tuple[bool, Optional[str], Decimal]:
         """
@@ -148,28 +148,28 @@ class TransactionValidator:
             
             from_, to_, amount_str, time_str, tx_chain_id = parts
             
-            # Validate chain ID (skip during sync for historical blocks)
-            if not self.skip_time_validation:
-                try:
-                    if int(tx_chain_id) != CHAIN_ID:
-                        return False, f"Invalid chain ID in tx {txid}: expected {CHAIN_ID}, got {tx_chain_id}", Decimal("0")
-                except ValueError:
-                    return False, f"Invalid chain ID format in tx {txid}: {tx_chain_id}", Decimal("0")
-            
-            # Validate timestamp (skip during sync for historical blocks)
-            if not self.skip_time_validation:
+            # Chain ID validation ALWAYS runs — it's not time-dependent
+            try:
+                if int(tx_chain_id) != CHAIN_ID:
+                    return False, f"Invalid chain ID in tx {txid}: expected {CHAIN_ID}, got {tx_chain_id}", Decimal("0")
+            except ValueError:
+                return False, f"Invalid chain ID format in tx {txid}: {tx_chain_id}", Decimal("0")
+
+            # Timestamp freshness check — skip during sync for historical blocks
+            # (expiration/future checks are relative to wall-clock time)
+            if not self.is_syncing:
                 try:
                     tx_timestamp = int(time_str)
                     current_time = int(time.time() * 1000)  # Convert to milliseconds
                     tx_age = (current_time - tx_timestamp) / 1000  # Age in seconds
-                    
+
                     if tx_age > TX_EXPIRATION_TIME:
                         return False, f"Transaction {txid} expired: age {tx_age}s > max {TX_EXPIRATION_TIME}s", Decimal("0")
-                    
+
                     # Reject transactions with future timestamps (more than 5 minutes in the future)
                     if tx_age < -300:  # -300 seconds = 5 minutes in the future
                         return False, f"Transaction {txid} has future timestamp: {-tx_age}s in the future", Decimal("0")
-                        
+
                 except (ValueError, TypeError):
                     return False, f"Invalid timestamp in tx {txid}: {time_str}", Decimal("0")
             
@@ -177,6 +177,15 @@ class TransactionValidator:
                 total_authorized = Decimal(amount_str)
             except:
                 return False, f"Invalid amount in tx {txid}: {amount_str}", Decimal("0")
+
+            # Amount bounds validation
+            if total_authorized <= 0:
+                return False, f"Invalid amount in tx {txid}: must be > 0, got {amount_str}", Decimal("0")
+            if total_authorized > TOTAL_SUPPLY:
+                return False, f"Invalid amount in tx {txid}: exceeds total supply ({amount_str} > {TOTAL_SUPPLY})", Decimal("0")
+            # Ensure max 8 decimal places (satoshi precision)
+            if total_authorized != total_authorized.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN):
+                return False, f"Invalid amount in tx {txid}: more than 8 decimal places ({amount_str})", Decimal("0")
         
         # Validate inputs
         inputs = tx.get("inputs", [])
@@ -233,7 +242,15 @@ class TransactionValidator:
                 amt = Decimal(out.get("amount", "0"))
             except:
                 return False, f"Invalid output amount in tx {txid}", Decimal("0")
-            
+
+            # Output amount bounds validation
+            if amt <= 0:
+                return False, f"Invalid output amount in tx {txid}: must be > 0", Decimal("0")
+            if amt > TOTAL_SUPPLY:
+                return False, f"Invalid output amount in tx {txid}: exceeds total supply ({amt} > {TOTAL_SUPPLY})", Decimal("0")
+            if amt != amt.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN):
+                return False, f"Invalid output amount in tx {txid}: more than 8 decimal places", Decimal("0")
+
             if is_self_transfer:
                 # For self-transfers, all outputs to the same address are valid
                 if recv == from_:  # which equals to_
@@ -265,14 +282,14 @@ class TransactionValidator:
         )
         grand_total_required = total_authorized + miner_fee
         
-        # Check sufficient balance (skip for genesis block initial distribution)
-        if height > 1 and grand_total_required > total_available:
+        # Check sufficient balance (only genesis at height 0 bypasses this)
+        if height > 0 and grand_total_required > total_available:
             return False, f"Insufficient balance in tx {txid}: available {str(total_available)} < required {str(grand_total_required)}", Decimal("0")
-        
-        # Verify exact payment amount
+
+        # Verify exact payment amount (only genesis at height 0 bypasses this)
         # For self-transfers, we already set total_to_recipient = total_authorized above
         # so we skip this check for self-transfers
-        if height > 1 and not is_self_transfer and total_to_recipient != total_authorized:
+        if height > 0 and not is_self_transfer and total_to_recipient != total_authorized:
             return False, f"Invalid tx {txid}: authorized amount {str(total_authorized)} != amount sent to recipient {str(total_to_recipient)}", Decimal("0")
         
         # Verify signature (skip only for genesis transaction)
@@ -311,13 +328,20 @@ class TransactionValidator:
         # Maximum allowed coinbase output
         max_coinbase_amount = block_subsidy + total_fees
         
-        # Calculate total coinbase output
+        # Calculate total coinbase output with bounds validation
         total_coinbase_output = Decimal("0")
         for out in coinbase_tx.get("outputs", []):
             try:
-                total_coinbase_output += Decimal(out.get("amount", "0"))
+                amt = Decimal(out.get("amount", "0"))
             except:
                 return False, "Invalid amount in coinbase output"
+            if amt < 0:
+                return False, f"Negative coinbase output amount: {amt}"
+            if amt > TOTAL_SUPPLY:
+                return False, f"Coinbase output amount exceeds total supply: {amt}"
+            if amt != amt.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN):
+                return False, f"Coinbase output amount has more than 8 decimal places: {amt}"
+            total_coinbase_output += amt
         
         logger.info(f"Validating coinbase at height {height}: output={total_coinbase_output}, "
                    f"subsidy={block_subsidy}, fees={total_fees}, max={max_coinbase_amount}, "

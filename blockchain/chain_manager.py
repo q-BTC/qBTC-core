@@ -10,7 +10,8 @@ from decimal import Decimal
 from collections import defaultdict
 from database.database import get_db, invalidate_height_cache
 from blockchain.blockchain import Block, validate_pow, bits_to_target, sha256d
-from blockchain.difficulty import get_next_bits, validate_block_bits, validate_block_timestamp, MAX_FUTURE_TIME, MAX_TARGET_BITS
+from blockchain.difficulty import get_next_bits, validate_block_bits, validate_block_timestamp, get_median_time_past, MAX_FUTURE_TIME, MAX_TARGET_BITS
+from config.config import MAX_REORG_DEPTH
 from blockchain.transaction_validator import TransactionValidator
 from blockchain.block_factory import normalize_block, validate_block_structure
 from rocksdict import WriteBatch
@@ -655,21 +656,27 @@ class ChainManager:
         # Validate timestamp (skip only for genesis)
         if not is_genesis and prev_hash in self.block_index:
             parent_info = self.block_index[prev_hash]
-            
+
+            # Compute Median Time Past (MTP) for enhanced timestamp security
+            mtp = get_median_time_past(height, self.block_index, self.db)
+
             # During sync, we can't use current time for historical blocks
-            # Instead, we only validate that blocks are sequential in time
+            # But we still enforce MTP to prevent timestamp manipulation
             if self.is_syncing:
-                # During sync, only validate against parent timestamp
+                # During sync, validate against parent timestamp
                 if block_data["timestamp"] <= parent_info["timestamp"]:
                     # Allow equal timestamps for rapid mining scenarios
                     if block_data["timestamp"] < parent_info["timestamp"]:
                         return False, f"Invalid block timestamp during sync - must be >= parent (block: {block_data['timestamp']}, parent: {parent_info['timestamp']})"
-                logger.info(f"Sync mode timestamp validation: block_ts={block_data['timestamp']}, parent_ts={parent_info['timestamp']}")
+                # Enforce MTP even during sync
+                if mtp is not None and block_data["timestamp"] <= mtp:
+                    return False, f"Block timestamp {block_data['timestamp']} must be greater than median time past {mtp}"
+                logger.info(f"Sync mode timestamp validation: block_ts={block_data['timestamp']}, parent_ts={parent_info['timestamp']}, mtp={mtp}")
             else:
                 # Not syncing - validate against current time too
                 current_time = int(time.time())
-                logger.info(f"Timestamp validation: block_ts={block_data['timestamp']}, parent_ts={parent_info['timestamp']}, current={current_time}")
-                
+                logger.info(f"Timestamp validation: block_ts={block_data['timestamp']}, parent_ts={parent_info['timestamp']}, current={current_time}, mtp={mtp}")
+
                 # Additional validation when not syncing
                 # Special case: If parent is genesis (height 0), be more lenient with timestamp
                 parent_height = parent_info.get("height", 0)
@@ -680,22 +687,20 @@ class ChainManager:
                     logger.info("Allowing block 1 timestamp despite being before genesis (special case)")
                 elif block_data["timestamp"] <= parent_info["timestamp"]:
                     # Special handling for rapid mining (cpuminer compatibility)
-                    # If the block timestamp equals or is less than parent timestamp, check if we're mining rapidly
-                    # Check if parent block was mined very recently (within last 10 seconds)
                     time_since_parent = current_time - parent_info["timestamp"]
                     logger.info(f"Block timestamp <= parent. Time since parent: {time_since_parent}s")
-                    
-                    if time_since_parent <= 10:  # Increased window to 10 seconds
+
+                    if time_since_parent <= 10:
                         logger.warning(f"Allowing timestamp {block_data['timestamp']} <= parent {parent_info['timestamp']} for rapid mining (parent mined {time_since_parent}s ago)")
-                        # Skip the normal timestamp validation for rapid mining
                     else:
                         return False, f"Invalid block timestamp - must be greater than parent (block: {block_data['timestamp']}, parent: {parent_info['timestamp']})"
                 else:
-                    # Normal timestamp validation
+                    # Normal timestamp validation with MTP
                     if not validate_block_timestamp(
                         block_data["timestamp"],
                         parent_info["timestamp"],
-                        current_time
+                        current_time,
+                        median_time_past=mtp
                     ):
                         return False, "Invalid block timestamp"
         
@@ -715,9 +720,10 @@ class ChainManager:
                 for i, tx in enumerate(block_data['full_transactions']):
                     logger.info(f"Block 1 transaction {i}: has_txid={('txid' in tx) if tx else False}, keys={(list(tx.keys()) if tx else 'None')}")
             
-            # During sync mode, skip time validation for historical blocks
+            # During sync mode, tell validator we're syncing so it skips timestamp freshness
+            # but still enforces chain_id and other non-time-dependent checks
             if self.is_syncing:
-                self.validator.skip_time_validation = True
+                self.validator.is_syncing = True
             
             # Validate all non-coinbase transactions
             logger.info(f"About to validate block with {len(block_data.get('full_transactions', []))} full_transactions")
@@ -784,9 +790,9 @@ class ChainManager:
             
             is_valid, error_msg, total_fees = self.validator.validate_block_transactions(block_data)
             
-            # Reset skip_time_validation after validation
+            # Reset is_syncing flag on validator after validation
             if self.is_syncing:
-                self.validator.skip_time_validation = False
+                self.validator.is_syncing = False
             if not is_valid:
                 logger.error(f"Block {block_hash} rejected: {str(error_msg)}")
                 
@@ -1494,7 +1500,15 @@ class ChainManager:
         blocks_to_connect.reverse()  # Need to apply in forward order
         
         logger.info(f"Disconnecting {len(blocks_to_disconnect)} blocks, connecting {len(blocks_to_connect)} blocks")
-        
+
+        # Reject reorgs deeper than MAX_REORG_DEPTH
+        if len(blocks_to_disconnect) > MAX_REORG_DEPTH:
+            logger.error(f"Rejecting reorganization: disconnect depth {len(blocks_to_disconnect)} exceeds MAX_REORG_DEPTH ({MAX_REORG_DEPTH})")
+            return False
+        if len(blocks_to_connect) > MAX_REORG_DEPTH:
+            logger.error(f"Rejecting reorganization: connect depth {len(blocks_to_connect)} exceeds MAX_REORG_DEPTH ({MAX_REORG_DEPTH})")
+            return False
+
         # Create backup of current state for rollback
         backup_state = {
             "best_tip": current_tip,
@@ -1521,15 +1535,22 @@ class ChainManager:
         
         try:
             # Phase 1: Disconnect blocks from current chain
+            # Track UTXOs restored (unspent) by disconnection for cross-checking
+            restored_utxos = set()
             for block_hash in blocks_to_disconnect:
                 # Backup block state before disconnecting
                 block_key = f"block:{block_hash}".encode()
                 backup_state["block_states"][block_hash] = self.db.get(block_key)
-                
+
                 self._disconnect_block(block_hash, batch, backup_state["utxo_backups"])
-            
+
+            # Collect the set of UTXOs that were restored (marked unspent) during disconnect
+            for utxo_key_str, _ in backup_state["utxo_backups"].items():
+                restored_utxos.add(utxo_key_str)
+
+            logger.info(f"Phase 1 complete: {len(restored_utxos)} UTXOs restored during disconnect")
+
             # Phase 2: Validate and connect blocks from new chain
-            # DO NOT pre-collect spent UTXOs - this causes issues with validation
             # Each block's validation will handle its own spent UTXO tracking
             new_chain_spent_utxos = set()
             
@@ -1558,8 +1579,8 @@ class ChainManager:
                     except Exception as e:
                         raise ValueError(f"Failed to validate block {block_hash} during reorg: {e}")
                 
-                # Connect with new chain UTXO tracking
-                self._connect_block_safe(block_dict, batch, new_chain_spent_utxos)
+                # Connect with new chain UTXO tracking and restored UTXO cross-check
+                self._connect_block_safe(block_dict, batch, new_chain_spent_utxos, restored_utxos)
             
             # Phase 3: Update chain state in the same batch for atomicity
             key = b"chain:best_tip"
@@ -1641,12 +1662,13 @@ class ChainManager:
             
             return False
     
-    def _find_common_ancestor(self, hash1: str, hash2: str) -> Optional[str]:
-        """Find the common ancestor of two blocks"""
-        # Get ancestors of both blocks
+    def _find_common_ancestor(self, hash1: str, hash2: str, max_depth: int = MAX_REORG_DEPTH) -> Optional[str]:
+        """Find the common ancestor of two blocks, bailing out if deeper than max_depth"""
+        # Get ancestors of both blocks (limited by max_depth)
         ancestors1 = set()
         current = hash1
-        while current:
+        depth = 0
+        while current and depth <= max_depth:
             ancestors1.add(current)
             if current in self.block_index:
                 current = self.block_index[current]["previous_hash"]
@@ -1656,10 +1678,12 @@ class ChainManager:
                     break
             else:
                 break
-        
-        # Walk up hash2's chain until we find common ancestor
+            depth += 1
+
+        # Walk up hash2's chain until we find common ancestor (limited by max_depth)
         current = hash2
-        while current:
+        depth = 0
+        while current and depth <= max_depth:
             if current in ancestors1:
                 return current
             if current in self.block_index:
@@ -1669,7 +1693,10 @@ class ChainManager:
                     return current
             else:
                 break
-        
+            depth += 1
+
+        if depth > max_depth:
+            logger.error(f"Common ancestor search exceeded max_depth ({max_depth})")
         return None
     
     def _get_chain_between(self, tip_hash: str, ancestor_hash: str) -> List[str]:
@@ -1814,10 +1841,12 @@ class ChainManager:
         height_index = get_height_index()
         height_index.add_block_to_index(block_data["height"], block_data["block_hash"])
     
-    def _connect_block_safe(self, block_data: dict, batch: WriteBatch, new_chain_spent_utxos: Set[str]):
+    def _connect_block_safe(self, block_data: dict, batch: WriteBatch, new_chain_spent_utxos: Set[str],
+                            restored_utxos: Optional[Set[str]] = None):
         """
-        Connect a block during reorganization with double-spend protection
-        Ensures UTXOs aren't restored if they're spent elsewhere in new chain
+        Connect a block during reorganization with double-spend protection.
+        Ensures UTXOs aren't restored if they're spent elsewhere in new chain.
+        Validates each input UTXO actually exists and is unspent before allowing the spend.
         """
         logger.info(f"Safely connecting block {block_data['block_hash']} at height {block_data['height']}")
 
@@ -1849,9 +1878,9 @@ class ChainManager:
                 continue  # Validate coinbase after we know total fees
                 
             # Validate transaction before applying
-            if not self._validate_transaction_for_reorg(tx, block_spent_utxos, new_chain_spent_utxos):
+            if not self._validate_transaction_for_reorg(tx, block_spent_utxos, new_chain_spent_utxos, restored_utxos):
                 raise ValueError(f"Invalid transaction {tx.get('txid')} during reorganization")
-            
+
             # Calculate transaction fee
             total_input = Decimal("0")
             total_output = Decimal("0")
@@ -1886,7 +1915,7 @@ class ChainManager:
             # Skip re-validation for non-coinbase (already validated above)
             if not self.validator._is_coinbase_transaction(tx):
                 # Validate transaction before applying (redundant but safe)
-                if not self._validate_transaction_for_reorg(tx, block_spent_utxos, new_chain_spent_utxos):
+                if not self._validate_transaction_for_reorg(tx, block_spent_utxos, new_chain_spent_utxos, restored_utxos):
                     raise ValueError(f"Invalid transaction {tx.get('txid')} during reorganization")
             
             # Apply transaction
@@ -2041,53 +2070,54 @@ class ChainManager:
         wallet_index = get_wallet_index()
         wallet_index.update_for_new_transaction(tx, batch)
     
-    def _validate_transaction_for_reorg(self, tx: dict, block_spent_utxos: Set[str], 
-                                       new_chain_spent_utxos: Set[str]) -> bool:
+    def _validate_transaction_for_reorg(self, tx: dict, block_spent_utxos: Set[str],
+                                       new_chain_spent_utxos: Set[str],
+                                       restored_utxos: Optional[Set[str]] = None) -> bool:
         """
-        Validate a transaction during reorganization
-        Checks signatures, balances, and double-spending
+        Validate a transaction during reorganization.
+        Checks signatures, balances, double-spending, and UTXO existence.
         """
         if not tx or "txid" not in tx:
             logger.error("Invalid transaction format - missing txid")
             return False
-        
+
         txid = tx["txid"]
-        
+
         # Skip coinbase transactions (they have special rules)
         if len(tx.get("inputs", [])) == 1 and tx["inputs"][0].get("txid") == "00" * 32:
             logger.debug(f"Skipping validation for coinbase transaction {txid}")
             return True
-        
+
         # Validate all inputs exist and aren't double-spent
         total_input = Decimal(0)
         for inp in tx.get("inputs", []):
             if "txid" not in inp:
                 logger.error(f"Transaction {txid} has invalid input - missing txid")
                 return False
-            
+
             # Check if this UTXO is already spent in this block
             utxo_key = f"{inp['txid']}:{inp.get('utxo_index', 0)}"
             if utxo_key in block_spent_utxos:
                 logger.error(f"Double-spend detected: UTXO {utxo_key} already spent in block")
                 return False
-            
+
             # Check if this UTXO is spent elsewhere in the new chain
             if utxo_key in new_chain_spent_utxos:
                 logger.error(f"Double-spend detected: UTXO {utxo_key} spent in new chain")
                 return False
-            
-            # Verify UTXO exists and get amount
+
+            # Verify UTXO exists in DB and is unspent
             utxo_db_key = f"utxo:{utxo_key}".encode()
             utxo_data = self.db.get(utxo_db_key)
             if not utxo_data:
                 logger.error(f"Transaction {txid} references non-existent UTXO {utxo_key}")
                 return False
-            
+
             utxo = json.loads(utxo_data.decode())
             if utxo.get("spent", False):
                 logger.error(f"Transaction {txid} tries to spend already spent UTXO {utxo_key}")
                 return False
-            
+
             total_input += Decimal(utxo.get("amount", "0"))
         
         # Validate outputs sum to inputs (allowing for fees)
