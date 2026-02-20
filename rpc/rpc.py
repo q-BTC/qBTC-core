@@ -10,8 +10,7 @@ from fastapi import FastAPI, Request
 # CORSMiddleware removed - nginx handles CORS at the proxy level
 from database.database import get_db, get_current_height
 from config.config import ADMIN_ADDRESS, CHAIN_ID
-from wallet.wallet import verify_transaction
-from blockchain.blockchain import derive_qsafe_address,Block, bits_to_target, serialize_transaction,scriptpubkey_to_address, read_varint, parse_tx, validate_pow, sha256d, calculate_merkle_root
+from blockchain.blockchain import Block, bits_to_target, serialize_transaction,scriptpubkey_to_address, read_varint, parse_tx, validate_pow, sha256d, calculate_merkle_root
 from blockchain.difficulty import get_next_bits
 from blockchain.block_factory import create_block, normalize_block
 from state.state import blockchain, state_lock, mempool_manager
@@ -667,93 +666,24 @@ async def submit_block(request: Request, data: dict) -> dict:
             logger.warning("cpuminer may have duplicated transaction data")
 
 
-        # Track UTXOs spent in this block to prevent double-spending within the same block
-        spent_in_this_block = set()
-        unique_txids_processed = set()  # Track which txids we've already processed
-        
+        # Calculate txids and deduplicate — NO inline validation here.
+        # All consensus validation (signatures, balances, UTXOs, double-spends,
+        # chain-id, timestamps, amounts) is handled by ChainManager.add_block()
+        # via TransactionValidator. Duplicating validation here risks consensus
+        # splits if the two paths diverge.
+        unique_txids_processed = set()
+
         for i, tx in enumerate(tx_list):
-            # ALWAYS calculate txid - don't preserve existing ones
-            # This ensures consistency with cpuminer's expectations
             raw_tx = serialize_transaction(tx)
-            # sha256d returns hash in internal byte order
-            # Reverse bytes for standard Bitcoin txid format
             txid = sha256d(bytes.fromhex(raw_tx))[::-1].hex()
-            logger.debug(f"Calculated TXID for transaction {i}: {txid}")
-            # Add txid to the transaction object itself
             tx["txid"] = txid
-            
-            # Only add unique txids to our list
+
             if txid not in unique_txids_processed:
                 txids.append(txid)
                 unique_txids_processed.add(txid)
             else:
                 logger.info(f"Skipping duplicate transaction {txid} in block data")
-                continue  # Skip processing duplicate transactions
-            inputs = tx["inputs"]
-            outputs = tx["outputs"]
-            message_str = tx["body"]["msg_str"]
-            pubkey = tx["body"]["pubkey"]
-            signature = tx["body"]["signature"]
-            if verify_transaction(message_str, signature, pubkey) is True:
-
-                from_ = message_str.split(":")[0]
-                to_ = message_str.split(":")[1]
-                amount_ = message_str.split(":")[2]
-                total_available = Decimal(0)
-                total_required = Decimal(0)
-                total_authorised = Decimal(amount_)
-
-                if derive_qsafe_address(pubkey) != from_:
-                    raise ValueError("Transaction signature validation failed: wrong signer")
-
-                for input_ in inputs:
-                    input_receiver = input_["receiver"]
-                    input_amount = input_["amount"]
-                    input_spent = input_["spent"]
-                    if (input_receiver == from_):
-                        if (input_spent == False):
-                            total_available += Decimal(input_amount)
-                for output_ in outputs:
-                    output_receiver = output_["receiver"]
-                    output_amount = output_["amount"]
-                    if output_receiver in (from_, to_, ADMIN_ADDRESS):
-                        total_required += Decimal(output_amount)
-                    else:
-                        logger.warning(f"Invalid output receiver in transaction: {output_receiver}")
-                        return rpc_error(-1, f"Invalid output receiver: {output_receiver}", data["id"])
-                miner_fee = (Decimal(total_authorised) * Decimal("0.001")).quantize(Decimal("0.00000001"))
-                total_required = Decimal(total_authorised) + Decimal(miner_fee)
-                if (total_required <= total_available):
-                    # Validation passed - just check for double-spends within this block
-                    for input_ in inputs:
-                        utxo_key = f"utxo:{input_['txid']}:{input_.get('utxo_index', 0)}".encode()
-                        utxo_key_str = utxo_key.decode()
-                        
-                        # Check if this UTXO was already spent in this block
-                        if utxo_key_str in spent_in_this_block:
-                            logger.error(f"Double-spend within block: {utxo_key}")
-                            return rpc_error(-1, f"Double-spend detected within block: {utxo_key.decode()}", data["id"])
-                            
-                        # Check if UTXO exists and isn't already spent
-                        if utxo_key in db:
-                            utxo_raw = db.get(utxo_key)
-                            if utxo_raw is None:
-                                logger.error(f"UTXO not found: {utxo_key}")
-                                return rpc_error(-1, f"Input not found: {utxo_key.decode()}", data["id"])
-                            utxo = json.loads(utxo_raw.decode())
-                            if utxo["spent"]:
-                                logger.error(f"Double-spend attempt: {utxo_key}")
-                                return rpc_error(-1, f"Double-spend detected: {utxo_key.decode()}", data["id"])
-                            
-                            # Track that this UTXO is being spent in this block
-                            spent_in_this_block.add(utxo_key_str)
-                        else:
-                            logger.error(f"UTXO not found in database: {utxo_key}")
-                            return rpc_error(-1, f"Input not found: {utxo_key.decode()}", data["id"])
-                    
-                    # ChainManager will handle all UTXO creation and wallet index updates
-                    # Transaction will be stored by ChainManager when it processes the block
-                    pass  # No need to store transaction here
+                continue
 
 
         # Debug: Log all transaction IDs
