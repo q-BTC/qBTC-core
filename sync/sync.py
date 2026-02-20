@@ -443,28 +443,27 @@ async def _handle_missing_utxo(block: dict, missing_utxo: str):
             txs = await request_specific_transactions([missing_txid], gossip_client)
             if txs:
                 logging.info(f"[SYNC] Successfully received missing transaction {missing_txid}, storing it")
-                # Store the transaction in the database
+                # Store transaction and UTXOs atomically
                 db = get_db()
+                batch = WriteBatch()
                 for tx in txs:
                     tx_key = f"tx:{missing_txid}".encode()
-                    db[tx_key] = json.dumps(tx).encode()
-
-                    # Also update UTXO set if needed
-                    from blockchain.utxo_manager import get_utxo_manager
-                    utxo_manager = get_utxo_manager()
+                    batch.put(tx_key, json.dumps(tx).encode())
 
                     # Process transaction outputs to add UTXOs
                     for i, output in enumerate(tx.get("outputs", [])):
-                        utxo_id = f"{missing_txid}:{i}"
-                        utxo_data = {
+                        utxo_key = f"utxo:{missing_txid}:{i}".encode()
+                        utxo_record = {
                             "txid": missing_txid,
-                            "index": i,
-                            "amount": output.get("amount", 0),
-                            "script_pubkey": output.get("script_pubkey", ""),
-                            "height": block_height - 1,  # Assume it's from a previous block
-                            "spent": False
+                            "utxo_index": i,
+                            "amount": str(output.get("amount", "0")),
+                            "receiver": output.get("receiver", ""),
+                            "sender": output.get("sender", ""),
+                            "spent": False,
+                            "created_at_height": block_height - 1,
                         }
-                        utxo_manager.add_utxo(utxo_id, utxo_data)
+                        batch.put(utxo_key, json.dumps(utxo_record).encode())
+                db.write(batch)
 
                 logging.info(f"[SYNC] Retrying block {block_hash} after fetching missing transaction")
                 # Retry processing the block with recursion depth guard
