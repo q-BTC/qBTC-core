@@ -401,53 +401,36 @@ def get_transactions(wallet_address: str, limit: int = 50, include_coinbase: boo
             "isPending": False
         })
     
-    # Add mempool transactions for this wallet
+    # Add mempool transactions for this wallet — O(k) where k = address's pending txs
     if mempool_manager:
-        mempool_txs = mempool_manager.get_all_transactions()
-        for txid, tx in mempool_txs.items():
-            # Check if this wallet is involved in the transaction
-            is_involved = False
-            
-            # Check outputs
-            for out in tx.get("outputs", []):
-                if out.get("receiver") == wallet_address:
-                    is_involved = True
-                    break
-            
-            # Check inputs (if wallet is sender)
-            if not is_involved:
-                body = tx.get("body", {})
-                msg_str = body.get("msg_str", "")
-                if msg_str:
-                    parts = msg_str.split(":")
-                    if len(parts) >= 2 and parts[0] == wallet_address:
-                        is_involved = True
-            
-            if is_involved:
-                # Add this mempool transaction
-                body = tx.get("body", {})
-                msg_str = body.get("msg_str", "")
-                if msg_str:
-                    parts = msg_str.split(":")
-                    if len(parts) >= 3:
-                        sender = parts[0]
-                        receiver = parts[1]
-                        amount = parts[2]
+        address_mempool_txs = mempool_manager.get_transactions_for_address(wallet_address)
+        for tx in address_mempool_txs:
+            txid = tx.get("txid")
+            if not txid:
+                continue
+            body = tx.get("body", {})
+            msg_str = body.get("msg_str", "")
+            if msg_str:
+                parts = msg_str.split(":")
+                if len(parts) >= 3:
+                    sender = parts[0]
+                    receiver = parts[1]
+                    amount = parts[2]
 
-                        direction = "sent" if sender == wallet_address else "received"
-                        from_address = sender
-                        to_address = receiver
+                    direction = "sent" if sender == wallet_address else "received"
+                    from_address = sender
+                    to_address = receiver
 
-                        tx_list.append({
-                            "txid": txid,
-                            "timestamp": tx.get("timestamp", int(time.time() * 1000)),
-                            "direction": direction,
-                            "amount": amount if direction == "received" else f"-{amount}",
-                            "from": from_address,
-                            "to": to_address,
-                            "isPending": True,
-                            "isMempool": True
-                        })
+                    tx_list.append({
+                        "txid": txid,
+                        "timestamp": tx.get("timestamp", int(time.time() * 1000)),
+                        "direction": direction,
+                        "amount": amount if direction == "received" else f"-{amount}",
+                        "from": from_address,
+                        "to": to_address,
+                        "isPending": True,
+                        "isMempool": True
+                    })
     
     # Sort by timestamp (newest first)
     tx_list.sort(key=lambda x: x["timestamp"], reverse=True)
@@ -1044,13 +1027,8 @@ async def worker_endpoint(request: Request):
         inputs = []
         total_available = Decimal("0")
         
-        # Get UTXOs already being used in mempool to avoid double-spending
-        mempool_used_utxos = set()
-        all_mempool_txs = mempool_manager.get_all_transactions()
-        for mempool_tx in all_mempool_txs.values():
-            for inp in mempool_tx.get("inputs", []):
-                utxo_key = f"{inp['txid']}:{inp.get('utxo_index', 0)}"
-                mempool_used_utxos.add(utxo_key)
+        # Get UTXOs already being used in mempool to avoid double-spending — O(1)
+        mempool_used_utxos = mempool_manager.get_in_use_utxo_keys()
         
         # Use new wallet index for fast lookup
         from blockchain.wallet_index import get_wallet_index

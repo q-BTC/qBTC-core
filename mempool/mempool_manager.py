@@ -31,6 +31,7 @@ class MempoolManager:
         self.tx_utxo_versions: Dict[str, Dict[str, int]] = {}  # txid -> {utxo_key: version} for optimistic locking
         self.tx_sequence: int = 0  # Global sequence counter for transaction ordering
         self.tx_sequences: Dict[str, int] = {}  # txid -> sequence number
+        self.address_txids: Dict[str, Set[str]] = {}  # address -> set of txids (O(1) per-address lookup)
         self.max_size = max_size if max_size is not None else MAX_MEMPOOL_TRANSACTIONS
         self.max_memory_bytes = (max_memory_mb if max_memory_mb is not None else MAX_MEMPOOL_SIZE_MB) * 1024 * 1024
         self.current_memory_usage = 0
@@ -159,6 +160,9 @@ class MempoolManager:
                 # Store UTXO versions for later validation
                 self.tx_utxo_versions[txid] = utxo_versions
 
+                # Update per-address index for O(1) lookups
+                self._index_transaction_addresses(txid, tx)
+
                 # Update wallet indexes for mempool transaction
                 # This ensures transactions show up in wallet views immediately
                 from blockchain.wallet_index import get_wallet_index
@@ -195,14 +199,17 @@ class MempoolManager:
             if self.in_use_utxos.get(utxo_key) == txid:
                 del self.in_use_utxos[utxo_key]
                 
+        # Remove from address index
+        self._unindex_transaction_addresses(txid, tx)
+
         # Remove transaction
         del self.transactions[txid]
         self.current_memory_usage -= self.tx_sizes.get(txid, 0)
         self.tx_fees.pop(txid, None)
         self.tx_sizes.pop(txid, None)
         self.tx_fee_rates.pop(txid, None)
-        self.tx_utxo_versions.pop(txid, None)  # Clean up UTXO version tracking
-        self.tx_sequences.pop(txid, None)  # Clean up sequence number
+        self.tx_utxo_versions.pop(txid, None)
+        self.tx_sequences.pop(txid, None)
         
         logger.info(f"Removed transaction {txid} from mempool")
         return True
@@ -398,6 +405,60 @@ class MempoolManager:
         logger.info(f"Evicting transaction {lowest_txid} with fee rate {self.tx_fee_rates.get(lowest_txid, 0):.8f}")
         return self.remove_transaction(lowest_txid)
     
+    def get_in_use_utxo_keys(self) -> Set[str]:
+        """Return the set of UTXO keys currently spent in mempool — O(1)."""
+        return set(self.in_use_utxos.keys())
+
+    def is_utxo_in_use(self, utxo_key: str) -> bool:
+        """Check if a UTXO is currently spent in mempool — O(1)."""
+        return utxo_key in self.in_use_utxos
+
+    def get_transactions_for_address(self, address: str) -> List[dict]:
+        """Get mempool transactions involving an address — O(k) where k = address's txs."""
+        txids = self.address_txids.get(address, set())
+        return [self.transactions[txid] for txid in txids if txid in self.transactions]
+
+    def _index_transaction_addresses(self, txid: str, tx: dict):
+        """Add transaction to per-address index."""
+        addresses = set()
+        # Extract addresses from outputs
+        for out in tx.get("outputs", []):
+            recv = out.get("receiver")
+            if recv:
+                addresses.add(recv)
+        # Extract sender from msg_str
+        body = tx.get("body", {})
+        msg_str = body.get("msg_str", "")
+        if msg_str:
+            parts = msg_str.split(":")
+            if len(parts) >= 2:
+                addresses.add(parts[0])  # sender
+                addresses.add(parts[1])  # receiver
+        for addr in addresses:
+            if addr not in self.address_txids:
+                self.address_txids[addr] = set()
+            self.address_txids[addr].add(txid)
+
+    def _unindex_transaction_addresses(self, txid: str, tx: dict):
+        """Remove transaction from per-address index."""
+        addresses = set()
+        for out in tx.get("outputs", []):
+            recv = out.get("receiver")
+            if recv:
+                addresses.add(recv)
+        body = tx.get("body", {})
+        msg_str = body.get("msg_str", "")
+        if msg_str:
+            parts = msg_str.split(":")
+            if len(parts) >= 2:
+                addresses.add(parts[0])
+                addresses.add(parts[1])
+        for addr in addresses:
+            if addr in self.address_txids:
+                self.address_txids[addr].discard(txid)
+                if not self.address_txids[addr]:
+                    del self.address_txids[addr]
+
     def get_stats(self) -> dict:
         """Get mempool statistics."""
         total_fees = sum(self.tx_fees.values())
