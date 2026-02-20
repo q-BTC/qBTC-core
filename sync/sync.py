@@ -431,52 +431,11 @@ async def _handle_missing_utxo(block: dict, missing_utxo: str):
     _missing_utxo_blocks[block_hash]["missing_utxos"].add(missing_utxo)
     _missing_utxo_blocks[block_hash]["attempts"] += 1
 
-    # First, try to request the specific missing transaction
-    if ":" in missing_utxo and _missing_utxo_blocks[block_hash]["attempts"] == 1:
-        missing_txid = missing_utxo.split(":")[0]
-        logging.info(f"[SYNC] Attempting to request missing transaction {missing_txid}")
-
-        from gossip.gossip import get_gossip_node
-        gossip_client = get_gossip_node()
-
-        if gossip_client:
-            txs = await request_specific_transactions([missing_txid], gossip_client)
-            if txs:
-                logging.info(f"[SYNC] Successfully received missing transaction {missing_txid}, storing it")
-                # Store transaction and UTXOs atomically
-                db = get_db()
-                batch = WriteBatch()
-                for tx in txs:
-                    tx_key = f"tx:{missing_txid}".encode()
-                    batch.put(tx_key, json.dumps(tx).encode())
-
-                    # Process transaction outputs to add UTXOs
-                    for i, output in enumerate(tx.get("outputs", [])):
-                        utxo_key = f"utxo:{missing_txid}:{i}".encode()
-                        utxo_record = {
-                            "txid": missing_txid,
-                            "utxo_index": i,
-                            "amount": str(output.get("amount", "0")),
-                            "receiver": output.get("receiver", ""),
-                            "sender": output.get("sender", ""),
-                            "spent": False,
-                            "created_at_height": block_height - 1,
-                        }
-                        batch.put(utxo_key, json.dumps(utxo_record).encode())
-                db.write(batch)
-
-                logging.info(f"[SYNC] Retrying block {block_hash} after fetching missing transaction")
-                # Retry processing the block with recursion depth guard
-                global _current_recursion_depth
-                if _current_recursion_depth >= _max_recursion_depth:
-                    logging.error(f"[SYNC] Max recursion depth ({_max_recursion_depth}) reached, aborting retry")
-                    return
-                _current_recursion_depth += 1
-                try:
-                    await process_blocks_from_peer([block])
-                finally:
-                    _current_recursion_depth -= 1
-                return
+    # SECURITY: Never fabricate UTXOs from individual transaction requests.
+    # Individual transactions have no PoW proof — a malicious peer could send
+    # fabricated transactions to create fake UTXOs. Instead, always request
+    # the ancestor BLOCKS and process them through the validated add_block
+    # pipeline (PoW check, signature verification, amount validation, etc.).
 
     # Check if we've tried too many times
     if _missing_utxo_blocks[block_hash]["attempts"] >= _max_backtrack_attempts:
