@@ -57,50 +57,92 @@ class ChainManager:
         # as it's now an async method. Call await chain_manager.initialize() after creating instance.
     
     def _check_and_recover_from_incomplete_reorg(self):
-        """Check for and recover from incomplete reorganization on startup"""
+        """Check for and recover from incomplete reorganization on startup.
+
+        Since the reorg marker is now written atomically in the same WriteBatch
+        as all reorg changes, only two states are possible:
+          1. No marker → no reorg was in progress (or it never committed)
+          2. Marker with status "completed" → reorg committed successfully
+
+        In either case, we verify chain integrity by walking back from the tip.
+        """
         try:
-            # Check for reorganization marker
             reorg_marker = self.db.get(b"chain:last_reorg")
             if reorg_marker:
                 reorg_data = json.loads(reorg_marker.decode())
-                logger.warning(f"Found incomplete reorganization marker: {reorg_data}")
-                
-                # Check if current tip matches expected result
-                current_tip_data = self.db.get(b"chain:best_tip")
-                if current_tip_data:
-                    current_tip = json.loads(current_tip_data.decode())
-                    
-                    # If tip doesn't match the expected reorg result, we may have crashed mid-reorg
-                    if current_tip["hash"] != reorg_data["to_tip"]:
-                        logger.critical(f"CRITICAL: Detected incomplete reorganization! Current tip: {current_tip['hash']}, Expected: {reorg_data['to_tip']}")
-                        
-                        # Verify blockchain consistency
-                        # This is a simplified check - in production, you'd want more comprehensive validation
-                        try:
-                            # Try to validate the current tip
-                            block_key = f"block:{current_tip['hash']}".encode()
-                            block_data = self.db.get(block_key)
-                            if not block_data:
-                                logger.critical(f"Current tip block {current_tip['hash']} not found in database!")
-                                # Attempt to revert to the original tip
-                                if reorg_data.get("from_tip"):
-                                    logger.info(f"Attempting to revert to original tip: {reorg_data['from_tip']}")
-                                    batch = WriteBatch()
-                                    batch.put(b"chain:best_tip", json.dumps({
-                                        "hash": reorg_data["from_tip"],
-                                        "height": reorg_data.get("from_height", 0)
-                                    }).encode())
-                                    self.db.write(batch)
-                        except Exception as e:
-                            logger.error(f"Failed to validate current chain state: {e}")
-                    else:
-                        logger.info("Reorganization appears to have completed successfully")
-                        # Clear the marker atomically
-                        cleanup_batch = WriteBatch()
-                        cleanup_batch.delete(b"chain:last_reorg")
-                        self.db.write(cleanup_batch)
+                status = reorg_data.get("status", "unknown")
+
+                if status == "completed":
+                    logger.info(f"Found completed reorganization marker: "
+                                f"{reorg_data.get('from_tip', '?')[:16]}... -> {reorg_data.get('to_tip', '?')[:16]}...")
+                else:
+                    # Legacy marker from before atomic reorg — shouldn't happen
+                    # with new code, but handle gracefully
+                    logger.warning(f"Found legacy reorg marker with status '{status}': {reorg_data}")
+
+            # Always verify chain integrity on startup regardless of marker
+            current_tip_data = self.db.get(b"chain:best_tip")
+            if not current_tip_data:
+                logger.info("No chain tip found — empty blockchain, skipping integrity check")
+                return
+
+            try:
+                current_tip = json.loads(current_tip_data.decode())
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                logger.error("Corrupt chain:best_tip — cannot parse JSON")
+                return
+
+            tip_hash = current_tip.get("hash")
+            if not tip_hash:
+                logger.error("chain:best_tip missing 'hash' field")
+                return
+
+            # Walk back from tip to verify block chain connectivity (up to 20 blocks)
+            INTEGRITY_CHECK_DEPTH = 20
+            current_hash = tip_hash
+            blocks_checked = 0
+
+            while current_hash and current_hash != "00" * 32 and blocks_checked < INTEGRITY_CHECK_DEPTH:
+                block_key = f"block:{current_hash}".encode()
+                block_data = self.db.get(block_key)
+
+                if not block_data:
+                    logger.critical(f"INTEGRITY FAILURE: Block {current_hash} referenced in chain but not found in DB!")
+                    # If we have the reorg marker's from_tip, try to fall back
+                    if reorg_marker:
+                        from_tip = reorg_data.get("from_tip")
+                        from_height = reorg_data.get("from_height")
+                        if from_tip:
+                            from_block = self.db.get(f"block:{from_tip}".encode())
+                            if from_block:
+                                logger.warning(f"Reverting to pre-reorg tip: {from_tip[:16]}...")
+                                batch = WriteBatch()
+                                batch.put(b"chain:best_tip", json.dumps({
+                                    "hash": from_tip,
+                                    "height": from_height or json.loads(from_block.decode()).get("height", 0)
+                                }).encode())
+                                batch.delete(b"chain:last_reorg")
+                                self.db.write(batch)
+                                logger.info("Reverted to pre-reorg chain tip")
+                                return
+                    logger.critical("No fallback available — manual recovery may be needed")
+                    return
+
+                block = json.loads(block_data.decode())
+                current_hash = block.get("previous_hash")
+                blocks_checked += 1
+
+            logger.info(f"Chain integrity check passed: {blocks_checked} blocks verified from tip {tip_hash[:16]}...")
+
+            # Clean up reorg marker after successful verification
+            if reorg_marker:
+                cleanup_batch = WriteBatch()
+                cleanup_batch.delete(b"chain:last_reorg")
+                self.db.write(cleanup_batch)
+                logger.info("Cleared reorg marker after integrity verification")
+
         except Exception as e:
-            logger.error(f"Error checking for incomplete reorganization: {e}")
+            logger.error(f"Error during startup integrity check: {e}")
     
     async def initialize(self):
         """Initialize the chain manager - must be called after __init__"""
@@ -494,7 +536,13 @@ class ChainManager:
                 if isinstance(difficulty, str):
                     difficulty = Decimal(difficulty)
 
-            if difficulty and difficulty > best_difficulty:
+            if difficulty and (difficulty > best_difficulty or
+                              (difficulty == best_difficulty and
+                               (best_tip is None or tip_hash < best_tip))):
+                # Deterministic tiebreaker: when difficulty is equal, prefer the
+                # lexicographically lower block hash. This ensures ALL nodes converge
+                # on the same chain rather than depending on non-deterministic set
+                # iteration order.
                 best_difficulty = difficulty
                 best_tip = tip_hash
                 best_height = tip_info["height"]
@@ -546,7 +594,10 @@ class ChainManager:
             if isinstance(difficulty, str):
                 difficulty = Decimal(difficulty)
             
-            if difficulty > best_difficulty:
+            if (difficulty > best_difficulty or
+                    (difficulty == best_difficulty and
+                     (best_tip is None or tip_hash < best_tip))):
+                # Deterministic tiebreaker: lower hash wins on equal difficulty
                 best_difficulty = difficulty
                 best_tip = tip_hash
                 best_height = tip_info["height"]
@@ -1566,20 +1617,10 @@ class ChainManager:
             "block_states": {}
         }
         
-        # Write a reorganization marker BEFORE starting (separate write for recovery)
+        # Start database transaction — ALL reorg changes (disconnect, connect, tip
+        # update, and completion marker) go into this single atomic WriteBatch.
+        # No separate pre-write marker: either everything commits or nothing does.
         reorg_marker_key = b"chain:last_reorg"
-        marker_batch = WriteBatch()
-        marker_batch.put(reorg_marker_key, json.dumps({
-            "from_tip": current_tip,
-            "to_tip": new_tip_hash,
-            "timestamp": time.time(),
-            "blocks_to_disconnect": len(blocks_to_disconnect),
-            "blocks_to_connect": len(blocks_to_connect),
-            "status": "in_progress"
-        }).encode())
-        self.db.write(marker_batch)
-        
-        # Start database transaction
         batch = WriteBatch()
         
         try:
@@ -1629,24 +1670,19 @@ class ChainManager:
                     except Exception as e:
                         raise ValueError(f"Failed to validate block {block_hash} during reorg: {e}")
                 
-                # Connect with new chain UTXO tracking and restored UTXO cross-check
-                self._connect_block_safe(block_dict, batch, new_chain_spent_utxos, restored_utxos)
+                # Connect with new chain UTXO tracking, restored UTXO cross-check,
+                # and overlay so connect phase reads pending disconnect changes
+                self._connect_block_safe(block_dict, batch, new_chain_spent_utxos, restored_utxos, utxo_overlay)
             
-            # Phase 3: Update chain state in the same batch for atomicity
-            key = b"chain:best_tip"
-            batch.put(key, json.dumps({
+            # Phase 3: Update chain state AND reorg marker in the same atomic batch.
+            # Since WriteBatch is atomic, either ALL changes commit or NONE do.
+            # No separate marker write needed — crash before commit = clean rollback,
+            # crash after commit = reorg fully applied with "completed" marker.
+            batch.put(b"chain:best_tip", json.dumps({
                 "hash": new_tip_hash,
                 "height": self.block_index[new_tip_hash]["height"]
             }).encode())
-            
-            # Commit the reorganization atomically - ALL changes in one write
-            self.db.write(batch)
-            
-            # Update the reorganization marker to completed status (separate write is OK here)
-            # If we crash after batch write but before this, recovery will see the reorg
-            # completed successfully by checking if tip matches expected result
-            completion_batch = WriteBatch()
-            completion_batch.put(reorg_marker_key, json.dumps({
+            batch.put(reorg_marker_key, json.dumps({
                 "from_tip": current_tip,
                 "to_tip": new_tip_hash,
                 "timestamp": time.time(),
@@ -1654,7 +1690,9 @@ class ChainManager:
                 "blocks_connected": len(blocks_to_connect),
                 "status": "completed"
             }).encode())
-            self.db.write(completion_batch)
+
+            # Commit the reorganization atomically - ALL changes in one write
+            self.db.write(batch)
             
             logger.info(f"Chain reorganization complete. New tip: {new_tip_hash}")
             
@@ -1897,12 +1935,19 @@ class ChainManager:
         height_index.add_block_to_index(block_data["height"], block_data["block_hash"])
     
     def _connect_block_safe(self, block_data: dict, batch: WriteBatch, new_chain_spent_utxos: Set[str],
-                            restored_utxos: Optional[Set[str]] = None):
+                            restored_utxos: Optional[Set[str]] = None,
+                            utxo_overlay: Optional[Dict[bytes, Optional[bytes]]] = None):
         """
         Connect a block during reorganization with double-spend protection.
         Ensures UTXOs aren't restored if they're spent elsewhere in new chain.
         Validates each input UTXO actually exists and is unspent before allowing the spend.
+
+        utxo_overlay: Tracks pending UTXO changes from disconnect phase AND prior connect
+        blocks. Reads go through overlay first so we see uncommitted WriteBatch state.
         """
+        if utxo_overlay is None:
+            utxo_overlay = {}
+
         logger.info(f"Safely connecting block {block_data['block_hash']} at height {block_data['height']}")
 
         # Get full transactions
@@ -1914,46 +1959,55 @@ class ChainManager:
         for txid in block_data.get("tx_ids", []):
             tx_block_key = f"tx_block:{txid}".encode()
             batch.put(tx_block_key, json.dumps({"height": block_height, "hash": block_hash}).encode())
-        
+
         # Track UTXOs spent within this block to prevent double-spending within same block
         block_spent_utxos = set()
-        
+
         # Track fees for coinbase validation
         total_fees = Decimal("0")
         coinbase_tx = None
-        
-        # Process all transactions in the block with validation
+
+        # First pass: validate all non-coinbase transactions and calculate fees.
+        # Track intra-block double-spends in block_spent_utxos during validation.
         for tx in full_transactions:
             if tx is None:
                 continue
-            
+
             # Check if this is coinbase
             if self.validator._is_coinbase_transaction(tx):
                 coinbase_tx = tx
                 continue  # Validate coinbase after we know total fees
-                
-            # Validate transaction before applying
-            if not self._validate_transaction_for_reorg(tx, block_spent_utxos, new_chain_spent_utxos, restored_utxos):
+
+            # Validate transaction (uses overlay to see disconnect-phase UTXO changes)
+            if not self._validate_transaction_for_reorg(tx, block_spent_utxos, new_chain_spent_utxos,
+                                                        restored_utxos, utxo_overlay):
                 raise ValueError(f"Invalid transaction {tx.get('txid')} during reorganization")
 
-            # Calculate transaction fee
+            # Track intra-block spent UTXOs during first pass so subsequent
+            # transactions in the same block see them as spent
+            for inp in tx.get("inputs", []):
+                if "txid" in inp and inp["txid"] != "00" * 32:
+                    utxo_key = f"{inp['txid']}:{inp.get('utxo_index', 0)}"
+                    block_spent_utxos.add(utxo_key)
+
+            # Calculate transaction fee using overlay for UTXO reads
             total_input = Decimal("0")
             total_output = Decimal("0")
-            
+
             for inp in tx.get("inputs", []):
                 if "txid" in inp and inp["txid"] != "00" * 32:
                     utxo_key = f"utxo:{inp['txid']}:{inp.get('utxo_index', 0)}".encode()
-                    utxo_data = self.db.get(utxo_key)
+                    utxo_data = self._read_utxo_overlay(utxo_key, utxo_overlay)
                     if utxo_data:
-                        utxo = json.loads(utxo_data.decode())
+                        utxo = json.loads(utxo_data.decode() if isinstance(utxo_data, bytes) else utxo_data)
                         total_input += Decimal(utxo.get("amount", "0"))
-            
+
             for out in tx.get("outputs", []):
                 total_output += Decimal(out.get("amount", "0"))
-            
+
             if total_input > total_output:
                 total_fees += (total_input - total_output)
-        
+
         # Validate coinbase transaction if present
         if coinbase_tx and block_data["height"] > 0:
             is_valid, error_msg = self.validator.validate_coinbase_transaction(
@@ -1961,27 +2015,16 @@ class ChainManager:
             )
             if not is_valid:
                 raise ValueError(f"Invalid coinbase during reorganization: {error_msg}")
-        
-        # Now apply all transactions (including coinbase)
+
+        # Second pass: apply all transactions (including coinbase).
+        # No re-validation needed — first pass was comprehensive with overlay reads.
         for tx in full_transactions:
             if tx is None:
                 continue
-                
-            # Skip re-validation for non-coinbase (already validated above)
-            if not self.validator._is_coinbase_transaction(tx):
-                # Validate transaction before applying (redundant but safe)
-                if not self._validate_transaction_for_reorg(tx, block_spent_utxos, new_chain_spent_utxos, restored_utxos):
-                    raise ValueError(f"Invalid transaction {tx.get('txid')} during reorganization")
-            
-            # Apply transaction
-            self._apply_transaction_safe(tx, block_data["height"], batch, new_chain_spent_utxos)
-            
-            # Track spent UTXOs from this transaction
-            for inp in tx.get("inputs", []):
-                if "txid" in inp and inp["txid"] != "00" * 32:
-                    utxo_key = f"{inp['txid']}:{inp.get('utxo_index', 0)}"
-                    block_spent_utxos.add(utxo_key)
-        
+
+            # Apply transaction (updates overlay so next block sees changes)
+            self._apply_transaction_safe(tx, block_data["height"], batch, new_chain_spent_utxos, utxo_overlay)
+
         # Remove mined transactions from mempool during reorganization
         removed_count = 0
         for tx in full_transactions:
@@ -1989,25 +2032,33 @@ class ChainManager:
                 if mempool_manager.get_transaction(tx["txid"]) is not None:
                     mempool_manager.remove_transaction(tx["txid"])
                     removed_count += 1
-        
+
         if removed_count > 0:
             logger.info(f"Removed {removed_count} mined transactions from mempool during reorg for block {block_data['block_hash']}")
-        
+
         # Mark block as connected
         block_data["connected"] = True
         # Normalize before storing
         block_data = normalize_block(block_data, add_defaults=False)
         block_key = f"block:{block_data['block_hash']}".encode()
         batch.put(block_key, json.dumps(block_data).encode())
-        
+
         # Update the height index
         height_index = get_height_index()
         height_index.add_block_to_index(block_data["height"], block_data["block_hash"])
-        
+
         # Update new_chain_spent_utxos with UTXOs spent in this block
         # This tracks all UTXOs spent across the entire new chain
         new_chain_spent_utxos.update(block_spent_utxos)
     
+    def _read_utxo_overlay(self, key: bytes, utxo_overlay: Dict[bytes, Optional[bytes]]) -> Optional[bytes]:
+        """Read UTXO from overlay first, then fall back to DB.
+        Overlay values of None indicate deleted UTXOs.
+        Used during reorg to see pending WriteBatch changes before commit."""
+        if key in utxo_overlay:
+            return utxo_overlay[key]  # None means deleted in overlay
+        return self.db.get(key)
+
     def _revert_transaction(self, txid: str, batch: WriteBatch, utxo_backups: Dict[str, bytes] = None,
                             utxo_overlay: Dict[bytes, Optional[bytes]] = None):
         """Revert a transaction's effects on the UTXO set.
@@ -2018,12 +2069,6 @@ class ChainManager:
             utxo_backups = {}
         if utxo_overlay is None:
             utxo_overlay = {}
-
-        def _read_utxo(key: bytes) -> Optional[bytes]:
-            """Read UTXO from overlay first, then fall back to DB"""
-            if key in utxo_overlay:
-                return utxo_overlay[key]  # None means deleted in overlay
-            return self.db.get(key)
 
         # Mark all outputs from this transaction as invalid
         tx_key = f"tx:{txid}".encode()
@@ -2039,7 +2084,7 @@ class ChainManager:
                 utxo_key = f"utxo:{inp['txid']}:{inp.get('utxo_index', 0)}".encode()
 
                 # Read from overlay or DB
-                current_utxo_data = _read_utxo(utxo_key)
+                current_utxo_data = self._read_utxo_overlay(utxo_key, utxo_overlay)
                 if current_utxo_data:
                     backup_key = f"{inp['txid']}:{inp.get('utxo_index', 0)}"
                     utxo_backups[backup_key] = current_utxo_data
@@ -2057,7 +2102,7 @@ class ChainManager:
         for idx, out in enumerate(tx.get("outputs", [])):
             utxo_key = f"utxo:{txid}:{idx}".encode()
 
-            current_data = _read_utxo(utxo_key)
+            current_data = self._read_utxo_overlay(utxo_key, utxo_overlay)
             if current_data:
                 backup_key = f"{txid}:{idx}"
                 utxo_backups[backup_key] = current_data
@@ -2133,11 +2178,16 @@ class ChainManager:
     
     def _validate_transaction_for_reorg(self, tx: dict, block_spent_utxos: Set[str],
                                        new_chain_spent_utxos: Set[str],
-                                       restored_utxos: Optional[Set[str]] = None) -> bool:
+                                       restored_utxos: Optional[Set[str]] = None,
+                                       utxo_overlay: Optional[Dict[bytes, Optional[bytes]]] = None) -> bool:
         """
         Validate a transaction during reorganization.
         Checks signatures, balances, double-spending, and UTXO existence.
+        Uses utxo_overlay to see pending WriteBatch changes from disconnect/prior connect.
         """
+        if utxo_overlay is None:
+            utxo_overlay = {}
+
         if not tx or "txid" not in tx:
             logger.error("Invalid transaction format - missing txid")
             return False
@@ -2167,14 +2217,15 @@ class ChainManager:
                 logger.error(f"Double-spend detected: UTXO {utxo_key} spent in new chain")
                 return False
 
-            # Verify UTXO exists in DB and is unspent
+            # Verify UTXO exists and is unspent — read from overlay first (sees
+            # disconnect-phase restorations and prior connect-phase spends)
             utxo_db_key = f"utxo:{utxo_key}".encode()
-            utxo_data = self.db.get(utxo_db_key)
+            utxo_data = self._read_utxo_overlay(utxo_db_key, utxo_overlay)
             if not utxo_data:
                 logger.error(f"Transaction {txid} references non-existent UTXO {utxo_key}")
                 return False
 
-            utxo = json.loads(utxo_data.decode())
+            utxo = json.loads(utxo_data.decode() if isinstance(utxo_data, bytes) else utxo_data)
             if utxo.get("spent", False):
                 logger.error(f"Transaction {txid} tries to spend already spent UTXO {utxo_key}")
                 return False
@@ -2239,44 +2290,52 @@ class ChainManager:
         
         return True
     
-    def _apply_transaction_safe(self, tx: dict, height: int, batch: WriteBatch, 
-                               new_chain_spent_utxos: Set[str]):
+    def _apply_transaction_safe(self, tx: dict, height: int, batch: WriteBatch,
+                               new_chain_spent_utxos: Set[str],
+                               utxo_overlay: Optional[Dict[bytes, Optional[bytes]]] = None):
         """
-        Apply a transaction during reorganization with double-spend protection
+        Apply a transaction during reorganization with double-spend protection.
+        Updates utxo_overlay so subsequent blocks/transactions see the changes.
         """
         if tx is None:
             return
-            
-        
+        if utxo_overlay is None:
+            utxo_overlay = {}
+
         # Check if this is a coinbase transaction
         is_coinbase = self.validator._is_coinbase_transaction(tx)
-        
+
         # Get transaction ID
         txid = tx.get("txid")
         if not txid:
             logger.error(f"Transaction without txid at height {height}")
             return
-        
+
         logger.debug(f"Safely applying transaction {txid}")
-        
+
         # Mark inputs as spent (skip if already spent in new chain, skip for coinbase/genesis)
         # Genesis transaction (height 0) has special inputs that shouldn't be marked as spent
         if not is_coinbase and height > 0:  # Skip input processing for genesis block
             for inp in tx.get("inputs", []):
                 if "txid" in inp and inp["txid"] != "00" * 32:
                     utxo_key = f"{inp['txid']}:{inp.get('utxo_index', 0)}"
-                    
+
                     # Skip if this UTXO is already marked as spent in new chain
                     if utxo_key not in new_chain_spent_utxos:
                         utxo_db_key = f"utxo:{utxo_key}".encode()
-                        utxo_data = self.db.get(utxo_db_key)
+                        # Read from overlay first (sees disconnect restorations)
+                        utxo_data = self._read_utxo_overlay(utxo_db_key, utxo_overlay)
                         if utxo_data:
-                            utxo = json.loads(utxo_data.decode())
+                            utxo = json.loads(utxo_data.decode() if isinstance(utxo_data, bytes) else utxo_data)
                             utxo["spent"] = True
-                            batch.put(utxo_db_key, json.dumps(utxo).encode())
-                        
-                        # Wallet indexes handled by wallet_index.update_for_new_transaction()
-        
+                            utxo["version"] = utxo.get("version", 0) + 1
+                            utxo["spent_at_height"] = height
+                            utxo["spent_by_tx"] = txid
+                            new_data = json.dumps(utxo).encode()
+                            batch.put(utxo_db_key, new_data)
+                            # Update overlay so next transaction/block sees this spend
+                            utxo_overlay[utxo_db_key] = new_data
+
         # Create new UTXOs (including for coinbase!)
         for idx, out in enumerate(tx.get("outputs", [])):
             # Create proper UTXO record with all necessary fields
@@ -2292,16 +2351,17 @@ class ChainManager:
                 "created_by_block": None  # Will be set by the block processor
             }
             utxo_key = f"utxo:{txid}:{idx}".encode()
-            batch.put(utxo_key, json.dumps(utxo_record).encode())
-            
-            # Wallet indexes are updated after transaction is stored (see below)
-            
+            new_data = json.dumps(utxo_record).encode()
+            batch.put(utxo_key, new_data)
+            # Update overlay so next transaction/block sees this new UTXO
+            utxo_overlay[utxo_key] = new_data
+
             if is_coinbase:
                 logger.info(f"Created coinbase UTXO during reorg: {utxo_key.decode()} for {out.get('receiver')} amount: {out.get('amount')}")
-        
+
         # Store transaction
         batch.put(f"tx:{txid}".encode(), json.dumps(tx).encode())
-        
+
         # Update wallet indexes for efficient lookups
         from blockchain.wallet_index import get_wallet_index
         wallet_index = get_wallet_index()
