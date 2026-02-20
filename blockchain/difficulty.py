@@ -180,13 +180,19 @@ def get_next_bits(db, current_height: int) -> int:
         except (json.JSONDecodeError, KeyError):
             # Fallback for raw hash format
             block_hash = tip_data.decode()
+        MAX_WALK = 500  # Safety bound for chain walking
+        walk_count = 0
         while block_hash:
+            walk_count += 1
+            if walk_count > MAX_WALK:
+                raise ValueError(f"Cannot determine difficulty: chain walk exceeded {MAX_WALK} blocks")
+
             block_key = f"block:{block_hash}".encode()
             block_data = db.get(block_key)
             if not block_data:
                 logger.error(f"Block {block_hash} not found in database")
                 raise ValueError(f"Cannot determine difficulty: block {block_hash} not found")
-            
+
             block = json.loads(block_data.decode())
             if block["height"] == current_height:
                 if block.get("bits") is None:
@@ -194,13 +200,11 @@ def get_next_bits(db, current_height: int) -> int:
                     raise ValueError(f"Cannot determine difficulty: block at height {current_height} missing bits field")
                 return block["bits"]
             elif block["height"] < current_height:
-                # We've gone too far back
                 logger.error(f"Could not find block at height {current_height}")
                 raise ValueError(f"Cannot determine difficulty: block at height {current_height} not found")
-            
-            # Continue to previous block
+
             block_hash = block.get("previous_hash")
-        
+
         logger.error(f"Reached genesis without finding height {current_height}")
         raise ValueError(f"Cannot determine difficulty: block at height {current_height} not found")
     
@@ -229,25 +233,30 @@ def get_next_bits(db, current_height: int) -> int:
             # Fallback for raw hash format
             block_hash = tip_data.decode()
 
-        # Find blocks by walking the chain
+        # Find blocks by walking the chain (bounded)
         blocks_needed = {interval_start_height: None, current_height: None}
-        
+        max_walk = DIFFICULTY_ADJUSTMENT_INTERVAL + 100  # Only need to walk one interval
+        walk_count = 0
+
         while block_hash and (blocks_needed[interval_start_height] is None or blocks_needed[current_height] is None):
+            walk_count += 1
+            if walk_count > max_walk:
+                raise ValueError(f"Cannot calculate difficulty: chain walk exceeded {max_walk} blocks")
+
             block_key = f"block:{block_hash}".encode()
             block_data = db.get(block_key)
             if not block_data:
                 raise ValueError(f"Cannot calculate difficulty: block {block_hash} not found")
-            
+
             block = json.loads(block_data.decode())
             height = block["height"]
-            
+
             if height in blocks_needed:
                 blocks_needed[height] = block
-            
+
             if height < interval_start_height:
-                # Gone too far
                 break
-                
+
             block_hash = block.get("previous_hash")
         
         first_block = blocks_needed[interval_start_height]

@@ -22,6 +22,7 @@ class BlockHeightIndex:
         self.db = db if db is not None else get_db()
         self._memory_cache: Dict[int, str] = {}  # height -> block_hash cache
         self._cache_size_limit = 1000  # Keep last 1000 blocks in memory
+        self._highest_height: int = -1  # Track highest height in memory (O(1) lookup)
         
         # Initialize Redis cache if available
         redis_url = os.getenv("REDIS_URL", None)
@@ -68,9 +69,11 @@ class BlockHeightIndex:
         batch.put(height_key, block_hash.encode())
         self.db.write(batch)
         
-        # Add to cache
+        # Add to cache and update tracked highest
         self._add_to_cache(height, block_hash)
-        
+        if height > self._highest_height:
+            self._highest_height = height
+
         # Update Redis cache incrementally
         if self.redis_cache:
             try:
@@ -90,10 +93,12 @@ class BlockHeightIndex:
             batch.delete(height_key)
             self.db.write(batch)
             
-        # Remove from cache
+        # Remove from cache and adjust tracked highest
         if height in self._memory_cache:
             del self._memory_cache[height]
-            
+        if height == self._highest_height:
+            self._highest_height = height - 1
+
         # Update Redis cache incrementally
         if self.redis_cache:
             try:
@@ -125,14 +130,16 @@ class BlockHeightIndex:
                 cached_index = await self.redis_cache.get_height_index()
                 if cached_index:
                     from rocksdict import WriteBatch
-                    
+
                     # Restore index to database atomically
                     batch = WriteBatch()
                     for height, block_hash in cached_index.items():
                         height_key = f"height:{height:08d}".encode()
                         batch.put(height_key, block_hash.encode())
                         self._add_to_cache(height, block_hash)
-                    
+                        if height > self._highest_height:
+                            self._highest_height = height
+
                     # Write all updates atomically
                     self.db.write(batch)
                     
@@ -160,6 +167,8 @@ class BlockHeightIndex:
                     height_key = f"height:{height:08d}".encode()
                     batch.put(height_key, block_hash.encode())
                     self._add_to_cache(height, block_hash)
+                    if height > self._highest_height:
+                        self._highest_height = height
                     height_index[height] = block_hash
                     count += 1
                     
@@ -185,31 +194,33 @@ class BlockHeightIndex:
         logger.info(f"Block height index rebuilt in {elapsed:.2f}s with {count} blocks")
     
     async def get_highest_indexed_height(self) -> int:
-        """Get the highest block height in the index"""
-        # Try Redis cache first
+        """Get the highest block height in the index — O(1) from tracked value"""
+        # Return in-memory tracked value if available
+        if self._highest_height >= 0:
+            return self._highest_height
+
+        # Try Redis cache (O(n) over cached index, but avoids DB scan)
         if self.redis_cache:
             try:
                 height_index = await self.redis_cache.get_height_index()
                 if height_index:
-                    return max(height_index.keys()) if height_index else -1
+                    self._highest_height = max(height_index.keys())
+                    return self._highest_height
             except:
                 pass
-        
-        # Fall back to database scan
-        highest = -1
-        
-        # Check database for height keys
-        for key in self.db.keys():
-            if key.startswith(b"height:"):
-                try:
-                    height_str = key[7:].decode()  # Skip "height:" prefix
-                    height = int(height_str)
-                    if height > highest:
-                        highest = height
-                except:
-                    continue
-                    
-        return highest
+
+        # Last resort: read chain:best_tip (O(1)) instead of scanning all height: keys
+        try:
+            import json
+            tip_data = self.db.get(b"chain:best_tip")
+            if tip_data:
+                tip_info = json.loads(tip_data.decode())
+                self._highest_height = tip_info.get("height", -1)
+                return self._highest_height
+        except:
+            pass
+
+        return -1
     
 
 # Global singleton instance

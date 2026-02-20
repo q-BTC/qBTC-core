@@ -117,14 +117,13 @@ async def get_current_height(db, max_retries: int = 3) -> Tuple[int, str]:
                 
                 # If height is -1, check if this is genuinely empty or an error
                 if highest_height == -1:
-                    # Quick check: are there any blocks in the DB?
-                    has_blocks = any(k.startswith(b"block:") for k in db.keys())
-                    if not has_blocks:
+                    # O(1) check: see if chain:best_tip exists (not a full DB scan)
+                    tip_data = db.get(b"chain:best_tip")
+                    if not tip_data:
                         logging.info("Height index confirms empty blockchain")
                         return -1, GENESIS_PREVHASH
                     else:
-                        # This is suspicious - we have blocks but index says -1
-                        # This indicates a corrupted or uninitialized index
+                        # We have a tip but index says -1 — corrupted/uninitialized index
                         raise ValueError("Height index returned -1 but blocks exist in DB")
                         
             except ImportError:
@@ -133,37 +132,21 @@ async def get_current_height(db, max_retries: int = 3) -> Tuple[int, str]:
                 last_error = e
                 logging.debug(f"Height index attempt {retry + 1} failed: {e}")
             
-            # Method 3: Final fallback - scan all blocks
+            # Method 3: Final fallback - read chain:best_tip directly (O(1))
             try:
-                # First check if we have any blocks at all
-                block_count = 0
-                tip_block = None
-                
-                for k, v in db.items():
-                    if k.startswith(b"block:"):
-                        block_count += 1
-                        if block_count == 1:
-                            # Initialize with first block found
-                            tip_block = json.loads(v.decode())
-                        else:
-                            # Compare with current tip
-                            block = json.loads(v.decode())
-                            if block.get("height", -1) > tip_block.get("height", -1):
-                                tip_block = block
-                
-                if tip_block and tip_block.get("height") is not None:
-                    height = tip_block["height"]
-                    block_hash = tip_block.get("block_hash", "")
-                    if height >= 0 and block_hash:
-                        logging.info(f"Scan method found tip at height {height}")
-                        height_cache.set(height, block_hash)
-                        return height, block_hash
-                
-                if block_count == 0:
-                    logging.info("Scan method confirms empty blockchain")
-                    return -1, GENESIS_PREVHASH
-                else:
-                    raise ValueError(f"Found {block_count} blocks but couldn't determine tip")
+                tip_data = db.get(b"chain:best_tip")
+                if tip_data:
+                    tip_info = json.loads(tip_data.decode())
+                    tip_hash = tip_info.get("hash", "")
+                    tip_height = tip_info.get("height", -1)
+                    if tip_hash and tip_height >= 0:
+                        logging.info(f"chain:best_tip fallback found tip at height {tip_height}")
+                        height_cache.set(tip_height, tip_hash)
+                        return tip_height, tip_hash
+
+                # No chain:best_tip means empty blockchain
+                logging.info("chain:best_tip fallback confirms empty blockchain")
+                return -1, GENESIS_PREVHASH
                     
             except Exception as e:
                 last_error = e
@@ -188,33 +171,18 @@ async def get_current_height(db, max_retries: int = 3) -> Tuple[int, str]:
     
     # One final check - if DB is actually inaccessible, raise the error
     try:
-        # Try a simple DB operation
-        _ = db.get(b"test")
-    except Exception as db_error:
-        logging.error(f"Database appears to be inaccessible: {db_error}")
-        raise RuntimeError(f"Database error prevented height retrieval: {db_error}")
-    
-    # DB is accessible but we couldn't determine height
-    # Only return -1 if we're absolutely sure there are no blocks
-    # Do one more careful check
-    try:
-        has_any_blocks = False
-        for key in db.keys():
-            if key.startswith(b"block:"):
-                has_any_blocks = True
-                break
-        
-        if not has_any_blocks:
-            # Confirmed: database is empty
-            logging.info("Final check confirms empty blockchain")
+        # O(1) final check: see if chain:best_tip exists
+        tip_data = db.get(b"chain:best_tip")
+        if not tip_data:
+            logging.info("Final check confirms empty blockchain (no chain:best_tip)")
             return -1, GENESIS_PREVHASH
         else:
-            # We have blocks but can't determine height - this is an error condition
-            # Don't return -1 as that would cause sync issues
-            raise RuntimeError(f"Database contains blocks but height cannot be determined. "
-                             f"This may indicate index corruption. Last error: {last_error}")
+            # We have a tip but all methods failed to parse it
+            raise RuntimeError(f"chain:best_tip exists but height cannot be determined. "
+                             f"This may indicate data corruption. Last error: {last_error}")
+    except RuntimeError:
+        raise
     except Exception as e:
-        # If we can't even iterate keys, the DB has issues
         raise RuntimeError(f"Database error during final verification: {e}")
 
 def set_db(db_path):

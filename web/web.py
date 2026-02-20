@@ -743,7 +743,9 @@ async def debug_utxos(localhost_only: bool = Depends(require_localhost)):
         count = 0
         
         for key, value in db.items():
-            if key.startswith(b"utxo:") and count < 20:  # Limit to first 20
+            if count >= 20:
+                break
+            if key.startswith(b"utxo:"):
                 count += 1
                 utxo_data = json.loads(value.decode())
                 utxos.append({
@@ -771,7 +773,8 @@ async def debug_genesis(localhost_only: bool = Depends(require_localhost)):
         genesis_txs = []
         all_txs = []
         
-        # Check all transaction entries
+        # Check transaction entries (bounded to first 100 to avoid full DB scan)
+        tx_count = 0
         for key, value in db.items():
             if key.startswith(b"tx:"):
                 tx_data = json.loads(value.decode('utf-8'))
@@ -780,10 +783,15 @@ async def debug_genesis(localhost_only: bool = Depends(require_localhost)):
                     "txid": txid,
                     "data": tx_data
                 })
-                
-        # Check all UTXOs for genesis patterns
+                tx_count += 1
+                if tx_count >= 100:
+                    break
+
+        # Check UTXOs for genesis patterns (bounded to first 1000 checked)
+        utxo_checked = 0
         for key, value in db.items():
             if key.startswith(b"utxo:"):
+                utxo_checked += 1
                 utxo_data = json.loads(value.decode())
                 if utxo_data.get("sender") == "" or utxo_data.get("sender") == "GENESIS":
                     genesis_txs.append({
@@ -794,6 +802,8 @@ async def debug_genesis(localhost_only: bool = Depends(require_localhost)):
                         "amount": utxo_data.get("amount"),
                         "spent": utxo_data.get("spent", False)
                     })
+                if utxo_checked >= 1000:
+                    break
         
         return {
             "genesis_utxos": genesis_txs,

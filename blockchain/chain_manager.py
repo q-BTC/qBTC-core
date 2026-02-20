@@ -375,13 +375,19 @@ class ChainManager:
             if "cumulative_difficulty" in block_info:
                 return Decimal(block_info["cumulative_difficulty"])
         
-        # Fall back to calculating it by traversing the chain
+        # Fall back to calculating it by traversing the chain (bounded)
+        MAX_DIFFICULTY_WALK = 200  # Safety bound — all new blocks store cumulative_difficulty
         cumulative = Decimal(0)
         current_hash = block_hash
-        
+        walk_count = 0
+
         while current_hash and current_hash != "00" * 32:
+            walk_count += 1
+            if walk_count > MAX_DIFFICULTY_WALK:
+                logger.error(f"Cumulative difficulty walk exceeded {MAX_DIFFICULTY_WALK} blocks from {block_hash[:16]}...")
+                break
+
             if current_hash not in self.block_index:
-                # Block not in index, try to load from DB
                 block_key = f"block:{current_hash}".encode()
                 block_data = self.db.get(block_key)
                 if not block_data:
@@ -390,20 +396,19 @@ class ChainManager:
                 block_info = json.loads(block_data.decode())
             else:
                 block_info = self.block_index[current_hash]
-            
+
             # Check if this block has stored cumulative difficulty
             if "cumulative_difficulty" in block_info:
-                # We found a block with stored difficulty, use it and stop
-                return Decimal(block_info["cumulative_difficulty"])
-            
+                return Decimal(block_info["cumulative_difficulty"]) + cumulative
+
             # Add this block's difficulty
-            bits = block_info.get("bits", MAX_TARGET_BITS)  # Default to min difficulty
+            bits = block_info.get("bits", MAX_TARGET_BITS)
             target = bits_to_target(bits)
             difficulty = Decimal(2**256) / Decimal(target)
             cumulative += difficulty
-            
+
             current_hash = block_info.get("previous_hash")
-        
+
         return cumulative
     
     async def _get_cumulative_difficulty_for_new_block(self, parent_hash: str, bits: int) -> Decimal:
