@@ -947,9 +947,9 @@ async def maintain_validator_list(gossip_node):
                         
                         if ip and port and ip != own_ip:
                             logger.info(f"Adding new validator {v} at {ip}:{port} to gossip peers")
-                            # CRITICAL: Mark all validators as protected on bootstrap servers
-                            is_protected = True  # All validators are protected!
-                            gossip_node.add_peer(ip, port, peer_info=info, protected=is_protected)
+                            # DHT-discovered peers must earn trust through reputation;
+                            # only anchor peers and manual config get protected status.
+                            gossip_node.add_peer(ip, port, peer_info=info)
                             # Store the mapping for this validator
                             validator_peer_mapping[v] = {'ip': ip, 'port': port}
                             #await push_blocks(ip, port)
