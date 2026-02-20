@@ -1299,7 +1299,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
 # Security Management Endpoints
 @app.get("/admin/security/status")
-async def get_security_status_endpoint():
+async def get_security_status_endpoint(localhost_only: bool = Depends(require_localhost)):
     """Get comprehensive security status (admin only)"""
     try:
         status = await get_security_status()
@@ -1309,7 +1309,8 @@ async def get_security_status_endpoint():
         raise HTTPException(status_code=500, detail="Failed to retrieve security status")
 
 @app.post("/admin/security/block/{client_ip}")
-async def block_client_endpoint(client_ip: str, duration_hours: int = 24, reason: str = "Manual block by admin"):
+async def block_client_endpoint(client_ip: str, duration_hours: int = 24, reason: str = "Manual block by admin",
+                                localhost_only: bool = Depends(require_localhost)):
     """Block a specific client IP (admin only)"""
     try:
         # Validate IP format
@@ -1338,7 +1339,7 @@ async def block_client_endpoint(client_ip: str, duration_hours: int = 24, reason
         raise HTTPException(status_code=500, detail="Failed to block client")
 
 @app.post("/admin/security/unblock/{client_ip}")
-async def unblock_client_endpoint(client_ip: str):
+async def unblock_client_endpoint(client_ip: str, localhost_only: bool = Depends(require_localhost)):
     """Unblock a specific client IP (admin only)"""
     try:
         # Validate IP format
@@ -1358,7 +1359,7 @@ async def unblock_client_endpoint(client_ip: str):
         raise HTTPException(status_code=500, detail="Failed to unblock client")
 
 @app.get("/admin/security/client/{client_ip}")
-async def get_client_info_endpoint(client_ip: str):
+async def get_client_info_endpoint(client_ip: str, localhost_only: bool = Depends(require_localhost)):
     """Get detailed information about a specific client (admin only)"""
     try:
         # Validate IP format

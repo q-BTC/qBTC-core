@@ -125,6 +125,7 @@ def verify_transaction(message: str, sig_hex: str, pub_hex: str) -> bool:
 
     except Exception as e:
         logging.error(f"Failed to verify: {e}")
+        return False
 
 
 def get_or_create_wallet(fname=WALLET_FILENAME, password: str | None = None):

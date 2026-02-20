@@ -279,7 +279,6 @@ async def get_work(data):
 
 
 async def get_block_template(data):
-    print(data)
     db = get_db()
     
     # Check if this is a longpoll request
@@ -528,7 +527,6 @@ async def submit_block(request: Request, data: dict) -> dict:
         logger.info(f"Block transaction count from header: {tx_count}")
         coinbase_start = offset
         coinbase_tx, size = parse_tx(raw, offset)
-        print(coinbase_tx)
         coinbase_script_pubkey = coinbase_tx["outputs"][0]["script_pubkey"]
         # For cpuminer compatibility, extract standard Bitcoin address from coinbase
         bitcoin_miner_address = None
@@ -680,7 +678,6 @@ async def submit_block(request: Request, data: dict) -> dict:
                 logger.info(f"Skipping duplicate transaction {txid} in block data")
                 continue  # Skip processing duplicate transactions
             inputs = tx["inputs"]
-            print(f"****** INPUTS : {inputs}")
             outputs = tx["outputs"]
             message_str = tx["body"]["msg_str"]
             pubkey = tx["body"]["pubkey"]

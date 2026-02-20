@@ -136,10 +136,11 @@ class TransactionValidator:
             parts = msg_str.split(":")
             
             # Check if this is a coinbase transaction (special msg_str format)
+            # CRITICAL: Must verify inputs are actually coinbase before trusting msg_str
             if len(parts) == 5 and parts[0] == "coinbase":
+                if not self._is_coinbase_transaction(tx):
+                    return False, f"Transaction {txid} has coinbase msg_str but non-coinbase inputs", Decimal("0")
                 # Coinbase format: "coinbase:miner_address:0:0:chain_id"
-                from_, to_, amount_str, time_str, tx_chain_id = "coinbase", parts[1], parts[2], parts[3], parts[4]
-                # Skip further validation for coinbase
                 return True, None, Decimal("0")
             
             # MANDATORY: All non-coinbase transactions must have exactly 5 parts including chain ID
@@ -225,6 +226,7 @@ class TransactionValidator:
         total_to_recipient = Decimal("0")
         total_change = Decimal("0")
         total_output = Decimal("0")
+        total_admin_fee = Decimal("0")
         
         # Handle self-transfers specially
         is_self_transfer = (from_ == to_)
@@ -254,11 +256,9 @@ class TransactionValidator:
             if is_self_transfer:
                 # For self-transfers, all outputs to the same address are valid
                 if recv == from_:  # which equals to_
-                    # All outputs to self are valid for self-transfers
                     pass
                 elif recv == ADMIN_ADDRESS and from_ != ADMIN_ADDRESS:
-                    # Fee to admin is allowed
-                    pass
+                    total_admin_fee += amt
                 else:
                     return False, f"Unauthorized output to {recv} in tx {txid}", Decimal("0")
             else:
@@ -268,10 +268,8 @@ class TransactionValidator:
                 elif recv == from_:
                     total_change += amt
                 elif recv == ADMIN_ADDRESS and from_ != ADMIN_ADDRESS:
-                    # This could be a fee to admin, but should be validated
-                    pass
+                    total_admin_fee += amt
                 else:
-                    # For now, only allow outputs to: recipient, sender (change), or admin (fee)
                     return False, f"Unauthorized output to {recv} in tx {txid}", Decimal("0")
             
             total_output += amt
@@ -281,7 +279,13 @@ class TransactionValidator:
             Decimal("0.00000001"), rounding=ROUND_DOWN
         )
         grand_total_required = total_authorized + miner_fee
-        
+
+        # Validate admin fee amount — must not exceed 2x the expected miner fee
+        # This prevents attackers from routing arbitrary amounts to admin address
+        max_admin_fee = miner_fee * 2
+        if height > 0 and total_admin_fee > max_admin_fee:
+            return False, f"Admin fee in tx {txid} exceeds maximum: {total_admin_fee} > {max_admin_fee}", Decimal("0")
+
         # Check sufficient balance (only genesis at height 0 bypasses this)
         if height > 0 and grand_total_required > total_available:
             return False, f"Insufficient balance in tx {txid}: available {str(total_available)} < required {str(grand_total_required)}", Decimal("0")

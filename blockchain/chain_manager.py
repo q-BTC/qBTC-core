@@ -707,8 +707,10 @@ class ChainManager:
         # Check if we have the parent block
         if prev_hash not in self.block_index and prev_hash != "00" * 32:
             # Parent not found - this is an orphan
+            # Return False to indicate block is NOT accepted into chain yet
+            # It will be fully re-validated via add_block() when parent arrives
             await self._add_orphan(block_data)
-            return True, None
+            return False, "Parent block not found - stored as orphan for later processing"
         
         # CRITICAL: Validate all transactions before accepting the block
         # This prevents invalid transactions from entering the chain

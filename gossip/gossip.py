@@ -169,8 +169,8 @@ class GossipNode:
         timestamp = msg.get("timestamp", int(time.time() * 1000))
         txid = msg.get("txid")
 
-        if timestamp < int(time.time() * 1000) - 60000:  
-            print("**** TRANSACTION IS STALE")
+        if timestamp < int(time.time() * 1000) - 60000:
+            logger.debug("Stale transaction received, ignoring")
             return
 
         if msg_type == "transaction":
@@ -202,10 +202,10 @@ class GossipNode:
                 return
             
             # Only log if this is a new transaction
-            print(f"[NEW TX] Received transaction {txid} from {from_peer}")
-            
+            logger.debug(f"Received transaction {txid} from {from_peer}")
+
             if not verify_transaction(msg["body"]["msg_str"], msg["body"]["signature"], msg["body"]["pubkey"]):
-                print(f"[TX INVALID] Transaction {txid} failed verification")
+                logger.warning(f"Transaction {txid} failed verification")
                 self.tx_stats['invalid'] += 1
                 return
             
@@ -248,14 +248,14 @@ class GossipNode:
                 if len(self.seen_tx) > MAX_SEEN_TX_SIZE:
                     self._cleanup_seen_tx()
             
-            print(f"[TX ADDED] Transaction {txid} added to mempool")
-            
-            # Print stats every 10 new transactions
+            logger.debug(f"Transaction {txid} added to mempool")
+
+            # Log stats every 10 new transactions
             if self.tx_stats['new'] % 10 == 0:
                 total = self.tx_stats['received']
                 dups = self.tx_stats['duplicates']
                 dup_rate = (dups / total * 100) if total > 0 else 0
-                print(f"[TX STATS] Total: {total}, New: {self.tx_stats['new']}, Duplicates: {dups} ({dup_rate:.1f}%), Invalid: {self.tx_stats['invalid']}")
+                logger.info(f"TX stats - Total: {total}, New: {self.tx_stats['new']}, Duplicates: {dups} ({dup_rate:.1f}%), Invalid: {self.tx_stats['invalid']}")
             
             await self.randomized_broadcast(msg)
 
@@ -377,7 +377,7 @@ class GossipNode:
             await writer.drain()
 
         elif msg_type == "get_blocks":
-            print(msg)
+            logger.debug(f"get_blocks request: start={msg.get('start_height')}, end={msg.get('end_height')}")
             start_height = msg.get("start_height")
             end_height = msg.get("end_height")
             if start_height is None or end_height is None:
