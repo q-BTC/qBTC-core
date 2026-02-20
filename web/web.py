@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from database.database import get_db, get_current_height
 from wallet.wallet import verify_transaction
 from pydantic import BaseModel
-from blockchain.blockchain import sha256d, serialize_transaction
+from blockchain.blockchain import sha256d, serialize_transaction, derive_qsafe_address
 from state.state import mempool_manager
 from config.config import CHAIN_ID
 
@@ -1010,12 +1010,9 @@ async def worker_endpoint(request: Request):
         
         parts = message_str.split(":")
         if len(parts) == 3:
-            # Old format - add timestamp and chain_id for compatibility
-            sender_, receiver_, send_amount = parts[0], parts[1], parts[2]
-            timestamp = str(int(time.time() * 1000))
-            chain_id = str(CHAIN_ID)
-            # Update message_str to new format for storage
-            message_str = f"{sender_}:{receiver_}:{send_amount}:{timestamp}:{chain_id}"
+            # Old 3-part format is no longer accepted — it creates a mismatch between
+            # the signed message and the stored message, allowing signature bypass
+            raise ValidationError("Deprecated 3-part message format rejected. Use sender:receiver:amount:timestamp:chain_id")
         elif len(parts) == 5:
             # New format with timestamp and chain_id
             sender_, receiver_, send_amount, timestamp, chain_id = parts
@@ -1028,6 +1025,11 @@ async def worker_endpoint(request: Request):
         # Verify transaction signature against original message
         if not verify_transaction(original_message_str, signature_hex, pubkey_hex):
             raise InvalidSignatureError("Transaction signature verification failed")
+
+        # Verify pubkey derives to the sender address (prevents spending with wrong keypair)
+        derived_address = derive_qsafe_address(pubkey_hex)
+        if derived_address != sender_:
+            raise ValidationError(f"Pubkey does not derive to sender address: expected {sender_}, got {derived_address}")
 
         inputs = []
         total_available = Decimal("0")

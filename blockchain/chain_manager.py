@@ -10,7 +10,7 @@ from decimal import Decimal
 from collections import defaultdict
 from database.database import get_db, invalidate_height_cache
 from blockchain.blockchain import Block, validate_pow, bits_to_target, sha256d
-from blockchain.difficulty import get_next_bits, validate_block_bits, validate_block_timestamp, get_median_time_past, MAX_FUTURE_TIME, MAX_TARGET_BITS
+from blockchain.difficulty import get_next_bits, validate_block_bits, validate_block_timestamp, get_median_time_past, compact_to_target, MAX_FUTURE_TIME, MAX_TARGET_BITS
 from config.config import MAX_REORG_DEPTH
 from blockchain.transaction_validator import TransactionValidator
 from blockchain.block_factory import normalize_block, validate_block_structure
@@ -47,6 +47,7 @@ class ChainManager:
         self.MAX_ORPHAN_BLOCKS = 100  # Maximum number of orphan blocks to keep
         self.MAX_ORPHAN_AGE = 3600  # Maximum age of orphan blocks in seconds (1 hour)
         self.is_syncing = False  # Flag to indicate if we're in initial sync
+        self._chain_lock = asyncio.Lock()  # Concurrency protection for chain operations
         
         # Initialize Redis cache if available
         redis_url = os.getenv("REDIS_URL", None)
@@ -548,10 +549,15 @@ class ChainManager:
         return best_tip, best_height
     
     async def add_block(self, block_data: dict, pre_validated_batch: WriteBatch = None) -> Tuple[bool, Optional[str]]:
+        """Add a new block to the chain with concurrency protection"""
+        async with self._chain_lock:
+            return await self._add_block_internal(block_data, pre_validated_batch)
+
+    async def _add_block_internal(self, block_data: dict, pre_validated_batch: WriteBatch = None) -> Tuple[bool, Optional[str]]:
         """
-        Add a new block to the chain
+        Internal block addition logic.
         Returns (success, error_message)
-        
+
         Args:
             block_data: The block data including full_transactions
             pre_validated_batch: Optional batch with pre-computed UTXOs and transactions
@@ -636,7 +642,11 @@ class ChainManager:
                 # Parent exists, we can validate difficulty
                 parent_block = json.loads(parent_block_data.decode())
                 parent_height = parent_block["height"]
-                
+
+                # Validate block height is exactly parent + 1
+                if height != parent_height + 1:
+                    return False, f"Invalid block height: expected {parent_height + 1}, got {height}"
+
                 try:
                     expected_bits = get_next_bits(self.db, parent_height)
                 except ValueError as e:
@@ -663,11 +673,9 @@ class ChainManager:
             # During sync, we can't use current time for historical blocks
             # But we still enforce MTP to prevent timestamp manipulation
             if self.is_syncing:
-                # During sync, validate against parent timestamp
+                # During sync, validate strict monotonicity against parent timestamp
                 if block_data["timestamp"] <= parent_info["timestamp"]:
-                    # Allow equal timestamps for rapid mining scenarios
-                    if block_data["timestamp"] < parent_info["timestamp"]:
-                        return False, f"Invalid block timestamp during sync - must be >= parent (block: {block_data['timestamp']}, parent: {parent_info['timestamp']})"
+                    return False, f"Invalid block timestamp during sync - must be > parent (block: {block_data['timestamp']}, parent: {parent_info['timestamp']})"
                 # Enforce MTP even during sync
                 if mtp is not None and block_data["timestamp"] <= mtp:
                     return False, f"Block timestamp {block_data['timestamp']} must be greater than median time past {mtp}"
@@ -858,31 +866,35 @@ class ChainManager:
 
             # Also store transactions separately for fork blocks
             # This ensures they're available during reorganization
+            explorer_txs = []  # Defer explorer index update until after commit
             if "full_transactions" in block_data:
                 for tx in block_data["full_transactions"]:
                     if tx and "txid" in tx:
                         tx_key = f"tx:{tx['txid']}".encode()
-                        # Always add to batch - the batch write is atomic
-                        # Don't check if it exists, as that would check the old state
                         batch.put(tx_key, json.dumps(tx).encode())
                         logger.debug(f"Storing transaction {tx['txid']} from block {block_hash}")
 
-                        # Update explorer index for non-coinbase transactions
+                        # Collect non-coinbase transactions for explorer index
                         inputs = tx.get("inputs", [])
                         is_coinbase = len(inputs) == 1 and inputs[0].get("txid", "") == "0" * 64
                         if not is_coinbase:
-                            from blockchain.explorer_index import get_explorer_index
-                            explorer_index = get_explorer_index()
-                            explorer_index.add_transaction(tx['txid'], tx.get('timestamp', 0), is_coinbase)
+                            explorer_txs.append((tx['txid'], tx.get('timestamp', 0), is_coinbase))
 
             # Write the batch atomically
-            logger.info(f"[DEBUG] About to write batch for block {block_hash}")
             try:
                 self.db.write(batch)
-                logger.info(f"[DEBUG] Batch write completed for block {block_hash}")
+                logger.info(f"Batch write completed for block {block_hash}")
             except Exception as e:
-                logger.error(f"[DEBUG] Batch write failed for block {block_hash}: {e}")
+                logger.error(f"Batch write failed for block {block_hash}: {e}")
                 raise
+
+            # Update explorer index AFTER successful commit
+            if explorer_txs:
+                from blockchain.explorer_index import get_explorer_index
+                explorer_index = get_explorer_index()
+                for txid_val, ts_val, is_cb in explorer_txs:
+                    explorer_index.add_transaction(txid_val, ts_val, is_cb)
+
             logger.debug(f"Block {block_hash} and its transactions stored atomically")
         elif is_genesis_becoming_tip:
             # For genesis, we'll store it when we connect it below
@@ -958,15 +970,10 @@ class ChainManager:
                 except Exception as e:
                     logger.debug(f"Failed to update caches: {e}")
             
-            # Connect the block to process its transactions and create UTXOs
+            # Connect the block and update tip atomically in a single batch
             if pre_validated_batch:
-                # Use the pre-validated batch from RPC (contains UTXOs and transactions)
-                # Still need to apply block-specific changes
                 batch = pre_validated_batch
-                self._connect_block(block_data, batch)
-                self.db.write(batch)
             else:
-                # Normal path: create our own batch
                 batch = WriteBatch()
 
                 # If this is genesis becoming tip and we haven't stored it yet,
@@ -983,17 +990,16 @@ class ChainManager:
                                 batch.put(tx_key, json.dumps(tx).encode())
                                 logger.info(f"Storing genesis transaction {tx['txid']}")
 
-                self._connect_block(block_data, batch)
-                self.db.write(batch)
-            
-            # Update chain:best_tip in database atomically
+            self._connect_block(block_data, batch)
+
+            # Include tip update in the same atomic batch
             tip_key = b"chain:best_tip"
-            tip_batch = WriteBatch()
-            tip_batch.put(tip_key, json.dumps({
+            batch.put(tip_key, json.dumps({
                 "hash": block_hash,
                 "height": height
             }).encode())
-            self.db.write(tip_batch)
+
+            self.db.write(batch)
             
             # CRITICAL: Invalidate height cache so next call gets fresh data
             invalidate_height_cache()
@@ -1041,8 +1047,8 @@ class ChainManager:
     async def _process_orphans_for_block(self, parent_hash: str):
         """Try to connect any orphans that have this block as parent"""
         connected = []
-        
-        for orphan_hash, orphan_data in self.orphan_blocks.items():
+
+        for orphan_hash, orphan_data in list(self.orphan_blocks.items()):
             if orphan_data["previous_hash"] == parent_hash:
                 # This orphan can now be connected
                 logger.info(f"Connecting orphan {orphan_hash} to parent {parent_hash}")
@@ -1189,45 +1195,44 @@ class ChainManager:
             return False
     
     async def _check_orphan_chains_for_reorg(self):
-        """Check if any orphan chain represents a better chain we should reorganize to"""
+        """Check if any orphan chain represents a better chain we should reorganize to.
+        Uses cumulative difficulty (not height) to determine the best chain."""
         current_tip, current_height = await self.get_best_chain_tip()
-        logger.info(f"[REORG_CHECK] Checking orphan chains for potential reorganization")
-        
+        current_difficulty = await self._get_cumulative_difficulty(current_tip)
+        logger.info(f"[REORG_CHECK] Checking orphan chains for potential reorganization (current difficulty: {current_difficulty})")
+
         # Look for orphan blocks at or near our current height that might be on a better chain
         for height in range(max(0, current_height - 10), current_height + 1):
-            for orphan_hash, orphan_data in self.orphan_blocks.items():
+            for orphan_hash, orphan_data in list(self.orphan_blocks.items()):
                 if orphan_data.get("height") == height:
-                    # This orphan is at a height we care about
-                    # Check if it's part of a longer chain
                     chain_length = self._get_orphan_chain_length(orphan_hash)
                     if chain_length > 0:
-                        logger.info(f"[REORG_CHECK] Found orphan chain starting at height {height} with {chain_length} blocks")
-                        
-                        # Check if this chain would give us a higher height
-                        potential_new_height = height + chain_length - 1
-                        if potential_new_height > current_height:
-                            logger.warning(f"[REORG_CHECK] Orphan chain would reach height {potential_new_height} vs current {current_height}")
-                            
-                            # We need to reorganize! 
-                            logger.warning(f"[REORG_CHECK] Need to reorganize to orphan chain!")
-                            
-                            # Find the fork point - where this orphan chain diverges from our main chain
-                            fork_height = self._find_fork_height_for_orphan(orphan_hash)
-                            if fork_height is not None:
-                                logger.warning(f"[REORG_CHECK] Fork detected at height {fork_height}")
-                                
-                                # Rewind to just before the fork
+                        # Calculate cumulative difficulty of the orphan chain
+                        orphan_difficulty = self._calculate_orphan_chain_difficulty_validated(orphan_hash, chain_length)
+                        fork_height = self._find_fork_height_for_orphan(orphan_hash)
+
+                        if fork_height is not None:
+                            # Get base difficulty at fork point
+                            fork_parent = None
+                            for bh, bi in self.block_index.items():
+                                if bi.get("height") == fork_height:
+                                    fork_parent = bh
+                                    break
+                            base_difficulty = await self._get_cumulative_difficulty(fork_parent) if fork_parent else Decimal(0)
+                            total_orphan_difficulty = base_difficulty + orphan_difficulty
+
+                            if total_orphan_difficulty > current_difficulty:
+                                logger.warning(f"[REORG_CHECK] Orphan chain has more work ({total_orphan_difficulty} > {current_difficulty})")
+
                                 if await self._rewind_to_height(fork_height - 1):
                                     logger.warning(f"[REORG_CHECK] Successfully rewound to height {fork_height - 1}")
-                                    # The orphan chain should now be able to connect
                                     return True
                                 else:
                                     logger.error(f"[REORG_CHECK] Failed to rewind to height {fork_height - 1}")
-                            else:
-                                # Can't find fork point, request missing parent blocks
-                                self._request_missing_parents_for_reorg(orphan_hash)
-                            
-                            return
+                        else:
+                            self._request_missing_parents_for_reorg(orphan_hash)
+
+                        return
     
     def _get_orphan_chain_length(self, start_hash: str) -> int:
         """Get the length of an orphan chain starting from a given block"""
@@ -1303,11 +1308,17 @@ class ChainManager:
     async def _rewind_to_height(self, target_height: int) -> bool:
         """Rewind the chain to a specific height by disconnecting blocks"""
         current_tip, current_height = await self.get_best_chain_tip()
-        
+
         if target_height >= current_height:
             logger.warning(f"Cannot rewind to height {target_height} - already at {current_height}")
             return False
-        
+
+        # Enforce MAX_REORG_DEPTH limit
+        rewind_depth = current_height - target_height
+        if rewind_depth > MAX_REORG_DEPTH:
+            logger.error(f"[REWIND] Rejecting rewind: depth {rewind_depth} exceeds MAX_REORG_DEPTH ({MAX_REORG_DEPTH})")
+            return False
+
         logger.warning(f"[REWIND] Rewinding chain from height {current_height} to {target_height}")
         
         # Disconnect blocks one by one
@@ -1331,15 +1342,18 @@ class ChainManager:
         # Actually disconnect the blocks
         batch = WriteBatch()
         utxo_backups = {}  # Track UTXO states for potential rollback
+        utxo_overlay = {}  # Consistent reads during multi-block disconnect
         for block_hash, block_data in blocks_to_disconnect:
             logger.info(f"[REWIND] Disconnecting block {block_hash} at height {block_data.get('height')}")
-            self._disconnect_block(block_hash, batch, utxo_backups)
+            self._disconnect_block(block_hash, batch, utxo_backups, utxo_overlay)
         
-        # Update best block to the new tip
+        # Update best block to the new tip using the correct key
         new_tip_hash = blocks_to_disconnect[-1][1].get("previous_hash")
         if new_tip_hash:
-            batch.put(b"best_block_hash", new_tip_hash.encode())
-            self.current_tip = new_tip_hash
+            batch.put(b"chain:best_tip", json.dumps({
+                "hash": new_tip_hash,
+                "height": target_height
+            }).encode())
             logger.warning(f"[REWIND] New chain tip: {new_tip_hash} at height {target_height}")
         
         # Write the batch atomically
@@ -1410,20 +1424,62 @@ class ChainManager:
                         logger.error(f"Failed to connect orphan chain starting at {root_hash}")
     
     def _calculate_orphan_chain_difficulty(self, chain: List[str]) -> Decimal:
-        """Calculate the total difficulty of an orphan chain"""
+        """Calculate the total difficulty of an orphan chain using validated bits"""
         total_difficulty = Decimal(0)
-        
+
         for block_hash in chain:
             block_data = self.orphan_blocks.get(block_hash)
             if not block_data:
                 logger.warning(f"Orphan block {block_hash} not found while calculating difficulty")
                 continue
-            
+
             bits = block_data.get("bits", MAX_TARGET_BITS)
-            target = bits_to_target(bits)
-            difficulty = Decimal(2**256) / Decimal(target)
-            total_difficulty += difficulty
-        
+            try:
+                # Use compact_to_target which has bounds checking
+                target = compact_to_target(bits)
+                if target <= 0:
+                    logger.warning(f"Invalid target from bits {bits:#x} in orphan {block_hash}")
+                    continue
+                difficulty = Decimal(2**256) / Decimal(target)
+                total_difficulty += difficulty
+            except (ValueError, ZeroDivisionError) as e:
+                logger.warning(f"Invalid bits {bits:#x} in orphan block {block_hash}: {e}")
+                continue
+
+        return total_difficulty
+
+    def _calculate_orphan_chain_difficulty_validated(self, start_hash: str, chain_length: int) -> Decimal:
+        """Calculate cumulative difficulty for an orphan chain starting from start_hash"""
+        total_difficulty = Decimal(0)
+        current_hash = start_hash
+        visited = set()
+
+        for _ in range(chain_length):
+            if current_hash in visited:
+                break
+            visited.add(current_hash)
+            block_data = self.orphan_blocks.get(current_hash)
+            if not block_data:
+                break
+            bits = block_data.get("bits", MAX_TARGET_BITS)
+            try:
+                target = compact_to_target(bits)
+                if target <= 0:
+                    continue
+                total_difficulty += Decimal(2**256) / Decimal(target)
+            except (ValueError, ZeroDivisionError):
+                continue
+
+            # Find next block in chain
+            found_next = False
+            for oh, od in self.orphan_blocks.items():
+                if od.get("previous_hash") == current_hash and oh not in visited:
+                    current_hash = oh
+                    found_next = True
+                    break
+            if not found_next:
+                break
+
         return total_difficulty
     
     async def _connect_orphan_chain(self, chain: List[str]) -> bool:
@@ -1525,12 +1581,13 @@ class ChainManager:
             # Phase 1: Disconnect blocks from current chain
             # Track UTXOs restored (unspent) by disconnection for cross-checking
             restored_utxos = set()
+            utxo_overlay = {}  # Tracks pending UTXO changes for consistent reads
             for block_hash in blocks_to_disconnect:
                 # Backup block state before disconnecting
                 block_key = f"block:{block_hash}".encode()
                 backup_state["block_states"][block_hash] = self.db.get(block_key)
 
-                self._disconnect_block(block_hash, batch, backup_state["utxo_backups"])
+                self._disconnect_block(block_hash, batch, backup_state["utxo_backups"], utxo_overlay)
 
             # Collect the set of UTXOs that were restored (marked unspent) during disconnect
             for utxo_key_str, _ in backup_state["utxo_backups"].items():
@@ -1720,9 +1777,14 @@ class ChainManager:
         
         return transactions
     
-    def _disconnect_block(self, block_hash: str, batch: WriteBatch, utxo_backups: Dict[str, bytes]):
-        """Disconnect a block from the active chain (revert its effects)"""
+    def _disconnect_block(self, block_hash: str, batch: WriteBatch, utxo_backups: Dict[str, bytes],
+                          utxo_overlay: Dict[bytes, Optional[bytes]] = None):
+        """Disconnect a block from the active chain (revert its effects).
+        utxo_overlay provides consistent reads during multi-block disconnect."""
         logger.info(f"Disconnecting block {block_hash}")
+
+        if utxo_overlay is None:
+            utxo_overlay = {}
 
         # Load block data
         block_key = f"block:{block_hash}".encode()
@@ -1733,7 +1795,7 @@ class ChainManager:
 
         # Revert all transactions in this block
         for txid in block_data.get("tx_ids", []):
-            self._revert_transaction(txid, batch, utxo_backups)
+            self._revert_transaction(txid, batch, utxo_backups, utxo_overlay)
             # Remove tx_block index entry
             tx_block_key = f"tx_block:{txid}".encode()
             batch.delete(tx_block_key)
@@ -1941,57 +2003,62 @@ class ChainManager:
         # This tracks all UTXOs spent across the entire new chain
         new_chain_spent_utxos.update(block_spent_utxos)
     
-    def _revert_transaction(self, txid: str, batch: WriteBatch, utxo_backups: Dict[str, bytes] = None):
-        """Revert a transaction's effects on the UTXO set"""
+    def _revert_transaction(self, txid: str, batch: WriteBatch, utxo_backups: Dict[str, bytes] = None,
+                            utxo_overlay: Dict[bytes, Optional[bytes]] = None):
+        """Revert a transaction's effects on the UTXO set.
+        utxo_overlay tracks pending batch changes to avoid stale reads during multi-block disconnect."""
         logger.debug(f"Reverting transaction {txid}")
-        
+
         if utxo_backups is None:
             utxo_backups = {}
-        
+        if utxo_overlay is None:
+            utxo_overlay = {}
+
+        def _read_utxo(key: bytes) -> Optional[bytes]:
+            """Read UTXO from overlay first, then fall back to DB"""
+            if key in utxo_overlay:
+                return utxo_overlay[key]  # None means deleted in overlay
+            return self.db.get(key)
+
         # Mark all outputs from this transaction as invalid
         tx_key = f"tx:{txid}".encode()
         tx_data = self.db.get(tx_key)
         if not tx_data:
             return
-        
+
         tx = json.loads(tx_data.decode())
-        
+
         # Restore spent inputs - but backup current state first
         for inp in tx.get("inputs", []):
             if "txid" in inp and inp["txid"] != "00" * 32:  # Skip coinbase
                 utxo_key = f"utxo:{inp['txid']}:{inp.get('utxo_index', 0)}".encode()
-                
-                # Backup current state before modifying
-                current_utxo_data = self.db.get(utxo_key)
+
+                # Read from overlay or DB
+                current_utxo_data = _read_utxo(utxo_key)
                 if current_utxo_data:
                     backup_key = f"{inp['txid']}:{inp.get('utxo_index', 0)}"
                     utxo_backups[backup_key] = current_utxo_data
-                    
-                    utxo = json.loads(current_utxo_data.decode())
+
+                    utxo = json.loads(current_utxo_data.decode() if isinstance(current_utxo_data, bytes) else current_utxo_data)
                     utxo["spent"] = False
-                    # Increment version when reverting
                     utxo["version"] = utxo.get("version", 0) + 1
-                    # Clear spending info
                     utxo.pop("spent_at_height", None)
                     utxo.pop("spent_by_tx", None)
-                    batch.put(utxo_key, json.dumps(utxo).encode())
-                    
-                    # Wallet indexes handled by wallet_index.update_for_new_transaction()
-        
+                    new_data = json.dumps(utxo).encode()
+                    batch.put(utxo_key, new_data)
+                    utxo_overlay[utxo_key] = new_data
+
         # Remove outputs created by this transaction
         for idx, out in enumerate(tx.get("outputs", [])):
             utxo_key = f"utxo:{txid}:{idx}".encode()
-            
-            # Backup before deleting
-            current_data = self.db.get(utxo_key)
+
+            current_data = _read_utxo(utxo_key)
             if current_data:
                 backup_key = f"{txid}:{idx}"
                 utxo_backups[backup_key] = current_data
-                
-                # Wallet indexes handled by wallet_index.update_for_new_transaction()
-                utxo = json.loads(current_data.decode())
-            
+
             batch.delete(utxo_key)
+            utxo_overlay[utxo_key] = None  # Mark as deleted in overlay
     
     def _apply_transaction(self, tx: dict, height: int, batch: WriteBatch):
         """Apply a transaction's effects on the UTXO set"""
@@ -2025,9 +2092,10 @@ class ChainManager:
                         utxo["spent_at_height"] = height
                         utxo["spent_by_tx"] = txid
                         batch.put(utxo_key, json.dumps(utxo).encode())
-                        
-                        # Wallet indexes handled by wallet_index.update_for_new_transaction()
-        
+                    else:
+                        logger.error(f"UTXO {utxo_key.decode()} not found when applying tx {txid} at height {height} - aborting transaction")
+                        return
+
         # Create new UTXOs (including for coinbase!)
         for idx, out in enumerate(tx.get("outputs", [])):
             # Create proper UTXO record with all necessary fields
@@ -2149,18 +2217,13 @@ class ChainManager:
                     logger.error(f"Chain ID validation error in tx {txid}: {e}")
                     return False
                 
-                # Validate timestamp
+                # Skip timestamp expiration check during reorg — historical transactions
+                # were valid when originally accepted and should remain valid during reorg.
+                # Only validate timestamp format.
                 try:
-                    from config.config import TX_EXPIRATION_TIME
-                    tx_timestamp = int(time_str)
-                    current_time = int(time.time() * 1000)
-                    tx_age = (current_time - tx_timestamp) / 1000
-                    
-                    if tx_age > TX_EXPIRATION_TIME:
-                        logger.error(f"Transaction {txid} expired during reorg: age {tx_age}s > max {TX_EXPIRATION_TIME}s")
-                        return False
-                except (ValueError, ImportError) as e:
-                    logger.error(f"Timestamp validation error in tx {txid}: {e}")
+                    int(time_str)  # Ensure parseable
+                except ValueError:
+                    logger.error(f"Invalid timestamp format in tx {txid}: {time_str}")
                     return False
                 
                 # Verify signature

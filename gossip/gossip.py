@@ -156,9 +156,10 @@ class GossipNode:
             return
         
         # Sort by timestamp and remove the oldest ones
-        sorted_txs = sorted(self.seen_tx_timestamps.items(), key=lambda x: x[1])
+        # Copy items to avoid RuntimeError from dict mutation during iteration
+        sorted_txs = sorted(list(self.seen_tx_timestamps.items()), key=lambda x: x[1])
         to_remove = len(self.seen_tx) - int(MAX_SEEN_TX_SIZE * 0.9)  # Remove 10% when at capacity
-        
+
         for txid, _ in sorted_txs[:to_remove]:
             self.seen_tx.discard(txid)
             self.seen_tx_timestamps.pop(txid, None)

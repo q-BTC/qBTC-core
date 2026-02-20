@@ -10,6 +10,7 @@ from typing import Dict, List, Set, Tuple, Optional
 import logging
 
 from wallet.wallet import verify_transaction
+from blockchain.blockchain import derive_qsafe_address
 from config.config import CHAIN_ID, TX_EXPIRATION_TIME, ADMIN_ADDRESS, GENESIS_ADDRESS, TOTAL_SUPPLY
 
 logger = logging.getLogger(__name__)
@@ -304,7 +305,16 @@ class TransactionValidator:
             
             if not verify_transaction(msg_str, signature, pubkey):
                 return False, f"Signature verification failed for tx {txid}", Decimal("0")
-        
+
+            # Verify pubkey derives to sender address (prevents spending with wrong keypair)
+            derived_address = derive_qsafe_address(pubkey)
+            if derived_address != from_:
+                return False, f"Pubkey does not derive to sender address in tx {txid}: expected {from_}, got {derived_address}", Decimal("0")
+
+        # Check total outputs don't exceed total inputs (prevents coin inflation)
+        if height > 0 and total_output > total_available:
+            return False, f"Total output ({total_output}) exceeds total available ({total_available}) in tx {txid}", Decimal("0")
+
         # Calculate actual transaction fee
         tx_fee = total_available - total_output
         
@@ -326,7 +336,8 @@ class TransactionValidator:
             block_subsidy = Decimal("0")
         else:
             # Initial reward: 0.4167 qBTC (maintains Bitcoin's emission rate for 50% supply)
-            initial_subsidy = Decimal(str(INITIAL_BLOCK_REWARD)) * Decimal("100000000")  # Convert to satoshis
+            # Amounts are in qBTC (not satoshis) to match UTXO storage format
+            initial_subsidy = Decimal(str(INITIAL_BLOCK_REWARD))
             block_subsidy = initial_subsidy / (2 ** halvings)
         
         # Maximum allowed coinbase output
@@ -339,8 +350,8 @@ class TransactionValidator:
                 amt = Decimal(out.get("amount", "0"))
             except (ValueError, ArithmeticError, TypeError):
                 return False, "Invalid amount in coinbase output"
-            if amt < 0:
-                return False, f"Negative coinbase output amount: {amt}"
+            if amt <= 0:
+                return False, f"Invalid coinbase output amount: {amt}"
             if amt > TOTAL_SUPPLY:
                 return False, f"Coinbase output amount exceeds total supply: {amt}"
             if amt != amt.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN):

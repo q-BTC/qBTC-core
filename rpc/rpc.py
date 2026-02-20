@@ -26,6 +26,18 @@ from security.simple_middleware import simple_security_middleware
 
 logger = logging.getLogger(__name__)
 
+
+def _calculate_block_subsidy(height: int) -> int:
+    """Calculate block subsidy in satoshis for a given height (for block template)"""
+    from config.config import HALVING_INTERVAL, INITIAL_BLOCK_REWARD
+    halvings = height // HALVING_INTERVAL
+    if halvings >= 64:
+        return 0
+    # INITIAL_BLOCK_REWARD is in qBTC, convert to satoshis for cpuminer compatibility
+    subsidy_satoshis = int(Decimal(str(INITIAL_BLOCK_REWARD)) * Decimal("100000000"))
+    return subsidy_satoshis >> halvings
+
+
 # Longpoll support for miners
 longpoll_waiters = []  # List of (longpollid, future) tuples
 longpoll_lock = None  # Will be created lazily
@@ -416,7 +428,7 @@ async def get_block_template(data):
         "noncerange": "00000000ffffffff",
         "capabilities": ["proposal"],
         "coinbaseaux": {},
-        "coinbasevalue": 50,
+        "coinbasevalue": _calculate_block_subsidy(height + 1),
         "transactions": transactions,
         "longpollid": previous_block_hash,
     }
@@ -958,9 +970,10 @@ async def create_wallet_rpc(data):
         if not password or len(password) < 8:
             return rpc_error(-8, "Password must be at least 8 characters", data.get("id"))
 
-        # Validate wallet name
-        if not wallet_name:
-            return rpc_error(-8, "Invalid wallet name", data.get("id"))
+        # Validate wallet name — reject path traversal and special characters
+        import re
+        if not wallet_name or not re.match(r'^[a-zA-Z0-9_\-]+$', wallet_name):
+            return rpc_error(-8, "Invalid wallet name: must contain only alphanumeric characters, underscores, and hyphens", data.get("id"))
 
         # Check if wallet already exists
         wallet_dir = os.path.join("wallets", wallet_name)
@@ -1009,9 +1022,10 @@ async def create_wallet_rpc(data):
             logger.error(f"Failed to generate keys: {str(e)}")
             return rpc_error(-1, f"Failed to generate keys: {str(e)}", data.get("id"))
 
-        # Save wallet file
+        # Save wallet file with restrictive permissions
         wallet_file = os.path.join(wallet_dir, "wallet.json")
-        with open(wallet_file, "w") as f:
+        fd = os.open(wallet_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
             json.dump(wallet_data, f, indent=2)
 
         # Store in database for quick access
@@ -1429,8 +1443,9 @@ async def encrypt_wallet_rpc(data):
                         wallet_data["encrypted"] = True
                         wallet_data["locked"] = True
 
-                        # Save encrypted wallet
-                        with open(wallet_file, "w") as f:
+                        # Save encrypted wallet with restrictive permissions
+                        fd = os.open(wallet_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                        with os.fdopen(fd, "w") as f:
                             json.dump(wallet_data, f, indent=2)
 
                         encrypted_wallet = wallet_name

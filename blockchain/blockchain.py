@@ -55,6 +55,10 @@ def calculate_merkle_root(txids: list[str]) -> str:
 def bits_to_target(bits: int) -> int:
     exponent = bits >> 24
     coefficient = bits & 0xffffff
+    if exponent < 3:
+        return coefficient >> (8 * (3 - exponent))
+    if exponent > 32:
+        raise ValueError(f"Invalid compact bits: exponent {exponent} exceeds maximum (32)")
     return coefficient * (1 << (8 * (exponent - 3)))
 
 def validate_pow(block: "Block") -> bool:

@@ -1,12 +1,15 @@
 #!/bin/bash
 set -e
 
-# Default values if not set
+# Require WALLET_PASSWORD to be set — no default
 WALLET_FILE="${WALLET_FILE:-wallet.json}"
-WALLET_PASSWORD="${WALLET_PASSWORD:-password123}"
+if [ -z "$WALLET_PASSWORD" ]; then
+    echo "ERROR: WALLET_PASSWORD environment variable is not set. Cannot start node."
+    exit 1
+fi
 
-echo "🔐 Wallet file: $WALLET_FILE"
-echo "🔐 Password: (hidden)"
+echo "Wallet file: $WALLET_FILE"
+echo "Password: (hidden)"
 
 # Generate or unlock wallet
 python3 -c "
@@ -19,7 +22,7 @@ password = os.getenv('WALLET_PASSWORD')
 # Force wallet generation or loading
 wallet = get_or_create_wallet(fname='/app/${WALLET_FILE}', password=password)
 
-print(f'✅ Wallet ready: Address {wallet[\"address\"]}')
+print(f'Wallet ready: Address {wallet[\"address\"]}')
 "
 
 # Run main.py with passed arguments

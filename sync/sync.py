@@ -410,6 +410,8 @@ async def _check_orphan_chains_for_missing_blocks(gossip_client=None):
 # Track blocks with missing UTXOs to avoid infinite retry loops
 _missing_utxo_blocks = {}  # block_hash -> {"height": int, "attempts": int, "missing_utxos": set()}
 _max_backtrack_attempts = 3  # Maximum times to try requesting earlier blocks
+_max_recursion_depth = 3  # Maximum recursive calls to process_blocks_from_peer
+_current_recursion_depth = 0  # Track current recursion depth
 
 async def _handle_missing_utxo(block: dict, missing_utxo: str):
     """
@@ -465,8 +467,16 @@ async def _handle_missing_utxo(block: dict, missing_utxo: str):
                         utxo_manager.add_utxo(utxo_id, utxo_data)
 
                 logging.info(f"[SYNC] Retrying block {block_hash} after fetching missing transaction")
-                # Retry processing the block
-                await process_blocks_from_peer([block])
+                # Retry processing the block with recursion depth guard
+                global _current_recursion_depth
+                if _current_recursion_depth >= _max_recursion_depth:
+                    logging.error(f"[SYNC] Max recursion depth ({_max_recursion_depth}) reached, aborting retry")
+                    return
+                _current_recursion_depth += 1
+                try:
+                    await process_blocks_from_peer([block])
+                finally:
+                    _current_recursion_depth -= 1
                 return
 
     # Check if we've tried too many times
@@ -516,8 +526,15 @@ async def _handle_missing_utxo(block: dict, missing_utxo: str):
                         blocks = msg.get("blocks", [])
                         if blocks:
                             logging.info(f"[SYNC] Received {len(blocks)} earlier blocks, processing them first")
-                            # Process these earlier blocks first
-                            await process_blocks_from_peer(blocks)
+                            # Process these earlier blocks first with recursion depth guard
+                            if _current_recursion_depth >= _max_recursion_depth:
+                                logging.error(f"[SYNC] Max recursion depth ({_max_recursion_depth}) reached, aborting backtrack")
+                            else:
+                                _current_recursion_depth += 1
+                                try:
+                                    await process_blocks_from_peer(blocks)
+                                finally:
+                                    _current_recursion_depth -= 1
                         else:
                             logging.warning(f"[SYNC] No blocks received for range {start_height} to {block_height - 1}")
 

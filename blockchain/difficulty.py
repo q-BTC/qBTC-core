@@ -168,13 +168,18 @@ def get_next_bits(db, current_height: int) -> int:
         
         # Get the current chain tip and work backwards
         tip_key = b"chain:best_tip"
-        tip_hash = db.get(tip_key)
-        if not tip_hash:
+        tip_data = db.get(tip_key)
+        if not tip_data:
             logger.error("No chain tip found")
             raise ValueError("Cannot determine difficulty: no chain tip")
-        
-        # Walk back from tip to find the block at current_height
-        block_hash = tip_hash.decode()
+
+        # chain:best_tip stores JSON {"hash": "...", "height": ...}
+        try:
+            tip_info = json.loads(tip_data.decode())
+            block_hash = tip_info["hash"]
+        except (json.JSONDecodeError, KeyError):
+            # Fallback for raw hash format
+            block_hash = tip_data.decode()
         while block_hash:
             block_key = f"block:{block_hash}".encode()
             block_data = db.get(block_key)
@@ -212,13 +217,20 @@ def get_next_bits(db, current_height: int) -> int:
         
         # Get chain tip and walk back
         tip_key = b"chain:best_tip"
-        tip_hash = db.get(tip_key)
-        if not tip_hash:
+        tip_data = db.get(tip_key)
+        if not tip_data:
             raise ValueError("Cannot calculate difficulty: no chain tip")
-        
+
+        # chain:best_tip stores JSON {"hash": "...", "height": ...}
+        try:
+            tip_info = json.loads(tip_data.decode())
+            block_hash = tip_info["hash"]
+        except (json.JSONDecodeError, KeyError):
+            # Fallback for raw hash format
+            block_hash = tip_data.decode()
+
         # Find blocks by walking the chain
         blocks_needed = {interval_start_height: None, current_height: None}
-        block_hash = tip_hash.decode()
         
         while block_hash and (blocks_needed[interval_start_height] is None or blocks_needed[current_height] is None):
             block_key = f"block:{block_hash}".encode()
