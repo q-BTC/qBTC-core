@@ -3,7 +3,7 @@ import json
 import time
 import aiohttp
 from kademlia.network import Server as KademliaServer
-from config.config import  shutdown_event, VALIDATOR_ID, HEARTBEAT_INTERVAL, VALIDATOR_TIMEOUT, VALIDATORS_LIST_KEY, DEFAULT_GOSSIP_PORT, KNOWN_VALIDATORS, MAX_HEARTBEAT_FAILURES, MAX_BLOCKS_PER_SYNC_REQUEST
+from config.config import  shutdown_event, VALIDATOR_ID, HEARTBEAT_INTERVAL, VALIDATOR_TIMEOUT, VALIDATORS_LIST_KEY, DEFAULT_GOSSIP_PORT, KNOWN_VALIDATORS, MAX_HEARTBEAT_FAILURES, MAX_BLOCKS_PER_SYNC_REQUEST, MAX_OUTBOUND_CONNECTIONS
 from state.state import validator_keys, known_validators
 
 # Track validator heartbeat failures
@@ -410,6 +410,16 @@ async def discover_peers_once(gossip_node):
         if vid == VALIDATOR_ID:
             logger.debug(f"Skipping self (validator {vid})")
             continue
+
+        # Early-exit: stop discovering if already at outbound peer capacity
+        if gossip_node and hasattr(gossip_node, 'dht_peers'):
+            if len(gossip_node.dht_peers) >= MAX_OUTBOUND_CONNECTIONS:
+                logger.info(
+                    f"At outbound peer capacity ({len(gossip_node.dht_peers)}/{MAX_OUTBOUND_CONNECTIONS}), "
+                    f"stopping discovery"
+                )
+                break
+
         gossip_key = f"gossip_{vid}"
         try:
             logger.debug(f"Looking up gossip info for validator {vid} with key {gossip_key}")
@@ -417,19 +427,19 @@ async def discover_peers_once(gossip_node):
             if not gossip_info_json:
                 logger.warning(f"No gossip info found for validator {vid}")
                 continue
-                
+
             info = json.loads(gossip_info_json)
-            
+
             # Handle both old format (just ip/port) and new NAT-aware format
             if isinstance(info, dict):
                 ip = info.get("ip", info.get("external_ip"))
                 port = info.get("port", info.get("external_port"))
-                
+
                 # Skip if it's our own validator ID (dynamic check)
                 if vid == VALIDATOR_ID:
                     logger.info(f"Skipping self-connection to {vid} at {ip}:{port}")
                     continue
-                    
+
                 try:
                     # Also check IP-based self-detection using dynamic values
                     if ip == own_ip or (nat_traversal and hasattr(nat_traversal, 'external_ip') and ip == nat_traversal.external_ip):
@@ -437,15 +447,15 @@ async def discover_peers_once(gossip_node):
                         continue
                 except:
                     pass
-                    
+
                 # Store full peer info for NAT traversal
                 logger.info(f"Adding peer {vid} at {ip}:{port} to gossip node")
                 gossip_node.add_peer(ip, port, peer_info=info)
                 discovered_count += 1
-                
+
                 nat_type = info.get("nat_type", "unknown")
                 logger.info(f"Successfully added peer {vid} at {ip}:{port} (NAT type: {nat_type})")
-                
+
                 # Also store publicKey in validator_keys for TX signature validation
                 if "publicKey" in info:
                     validator_keys[vid] = info["publicKey"]

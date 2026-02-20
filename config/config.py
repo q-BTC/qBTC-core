@@ -51,3 +51,14 @@ MAX_MEMPOOL_SIZE_MB = int(os.getenv("MAX_MEMPOOL_SIZE_MB", "300"))  # Max mempoo
 MIN_RELAY_FEE = float(os.getenv("MIN_RELAY_FEE", "0.00001"))  # Minimum fee to relay transaction
 # Maximum reorg depth - reject reorganizations deeper than this (matches Bitcoin's practical limit)
 MAX_REORG_DEPTH = 100
+
+# Gossip network hardening constants
+MAX_INBOUND_CONNECTIONS = int(os.getenv("MAX_INBOUND_CONNECTIONS", "117"))
+MAX_OUTBOUND_CONNECTIONS = int(os.getenv("MAX_OUTBOUND_CONNECTIONS", "10"))
+GOSSIP_RATE_LIMIT_WINDOW = int(os.getenv("GOSSIP_RATE_LIMIT_WINDOW", "60"))  # seconds
+GOSSIP_RATE_LIMIT_TX = int(os.getenv("GOSSIP_RATE_LIMIT_TX", "200"))  # per peer per window
+GOSSIP_RATE_LIMIT_BLOCK = int(os.getenv("GOSSIP_RATE_LIMIT_BLOCK", "30"))
+GOSSIP_RATE_LIMIT_QUERY = int(os.getenv("GOSSIP_RATE_LIMIT_QUERY", "60"))
+GOSSIP_RATE_LIMIT_DEFAULT = int(os.getenv("GOSSIP_RATE_LIMIT_DEFAULT", "120"))
+MAX_PEERS_PER_SUBNET = int(os.getenv("MAX_PEERS_PER_SUBNET", "4"))  # /16 netgroup limit
+NUM_ANCHOR_PEERS = int(os.getenv("NUM_ANCHOR_PEERS", "2"))

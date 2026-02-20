@@ -1,9 +1,22 @@
 import asyncio
 import json
+import os
 import time
 import random
+from collections import deque
 from asyncio import StreamReader, StreamWriter
-from config.config import DEFAULT_GOSSIP_PORT
+from config.config import (
+    DEFAULT_GOSSIP_PORT,
+    MAX_INBOUND_CONNECTIONS,
+    MAX_OUTBOUND_CONNECTIONS,
+    GOSSIP_RATE_LIMIT_WINDOW,
+    GOSSIP_RATE_LIMIT_TX,
+    GOSSIP_RATE_LIMIT_BLOCK,
+    GOSSIP_RATE_LIMIT_QUERY,
+    GOSSIP_RATE_LIMIT_DEFAULT,
+    MAX_PEERS_PER_SUBNET,
+    NUM_ANCHOR_PEERS,
+)
 from state.state import mempool_manager
 from wallet.wallet import verify_transaction
 from database.database import get_db, get_current_height
@@ -27,8 +40,62 @@ except ImportError:
     NAT_TRAVERSAL_AVAILABLE = False
 
 GENESIS_HASH = "0" * 64
-MAX_LINE_BYTES = 30 * 1024 * 1024  
+MAX_LINE_BYTES = 30 * 1024 * 1024
 MAX_SEEN_TX_SIZE = 10000  # Maximum number of transaction IDs to remember
+
+# Map gossip message types to rate-limit categories
+_MSG_TYPE_CATEGORY = {
+    "transaction": "tx",
+    "blocks_response": "block",
+    "blocks_by_hash_response": "block",
+    "blocks_response_chunked": "block",
+    "get_height": "query",
+    "get_blocks": "query",
+    "get_blocks_by_hash": "query",
+    "get_transactions": "query",
+    "height_response": "default",
+}
+
+_CATEGORY_LIMITS = {
+    "tx": GOSSIP_RATE_LIMIT_TX,
+    "block": GOSSIP_RATE_LIMIT_BLOCK,
+    "query": GOSSIP_RATE_LIMIT_QUERY,
+    "default": GOSSIP_RATE_LIMIT_DEFAULT,
+}
+
+
+class GossipRateLimiter:
+    """Per-peer, per-category sliding-window rate limiter for gossip messages."""
+
+    def __init__(self, window: int = GOSSIP_RATE_LIMIT_WINDOW):
+        self.window = window
+        # {peer_key: {category: deque_of_timestamps}}
+        self._buckets: dict[str, dict[str, deque]] = {}
+
+    def check_rate_limit(self, peer_ip: str, peer_port: int, msg_type: str) -> bool:
+        """Return True if the message is within limits, False if rate-limited."""
+        now = time.monotonic()
+        key = f"{peer_ip}:{peer_port}"
+        category = _MSG_TYPE_CATEGORY.get(msg_type, "default")
+        limit = _CATEGORY_LIMITS.get(category, GOSSIP_RATE_LIMIT_DEFAULT)
+
+        peer_buckets = self._buckets.setdefault(key, {})
+        dq = peer_buckets.setdefault(category, deque())
+
+        # Evict timestamps outside the window
+        cutoff = now - self.window
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+
+        if len(dq) >= limit:
+            return False
+
+        dq.append(now)
+        return True
+
+    def cleanup_peer(self, peer_ip: str, peer_port: int):
+        """Remove all state for a disconnected peer."""
+        self._buckets.pop(f"{peer_ip}:{peer_port}", None)
 
 class GossipNode:
     def __init__(self, node_id, wallet=None, is_bootstrap=False, is_full_node=True):
@@ -42,8 +109,8 @@ class GossipNode:
             'new': 0,
             'invalid': 0
         }
-        self.dht_peers = set()  
-        self.client_peers = set()  
+        self.dht_peers = set()
+        self.client_peers = set()
         self.failed_peers = {}
         self.peer_info = {}  # Store full peer info for NAT traversal
         self.server_task = None
@@ -61,6 +128,17 @@ class GossipNode:
         # CRITICAL: Protected peers that must NEVER be removed
         self.protected_peers = set()  # Peers that are critical for network operation
 
+        # --- Gossip hardening state ---
+        self.gossip_rate_limiter = GossipRateLimiter()
+        self.inbound_connections = 0
+        self._inbound_lock = asyncio.Lock()
+        # Subnet diversity: /16 prefix -> count of connected peers
+        self.subnet_counts: dict[str, int] = {}
+        # Anchor peers file path (persistent across restarts)
+        self._anchor_path = os.path.join(
+            os.environ.get("ROCKSDB_PATH", "/app/db"), "anchor_peers.json"
+        )
+
     async def start_server(self, host="0.0.0.0", port=DEFAULT_GOSSIP_PORT):
         self.gossip_port = port  # Store for NAT traversal
         self.server = await asyncio.start_server(self.handle_client, host, port, limit=MAX_LINE_BYTES)
@@ -71,44 +149,84 @@ class GossipNode:
         self.sync_task = asyncio.create_task(self.periodic_sync())
         # Start periodic cleanup task
         self.cleanup_task = asyncio.create_task(self.periodic_cleanup())
-        logger.info(f"Gossip server started on {host}:{port}")
+
+        # Register auto-disconnect callback with the reputation system
+        peer_reputation_manager.register_disconnect_callback(
+            self._on_peer_reputation_disconnect
+        )
+
+        # Load anchor peers from last shutdown
+        self._load_anchor_peers()
+
+        logger.info(
+            f"Gossip server started on {host}:{port} "
+            f"(max_in={MAX_INBOUND_CONNECTIONS}, max_out={MAX_OUTBOUND_CONNECTIONS}, "
+            f"rate_window={GOSSIP_RATE_LIMIT_WINDOW}s, subnet_limit={MAX_PEERS_PER_SUBNET})"
+        )
 
     async def handle_client(self, reader: StreamReader, writer: StreamWriter):
         peer_info = writer.get_extra_info('peername')
         peer_ip, peer_port = peer_info[0], peer_info[1]
-        
+
+        # --- Inbound connection limit ---
+        async with self._inbound_lock:
+            if self.inbound_connections >= MAX_INBOUND_CONNECTIONS:
+                logger.warning(
+                    f"Rejecting {peer_ip}:{peer_port} — at inbound limit "
+                    f"({self.inbound_connections}/{MAX_INBOUND_CONNECTIONS})"
+                )
+                writer.close()
+                await writer.wait_closed()
+                return
+            self.inbound_connections += 1
+
         logger.info(f"New peer connection: {peer_ip}:{peer_port}")
-        
+
         # Check peer reputation before accepting connection
         if not peer_reputation_manager.should_connect_to_peer(peer_ip, peer_port):
             logger.warning(f"Rejecting connection from banned/malicious peer {peer_ip}:{peer_port}")
+            async with self._inbound_lock:
+                self.inbound_connections -= 1
             writer.close()
             await writer.wait_closed()
             return
-        
+
         # Record successful connection
         peer_reputation_manager.record_connection_success(peer_ip, peer_port)
-        
+
         if peer_info not in self.client_peers and peer_info not in self.dht_peers:
             self.client_peers.add(peer_info)
             logger.info(f"Added temporary client peer {peer_info}")
-        
+
         start_time = time.time()
         try:
             while True:
                 line = await asyncio.wait_for(reader.readline(), timeout=10)
                 if not line:
                     break
-                
+
                 try:
                     msg = json.loads(line.decode('utf-8').strip())
+
+                    # --- Per-peer gossip rate limiting ---
+                    msg_type = msg.get("type", "unknown")
+                    if not self.gossip_rate_limiter.check_rate_limit(
+                        peer_ip, peer_port, msg_type
+                    ):
+                        logger.warning(
+                            f"Rate limit exceeded for {peer_ip}:{peer_port} "
+                            f"on {msg_type} — disconnecting"
+                        )
+                        peer_reputation_manager.record_spam_message(peer_ip, peer_port)
+                        break  # disconnect the flooding peer
+
                     await self.handle_gossip_message(msg, peer_info, writer)
-                    
+
                     # Record valid message
                     peer_reputation_manager.record_valid_message(
-                        peer_ip, peer_port, msg.get("type", "unknown")
+                        peer_ip, peer_port, msg_type
                     )
-                    
+
                 except json.JSONDecodeError as e:
                     logger.warning(f"Invalid JSON from {peer_info}: {e}")
                     peer_reputation_manager.record_invalid_message(
@@ -119,7 +237,7 @@ class GossipNode:
                     peer_reputation_manager.record_invalid_message(
                         peer_ip, peer_port, str(e)
                     )
-                    
+
         except asyncio.TimeoutError:
             logger.warning(f"Timeout handling client {peer_info}")
             peer_reputation_manager.record_timeout(peer_ip, peer_port)
@@ -129,17 +247,22 @@ class GossipNode:
                 peer_ip, peer_port, str(e)
             )
         finally:
+            # Decrement inbound counter and clean up rate limiter state
+            async with self._inbound_lock:
+                self.inbound_connections -= 1
+            self.gossip_rate_limiter.cleanup_peer(peer_ip, peer_port)
+
             # Record disconnection
             peer_reputation_manager.record_disconnection(peer_ip, peer_port)
-            
+
             # Record response time
             response_time = time.time() - start_time
             peer_reputation_manager.record_response_time(peer_ip, peer_port, response_time)
-            
+
             if peer_info in self.client_peers:
                 self.client_peers.remove(peer_info)
                 logger.info(f"Removed temporary client peer {peer_info}")
-            
+
             writer.close()
             await writer.wait_closed()
 
@@ -805,25 +928,25 @@ class GossipNode:
                         # Simple ping to check if peer is back online
                         reader, writer = await asyncio.wait_for(
                             asyncio.open_connection(peer[0], peer[1]),
-                            timeout=1  # Reduced from 3s to 1s for recovery check
+                            timeout=1
                         )
                         # Send a get_height request as ping
                         ping_msg = json.dumps({"type": "get_height", "timestamp": int(time.time() * 1000)}) + "\n"
                         writer.write(ping_msg.encode('utf-8'))
                         await writer.drain()
-                        
+
                         # Wait for response
-                        response = await asyncio.wait_for(reader.readline(), timeout=2)  # Reduced from 3s to 2s
+                        response = await asyncio.wait_for(reader.readline(), timeout=2)
                         if response:
                             # Peer is back online, reset failure count
                             self.failed_peers[peer] = 0
                             logger.info(f"Peer {peer} is back online, resetting failure count")
-                            
+
                             # Ensure peer is in both lists if it's back online
                             if peer not in self.synced_peers:
                                 self.synced_peers.add(peer)
                                 asyncio.create_task(push_blocks(peer[0], peer[1]))
-                        
+
                         writer.close()
                         await writer.wait_closed()
                     except Exception as e:
@@ -834,27 +957,22 @@ class GossipNode:
                             if peer in self.protected_peers:
                                 logger.info(f"Not removing protected peer {peer} despite failures")
                                 continue
-                            
-                            self.dht_peers.discard(peer)
-                            self.peer_info.pop(peer, None)
+
+                            fail_count = self.failed_peers.get(peer, 0)
                             self.synced_peers.discard(peer)
-                            del self.failed_peers[peer]
-                            logger.info(f"Removed unreachable peer {peer} after {self.failed_peers.get(peer, 0)} failures")
-            
+                            self.remove_peer(peer[0], peer[1])
+                            logger.info(f"Removed unreachable peer {peer} after {fail_count} failures")
+
             # Clean up peers that are in dht_peers but not in synced_peers for too long
             for peer in list(self.dht_peers):
                 if peer not in self.synced_peers and peer not in self.protected_peers:
-                    # Check if we have a timestamp for when this peer was added
                     if peer in self.peer_timestamps:
                         age = time.time() - self.peer_timestamps[peer]
-                        # If peer has been unsynced for more than 5 minutes, remove it
                         if age > 300:  # 5 minutes
                             logger.info(f"Removing stale unsynced peer {peer} (age: {age:.0f}s)")
-                            self.dht_peers.discard(peer)
-                            self.peer_info.pop(peer, None)
-                            self.failed_peers.pop(peer, None)
-                            del self.peer_timestamps[peer]
-            
+                            self.synced_peers.discard(peer)
+                            self.remove_peer(peer[0], peer[1])
+
             await asyncio.sleep(30)
 
     async def periodic_sync(self):
@@ -1000,134 +1118,179 @@ class GossipNode:
     async def periodic_cleanup(self):
         """Periodically clean up peer lists to ensure consistency"""
         await asyncio.sleep(60)  # Initial delay
-        
+
         while True:
             try:
-                # Ensure dht_peers and synced_peers are consistent
                 # Remove peers from dht_peers that are not in synced_peers and not protected
                 peers_to_remove = []
-                for peer in self.dht_peers:
+                for peer in list(self.dht_peers):
                     if peer not in self.synced_peers and peer not in self.protected_peers:
-                        # Check if peer has been unsynced for too long
                         if peer in self.peer_timestamps:
                             age = time.time() - self.peer_timestamps[peer]
                             if age > 180:  # 3 minutes
                                 peers_to_remove.append(peer)
                                 logger.info(f"[CLEANUP] Marking {peer} for removal (unsynced for {age:.0f}s)")
-                
-                # Remove stale peers
+
+                # Remove stale peers via remove_peer to keep subnet_counts consistent
                 for peer in peers_to_remove:
-                    self.dht_peers.discard(peer)
-                    self.peer_info.pop(peer, None)
-                    self.failed_peers.pop(peer, None)
-                    if peer in self.peer_timestamps:
-                        del self.peer_timestamps[peer]
+                    self.synced_peers.discard(peer)
+                    self.remove_peer(peer[0], peer[1])
                     logger.info(f"[CLEANUP] Removed stale peer {peer}")
-                
+
                 # Log current state
-                logger.info(f"[CLEANUP] Current state - dht_peers: {len(self.dht_peers)}, synced_peers: {len(self.synced_peers)}, protected: {len(self.protected_peers)}")
-                
+                logger.info(
+                    f"[CLEANUP] Current state - dht_peers: {len(self.dht_peers)}, "
+                    f"synced_peers: {len(self.synced_peers)}, protected: {len(self.protected_peers)}, "
+                    f"inbound: {self.inbound_connections}"
+                )
+
                 # Ensure all synced_peers are also in dht_peers
-                for peer in self.synced_peers:
+                for peer in list(self.synced_peers):
                     if peer not in self.dht_peers:
                         self.dht_peers.add(peer)
                         logger.warning(f"[CLEANUP] Added missing synced peer {peer} to dht_peers")
-                
+
             except Exception as e:
                 logger.error(f"[CLEANUP] Error in periodic cleanup: {e}", exc_info=True)
-            
+
             # Run every 2 minutes
             await asyncio.sleep(120)
+
+    @staticmethod
+    def _get_subnet(ip: str) -> str:
+        """Extract /16 subnet prefix for IPv4 addresses."""
+        try:
+            parts = ip.split(".")
+            if len(parts) == 4:
+                return f"{parts[0]}.{parts[1]}"
+        except Exception:
+            pass
+        return ip  # fallback: treat whole IP as its own group
 
     def add_peer(self, ip: str, port: int, peer_info=None, protected=False):
         peer = (ip, port)
         current_time = time.time()
-        
+        is_protected = protected or (peer_info and peer_info.get('protected', False))
+
         # CRITICAL: Mark important peers as protected
-        if protected or (peer_info and peer_info.get('protected', False)):
+        if is_protected:
             self.protected_peers.add(peer)
             logger.info(f"Added PROTECTED peer {peer} - this peer will NEVER be removed")
-        
+
         # Don't add ourselves as a peer - check using dynamic validator ID
         if peer_info and 'validator_id' in peer_info:
             if peer_info['validator_id'] == self.node_id:
                 logger.warning(f"Refusing to add self as peer (same validator ID): {ip}:{port}")
                 return
-        
+
         # Also check port and common local IPs
         if port == self.gossip_port:
-            # Check if it's potentially our own IP
             import socket
             try:
-                # Get our hostname and potential IPs
                 hostname = socket.gethostname()
                 local_ips = {'localhost', '127.0.0.1', '0.0.0.0', hostname}
-                
-                # Also check our external IP if available
                 if hasattr(self, '_external_ip'):
                     local_ips.add(self._external_ip)
-                
-                # Check if external IP from NAT traversal matches
                 if hasattr(self, '_nat_external_ip'):
                     if ip == self._nat_external_ip:
                         logger.warning(f"Refusing to add self as peer (NAT external IP match): {ip}:{port}")
                         return
-                
                 if ip in local_ips:
                     logger.warning(f"Refusing to add self as peer: {ip}:{port}")
                     return
             except Exception as e:
                 logger.debug(f"Error checking self-connection: {e}")
-        
+
         # Check if this IP already has a peer entry
         if ip in self.ip_to_peer:
             old_port, old_vid, old_timestamp = self.ip_to_peer[ip]
             old_peer = (ip, old_port)
-            
-            # Extract validator_id from peer_info if available
             new_vid = peer_info.get('validator_id', 'unknown') if peer_info else 'unknown'
-            
-            # Remove the old peer entry if it's different port or validator ID
+
             if old_port != port or old_vid != new_vid:
-                # Keep the peer with the most recent timestamp
-                # If the old peer has a more recent timestamp, don't replace it
                 if old_timestamp > current_time:
-                    logger.info(f"Keeping existing peer {old_vid} on port {old_port} for IP {ip} (timestamp {old_timestamp} > {current_time})")
-                    return  # Don't add the new peer
-                
-                logger.warning(f"IP {ip} already has peer {old_vid} on port {old_port}, replacing with {new_vid} on port {port} (timestamp {current_time} > {old_timestamp})")
-                
-                # Remove old peer from all tracking structures
-                if old_peer in self.dht_peers:
-                    self.dht_peers.remove(old_peer)
-                if old_peer in self.synced_peers:
-                    self.synced_peers.remove(old_peer)
-                if old_peer in self.peer_info:
-                    del self.peer_info[old_peer]
-                if old_peer in self.failed_peers:
-                    del self.failed_peers[old_peer]
-                if old_peer in self.peer_timestamps:
-                    del self.peer_timestamps[old_peer]
+                    logger.info(f"Keeping existing peer {old_vid} on port {old_port} for IP {ip}")
+                    return
+
+                logger.warning(
+                    f"IP {ip} already has peer {old_vid} on port {old_port}, "
+                    f"replacing with {new_vid} on port {port}"
+                )
+
+                # Remove old peer through remove_peer to keep subnet_counts consistent
+                self.synced_peers.discard(old_peer)
+                # Temporarily allow removal even if old_peer was protected (we're replacing)
+                was_protected = old_peer in self.protected_peers
+                if was_protected:
+                    self.protected_peers.discard(old_peer)
+                self.remove_peer(ip, old_port)
+                if was_protected and is_protected:
+                    pass  # new peer will be protected
             else:
-                # Same peer, just update timestamp
                 logger.info(f"Updating timestamp for existing peer {ip}:{port}")
-        
+
+        # --- Subnet diversity check (non-protected only) ---
+        subnet = self._get_subnet(ip)
+        if not is_protected and peer not in self.dht_peers:
+            current_subnet_count = self.subnet_counts.get(subnet, 0)
+            if current_subnet_count >= MAX_PEERS_PER_SUBNET:
+                logger.warning(
+                    f"Rejecting peer {ip}:{port} — subnet {subnet}.0.0/16 already "
+                    f"has {current_subnet_count} peers (limit {MAX_PEERS_PER_SUBNET})"
+                )
+                return
+
+        # --- Outbound connection limit (non-protected only) ---
+        if not is_protected and peer not in self.dht_peers:
+            if len(self.dht_peers) >= MAX_OUTBOUND_CONNECTIONS:
+                # Try to evict the lowest-reputation non-protected peer
+                evict_candidate = None
+                evict_score = float('inf')
+                for existing in self.dht_peers:
+                    if existing in self.protected_peers:
+                        continue
+                    rep = peer_reputation_manager.get_peer_reputation(existing[0], existing[1])
+                    score = rep.reputation_score if rep else 50.0
+                    if score < evict_score:
+                        evict_score = score
+                        evict_candidate = existing
+
+                # Only evict if new peer has better reputation
+                new_rep = peer_reputation_manager.get_peer_reputation(ip, port)
+                new_score = new_rep.reputation_score if new_rep else 50.0
+                if evict_candidate and new_score > evict_score:
+                    logger.info(
+                        f"Evicting low-reputation peer {evict_candidate} (score {evict_score:.0f}) "
+                        f"for {ip}:{port} (score {new_score:.0f})"
+                    )
+                    self.synced_peers.discard(evict_candidate)
+                    self.remove_peer(evict_candidate[0], evict_candidate[1])
+                else:
+                    logger.info(
+                        f"Rejecting peer {ip}:{port} — at outbound limit "
+                        f"({len(self.dht_peers)}/{MAX_OUTBOUND_CONNECTIONS}) "
+                        f"and no lower-reputation peer to evict"
+                    )
+                    return
+
         # Update IP mapping with validator ID and timestamp
         vid = peer_info.get('validator_id', 'unknown') if peer_info else 'unknown'
         self.ip_to_peer[ip] = (port, vid, current_time)
         self.peer_timestamps[peer] = current_time
-        
+
         # Reset failure count if peer is being re-added
         if peer in self.failed_peers:
             logger.info(f"Resetting failure count for peer {peer} (was {self.failed_peers[peer]})")
             self.failed_peers[peer] = 0
-        
+
         # Always update peer info if provided
         if peer_info:
             self.peer_info[peer] = peer_info
-        
+
         if peer not in self.dht_peers:
             self.dht_peers.add(peer)
+            # Track subnet count
+            self.subnet_counts[subnet] = self.subnet_counts.get(subnet, 0) + 1
             logger.info(f"Added DHT peer {peer} to validator list (validator_id: {vid})")
             if peer not in self.synced_peers:
                 self.synced_peers.add(peer)
@@ -1135,33 +1298,97 @@ class GossipNode:
         else:
             # Peer already exists, but might have been marked as failed
             logger.info(f"Peer {peer} already in list, ensuring it's active")
-            # Trigger sync if needed
             if peer not in self.synced_peers:
                 self.synced_peers.add(peer)
                 asyncio.create_task(push_blocks(ip, port))
 
     def remove_peer(self, ip: str, port: int):
         peer = (ip, port)
-        
+
         # CRITICAL: NEVER remove protected peers
         if peer in self.protected_peers:
             logger.error(f"REFUSING to remove PROTECTED peer {peer}! This peer is critical for network operation.")
             return
-        
+
         # Clean up IP mapping
         if ip in self.ip_to_peer and self.ip_to_peer[ip][0] == port:
             del self.ip_to_peer[ip]
-        
+
         # Clean up timestamp
         if peer in self.peer_timestamps:
             del self.peer_timestamps[peer]
-        
+
         if peer in self.dht_peers:
             self.dht_peers.remove(peer)
             self.failed_peers.pop(peer, None)
+            self.peer_info.pop(peer, None)
+            # Decrement subnet count
+            subnet = self._get_subnet(ip)
+            if subnet in self.subnet_counts:
+                self.subnet_counts[subnet] = max(0, self.subnet_counts[subnet] - 1)
+                if self.subnet_counts[subnet] == 0:
+                    del self.subnet_counts[subnet]
             logger.info(f"Removed DHT peer {peer} from validator list")
 
+    # --- Reputation auto-disconnect callback ---
+
+    def _on_peer_reputation_disconnect(self, ip: str, port: int, reason: str):
+        """Called by PeerReputationManager when a peer becomes MALICIOUS/BANNED."""
+        peer = (ip, port)
+        logger.warning(f"Auto-disconnecting peer {ip}:{port} — {reason}")
+        self.synced_peers.discard(peer)
+        self.client_peers.discard(peer)
+        # remove_peer respects protected status internally
+        self.remove_peer(ip, port)
+
+    # --- Anchor peer persistence ---
+
+    def _load_anchor_peers(self):
+        """Load anchor peers saved from the previous shutdown."""
+        try:
+            with open(self._anchor_path, "r") as f:
+                anchors = json.load(f)
+            for entry in anchors:
+                ip, port = entry["ip"], entry["port"]
+                logger.info(f"Loading anchor peer {ip}:{port}")
+                self.add_peer(ip, port, peer_info=entry.get("info"), protected=True)
+        except FileNotFoundError:
+            logger.debug("No anchor peers file found — first run")
+        except Exception as e:
+            logger.warning(f"Failed to load anchor peers: {e}")
+
+    def save_anchor_peers(self):
+        """Persist top N long-lived GOOD peers for next startup."""
+        from network.peer_reputation import PeerBehavior
+        candidates = []
+        for peer in self.dht_peers:
+            rep = peer_reputation_manager.get_peer_reputation(peer[0], peer[1])
+            if rep and rep.behavior == PeerBehavior.GOOD:
+                candidates.append((peer, rep.get_age(), rep.reputation_score))
+
+        # Sort by age descending (prefer long-lived peers), break ties by score
+        candidates.sort(key=lambda c: (c[1], c[2]), reverse=True)
+
+        anchors = []
+        for peer, age, score in candidates[:NUM_ANCHOR_PEERS]:
+            anchors.append({
+                "ip": peer[0],
+                "port": peer[1],
+                "info": self.peer_info.get(peer),
+            })
+
+        try:
+            os.makedirs(os.path.dirname(self._anchor_path), exist_ok=True)
+            with open(self._anchor_path, "w") as f:
+                json.dump(anchors, f)
+            logger.info(f"Saved {len(anchors)} anchor peers")
+        except Exception as e:
+            logger.warning(f"Failed to save anchor peers: {e}")
+
     async def stop(self):
+        # Save anchor peers before shutdown
+        self.save_anchor_peers()
+
         if self.server_task:
             self.server_task.cancel()
         if self.partition_task:

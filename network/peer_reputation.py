@@ -85,10 +85,11 @@ class PeerMetrics:
 
 class PeerReputationManager:
     """Manages peer reputation and behavior analysis"""
-    
+
     def __init__(self):
         self.peers: Dict[str, PeerMetrics] = {}
         self.trusted_peers: Set[str] = set()  # Manually trusted peers
+        self._disconnect_callbacks: List = []  # Callbacks fired on MALICIOUS/BANNED transitions
         self.reputation_thresholds = {
             PeerBehavior.GOOD: 70.0,
             PeerBehavior.SUSPICIOUS: 40.0,
@@ -105,6 +106,19 @@ class PeerReputationManager:
             'age_bonus': 0.1
         }
     
+    def register_disconnect_callback(self, fn):
+        """Register a callback fired when a peer transitions to MALICIOUS or BANNED.
+        Callback signature: fn(ip: str, port: int, reason: str)"""
+        self._disconnect_callbacks.append(fn)
+
+    def _fire_disconnect_callbacks(self, peer: PeerMetrics, reason: str):
+        """Notify all registered callbacks that a peer should be disconnected."""
+        for fn in self._disconnect_callbacks:
+            try:
+                fn(peer.ip, peer.port, reason)
+            except Exception as e:
+                logger.error(f"Disconnect callback error for {peer.peer_id}: {e}")
+
     def get_peer_id(self, ip: str, port: int) -> str:
         """Generate unique peer identifier"""
         return f"{ip}:{port}"
@@ -303,12 +317,16 @@ class PeerReputationManager:
         else:
             peer.behavior = PeerBehavior.BANNED
         
-        # Log significant changes
+        # Log significant changes and fire disconnect callbacks on escalation
         if old_behavior != peer.behavior:
             logger.warning(
                 f"Peer {peer.peer_id} behavior changed: {old_behavior.value} -> {peer.behavior.value} "
                 f"(score: {old_score:.1f} -> {peer.reputation_score:.1f})"
             )
+            if peer.behavior in (PeerBehavior.MALICIOUS, PeerBehavior.BANNED):
+                self._fire_disconnect_callbacks(
+                    peer, f"reputation escalated to {peer.behavior.value}"
+                )
     
     def _flag_suspicious_behavior(self, peer: PeerMetrics, reason: str):
         """Flag peer for suspicious behavior"""
@@ -336,8 +354,9 @@ class PeerReputationManager:
         peer.behavior = PeerBehavior.BANNED
         peer.banned_until = time.time() + duration
         peer.reputation_score = 0.0
-        
+
         logger.error(f"Peer {peer.peer_id} banned for {duration}s: {reason}")
+        self._fire_disconnect_callbacks(peer, reason)
     
     def unban_peer(self, ip: str, port: int) -> bool:
         """Unban peer"""
