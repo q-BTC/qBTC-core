@@ -197,7 +197,10 @@ async def startup(args=None):
         
         # Load wallet if specified
         wallet_file = os.environ.get('WALLET_FILE', 'wallet.json')
-        wallet_password = os.environ.get('WALLET_PASSWORD', 'password123')
+        wallet_password = os.environ.get('WALLET_PASSWORD')
+        if not wallet_password:
+            logger.error("WALLET_PASSWORD environment variable is not set. Cannot start node without wallet password.")
+            raise RuntimeError("WALLET_PASSWORD environment variable must be set")
         
         from wallet.wallet import get_or_create_wallet
         wallet = get_or_create_wallet(fname=wallet_file, password=wallet_password)

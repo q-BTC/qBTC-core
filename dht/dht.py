@@ -460,9 +460,7 @@ async def discover_peers_once(gossip_node):
 
 
 async def push_blocks(peer_ip, peer_port):
-    print("******* IM IN PUSH BLOCKS ******")
-    print(peer_ip)
-    print(peer_port)
+    logger.info(f"Pushing blocks to peer {peer_ip}:{peer_port}")
     db = get_db()
 
     height_request = {
@@ -474,12 +472,12 @@ async def push_blocks(peer_ip, peer_port):
     local_height = height_temp[0]
     local_tip = height_temp[1]
 
-    print(f"Local height: {local_height}, Local tip: {local_tip}")
+    logger.info(f"Local height: {local_height}, Local tip: {local_tip}")
 
-    print("Opening connection...")
+    logger.info("Opening connection...")
     try:
         r, w = await asyncio.open_connection(peer_ip, peer_port, limit=100 * 1024 * 1024)  # 100MB limit
-        print("Opened connection.")
+        logger.info("Opened connection.")
 
         # Ask peer for its height
         w.write((json.dumps(height_request) + "\n").encode('utf-8'))
@@ -491,7 +489,7 @@ async def push_blocks(peer_ip, peer_port):
         msg = json.loads(line.decode('utf-8').strip())
 
         if msg.get("type") == "height_response":
-            print(msg)
+            logger.info(f"Peer height response: {msg}")
             peer_height = msg.get("height")
             #peer_tip = msg.get("current_tip")
             logger.info(f"*** Peer {peer_ip} responded with height {peer_height}")
@@ -515,7 +513,7 @@ async def push_blocks(peer_ip, peer_port):
 
         # Only push if our height is greater than peer's
         if peer_height_int < local_height:
-            print("***** WILL PUSH BLOCKS TO PEER ****")
+            logger.info("Will push blocks to peer")
 
             start_height = peer_height_int + 1  # Fixed: proper integer addition
             end_height = local_height
@@ -528,7 +526,7 @@ async def push_blocks(peer_ip, peer_port):
                 found_block = height_index.get_block_by_height(h)
                 
                 if not found_block:
-                    print(f"Block at height {h} not found!")
+                    logger.warning(f"Block at height {h} not found!")
                     continue
                 
                 # Make a deep copy to avoid modifying the original
@@ -567,15 +565,14 @@ async def push_blocks(peer_ip, peer_port):
                 "timestamp": int(time.time() * 1000)
             }
             message_json = json.dumps(blocks_message)
-            print(f"Sending message of {len(message_json)} bytes to {peer_ip}")
+            logger.info(f"Sending message of {len(message_json)} bytes to {peer_ip}")
             w.write((message_json + "\n").encode('utf-8'))
             await w.drain()
-            print(f"Sent {len(blocks_to_send)} blocks to {peer_ip}")
+            logger.info(f"Sent {len(blocks_to_send)} blocks to {peer_ip}")
         
         elif peer_height_int > local_height:
             # We need blocks from peer
-            print("***** WILL PULL BLOCKS FROM PEER *****")
-            print(f"Decision logic: peer_height={peer_height_int}, local_height={local_height}")
+            logger.info(f"Will pull blocks from peer (peer_height={peer_height_int}, local_height={local_height})")
             
             # Keep connection alive and sync all blocks in batches
             current_height = local_height
@@ -730,14 +727,13 @@ async def push_blocks(peer_ip, peer_port):
                 logger.info("No blocks were synced")
 
         else:
-            print("Peer up to date")
-            print(f"Decision logic: peer_height={peer_height_int}, local_height={local_height}")
+            logger.info(f"Peer up to date (peer_height={peer_height_int}, local_height={local_height})")
             logger.info(f"No sync needed: peer_height={peer_height_int}, local_height={local_height}")
 
         w.close()
         await w.wait_closed()
     except Exception as e:
-        print(f"**** Could not connect to peer: {e}")
+        logger.error(f"Could not connect to peer: {e}")
 
 
 
@@ -760,7 +756,6 @@ async def discover_peers_periodically(gossip_node, local_ip=None):
             except (json.JSONDecodeError, TypeError) as e:
                 logger.warning(f"Failed to parse validators JSON in discover_peers_periodically: {e}")
                 validator_ids = []
-            print("*** in discover peers periodically")
             logger.info(f"Discovered {len(validator_ids)} validators in DHT")
             
             for vid in validator_ids:
@@ -770,10 +765,6 @@ async def discover_peers_periodically(gossip_node, local_ip=None):
                 gossip_info_json = await kad_server.get(gossip_key)
                 if gossip_info_json:
                     info = json.loads(gossip_info_json)
-                    print("*** in discover peers periodically")
-                    print(info.get("ip", info.get("external_ip", "unknown")))
-                    print(current_ip)
-                    
                     # Handle both old and new format
                     ip = info.get("ip", info.get("external_ip"))
                     port = info.get("port", info.get("external_port"))

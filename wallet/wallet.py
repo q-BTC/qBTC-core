@@ -14,7 +14,7 @@ import base58
 
 WALLET_FILENAME   = "wallet.json"
 _PQ_ALG           = "ML-DSA-87"
-_PBKDF2_ROUNDS    = 100_000
+_PBKDF2_ROUNDS    = 310_000
 _AES_KEYLEN       = 32
 _SALT_LEN         = 16
 _IV_LEN           = 12
@@ -60,10 +60,15 @@ def _decrypt_privkey(enc_b64, password, salt_b64, iv_b64) -> str:
 
 
 def load_wallet_file(fname=WALLET_FILENAME) -> Optional[dict]:
-    return json.load(open(fname)) if os.path.exists(fname) else None
+    if not os.path.exists(fname):
+        return None
+    with open(fname, "r") as f:
+        return json.load(f)
 
 def save_wallet_file(wallet: dict, fname=WALLET_FILENAME):
-    json.dump(wallet, open(fname, "w"), indent=2)
+    fd = os.open(fname, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(wallet, f, indent=2)
 
 
 def generate_wallet(password: str) -> dict:

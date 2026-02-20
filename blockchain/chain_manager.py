@@ -650,7 +650,7 @@ class ChainManager:
                 # Parent doesn't exist yet - this is an orphan block
                 # Store as orphan and process later
                 logger.warning(f"Parent block {prev_hash} not found for block {block_hash} at height {height}")
-                self.orphan_blocks[block_hash] = block_data
+                await self._add_orphan(block_data)
                 return False, "Parent block not found - stored as orphan"
         
         # Validate timestamp (skip only for genesis)
@@ -677,23 +677,9 @@ class ChainManager:
                 current_time = int(time.time())
                 logger.info(f"Timestamp validation: block_ts={block_data['timestamp']}, parent_ts={parent_info['timestamp']}, current={current_time}, mtp={mtp}")
 
-                # Additional validation when not syncing
-                # Special case: If parent is genesis (height 0), be more lenient with timestamp
-                parent_height = parent_info.get("height", 0)
-                if parent_height == 0:
-                    # For block 1 (child of genesis), only check that it's not too far in future
-                    if block_data["timestamp"] > current_time + MAX_FUTURE_TIME:
-                        return False, f"Block timestamp too far in future"
-                    logger.info("Allowing block 1 timestamp despite being before genesis (special case)")
-                elif block_data["timestamp"] <= parent_info["timestamp"]:
-                    # Special handling for rapid mining (cpuminer compatibility)
-                    time_since_parent = current_time - parent_info["timestamp"]
-                    logger.info(f"Block timestamp <= parent. Time since parent: {time_since_parent}s")
-
-                    if time_since_parent <= 10:
-                        logger.warning(f"Allowing timestamp {block_data['timestamp']} <= parent {parent_info['timestamp']} for rapid mining (parent mined {time_since_parent}s ago)")
-                    else:
-                        return False, f"Invalid block timestamp - must be greater than parent (block: {block_data['timestamp']}, parent: {parent_info['timestamp']})"
+                # Strict timestamp validation: block timestamp must be > parent timestamp
+                if block_data["timestamp"] <= parent_info["timestamp"]:
+                    return False, f"Invalid block timestamp - must be greater than parent (block: {block_data['timestamp']}, parent: {parent_info['timestamp']})"
                 else:
                     # Normal timestamp validation with MTP
                     if not validate_block_timestamp(

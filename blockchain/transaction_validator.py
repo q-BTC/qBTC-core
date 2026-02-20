@@ -176,7 +176,7 @@ class TransactionValidator:
             
             try:
                 total_authorized = Decimal(amount_str)
-            except:
+            except (ValueError, ArithmeticError, TypeError):
                 return False, f"Invalid amount in tx {txid}: {amount_str}", Decimal("0")
 
             # Amount bounds validation
@@ -242,7 +242,7 @@ class TransactionValidator:
             
             try:
                 amt = Decimal(out.get("amount", "0"))
-            except:
+            except (ValueError, ArithmeticError, TypeError):
                 return False, f"Invalid output amount in tx {txid}", Decimal("0")
 
             # Output amount bounds validation
@@ -337,7 +337,7 @@ class TransactionValidator:
         for out in coinbase_tx.get("outputs", []):
             try:
                 amt = Decimal(out.get("amount", "0"))
-            except:
+            except (ValueError, ArithmeticError, TypeError):
                 return False, "Invalid amount in coinbase output"
             if amt < 0:
                 return False, f"Negative coinbase output amount: {amt}"
