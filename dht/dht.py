@@ -200,21 +200,39 @@ async def register_validator_once():
             logger.info(f"Validator registered: {VALIDATOR_ID}")
             
             # Also update the shared list with all validators we know about
-            all_validators = known_validators.copy()
-            all_validators.add(VALIDATOR_ID)
-            
-            try:
-                # Get current list and merge with our knowledge
-                existing_json = b2s(await kad_server.get(VALIDATORS_LIST_KEY))
-                if existing_json:
-                    existing = set(json.loads(existing_json))
-                    all_validators.update(existing)
-                
-                # Write the merged list
-                await kad_server.set(VALIDATORS_LIST_KEY, json.dumps(sorted(list(all_validators))))
-                logger.info(f"Updated validator list with {len(all_validators)} validators")
-            except Exception as e:
-                logger.warning(f"Failed to update validator list (non-critical): {e}")
+            # Use retry-and-re-merge to mitigate TOCTOU race:
+            # If another validator registered between our read and write,
+            # re-read and merge again to avoid overwriting their entry.
+            for merge_attempt in range(3):
+                try:
+                    existing_json = b2s(await kad_server.get(VALIDATORS_LIST_KEY))
+                    all_validators = known_validators.copy()
+                    all_validators.add(VALIDATOR_ID)
+                    if existing_json:
+                        existing = set(json.loads(existing_json))
+                        all_validators.update(existing)
+
+                    merged_list = json.dumps(sorted(list(all_validators)))
+                    await kad_server.set(VALIDATORS_LIST_KEY, merged_list)
+
+                    # Verify write: re-read and check our ID is present
+                    verify_json = b2s(await kad_server.get(VALIDATORS_LIST_KEY))
+                    if verify_json:
+                        verify_set = set(json.loads(verify_json))
+                        if VALIDATOR_ID in verify_set:
+                            logger.info(f"Updated validator list with {len(all_validators)} validators (attempt {merge_attempt + 1})")
+                            break
+                        else:
+                            # Our write was overwritten by another validator — re-merge
+                            logger.warning(f"Validator list write conflict (attempt {merge_attempt + 1}), re-merging")
+                            await asyncio.sleep(0.5 * (merge_attempt + 1))
+                            continue
+                    else:
+                        logger.info(f"Updated validator list with {len(all_validators)} validators")
+                        break
+                except Exception as e:
+                    logger.warning(f"Failed to update validator list (attempt {merge_attempt + 1}): {e}")
+                    break
             
             return  # Success
             
@@ -467,6 +485,25 @@ async def discover_peers_once(gossip_node):
             logger.error(f"Error processing peer {vid}: {e}")
     
     logger.info(f"Peer discovery complete: discovered {discovered_count}/{len(discovered_validators)-1} peers")
+
+    # Fallback: if DHT found zero peers, try re-adding all known bootstrap nodes
+    # as gossip peers so the node isn't completely isolated
+    if discovered_count == 0 and gossip_node:
+        from config.config import KNOWN_VALIDATORS
+        logger.warning("DHT found no peers — falling back to KNOWN_VALIDATORS as gossip peers")
+        for validator_ip, validator_info in KNOWN_VALIDATORS.items():
+            vport = validator_info.get("port", DEFAULT_GOSSIP_PORT)
+            vname = validator_info.get("name", "known")
+            # Skip self
+            if validator_ip == own_ip:
+                continue
+            logger.info(f"Fallback: adding known validator {vname} at {validator_ip}:{vport}")
+            gossip_node.add_peer(validator_ip, vport, peer_info={
+                "ip": validator_ip,
+                "port": vport,
+                "validator_id": vname,
+                "nat_type": "direct",
+            })
 
 
 async def push_blocks(peer_ip, peer_port):
@@ -877,25 +914,32 @@ async def maintain_validator_list(gossip_node):
             force_keep.update(active_validators)
             
             # Check heartbeats for all validators
+            # Track DHT lookup success/failure to detect degradation
+            heartbeat_lookup_successes = 0
+            heartbeat_lookup_failures = 0
+            non_self_validators = [v for v in dht_set if v != VALIDATOR_ID and v not in active_validators]
+
             for v in dht_set:
                 try:
                     # Skip heartbeat check for actively connected validators
                     if v in active_validators:
                         alive.add(v)
                         continue
-                        
+
                     last_seen_raw = await kad_server.get(f"validator_{v}_heartbeat")
                     last_seen_str = b2s(last_seen_raw)
                     last_seen = float(last_seen_str) if last_seen_str else None
                     if last_seen and (current_time - last_seen) <= VALIDATOR_TIMEOUT:
                         alive.add(v)
+                        heartbeat_lookup_successes += 1
                         # Reset failure count on successful heartbeat
                         if v in validator_heartbeat_failures:
                             del validator_heartbeat_failures[v]
                     else:
+                        heartbeat_lookup_successes += 1  # DHT responded, heartbeat is just stale
                         # Heartbeat is stale - INCREMENT the failure counter
                         validator_heartbeat_failures[v] = validator_heartbeat_failures.get(v, 0) + 1
-                        
+
                         # Check if validator is in our known list and hasn't exceeded failure threshold
                         if v in known_validators:
                             if validator_heartbeat_failures[v] < MAX_HEARTBEAT_FAILURES:
@@ -917,11 +961,40 @@ async def maintain_validator_list(gossip_node):
                             else:
                                 logger.info(f"Removing unknown validator {v} after {validator_heartbeat_failures[v]} failures")
                 except Exception as e:
+                    heartbeat_lookup_failures += 1
                     logger.warning(f"Failed to fetch heartbeat for {v}: {e}")
-                    # On DHT lookup failure, keep the validator if it's known
+                    # On DHT lookup failure, keep the validator AND don't increment failure counter
+                    # (the failure is DHT's problem, not the validator's)
+                    alive.add(v)
                     if v in known_validators or v in active_validators:
                         logger.info(f"Keeping validator {v} despite DHT lookup failure (known or active)")
-                        alive.add(v)
+
+            # Cascading removal protection:
+            # If >50% of heartbeat lookups failed, DHT is degraded — keep everyone
+            total_lookups = heartbeat_lookup_successes + heartbeat_lookup_failures
+            if total_lookups > 0 and heartbeat_lookup_failures > total_lookups * 0.5:
+                logger.error(f"DHT degraded: {heartbeat_lookup_failures}/{total_lookups} heartbeat lookups failed — "
+                           f"freezing all failure counters and keeping all validators")
+                alive.update(dht_set)
+                # Roll back any failure counter increments from this cycle
+                for v in non_self_validators:
+                    if v in validator_heartbeat_failures and validator_heartbeat_failures[v] > 0:
+                        validator_heartbeat_failures[v] = max(0, validator_heartbeat_failures[v] - 1)
+
+            # Cap removals per cycle: never remove more than 1 validator at a time
+            # to prevent cascading removal during transient outages
+            MAX_REMOVALS_PER_CYCLE = 1
+            pending_removals = dht_set - alive - {VALIDATOR_ID}
+            if len(pending_removals) > MAX_REMOVALS_PER_CYCLE:
+                # Keep all but the one with highest failure count
+                sorted_by_failures = sorted(pending_removals,
+                                          key=lambda v: validator_heartbeat_failures.get(v, 0),
+                                          reverse=True)
+                to_remove = set(sorted_by_failures[:MAX_REMOVALS_PER_CYCLE])
+                to_keep = pending_removals - to_remove
+                alive.update(to_keep)
+                logger.warning(f"Capping removals to {MAX_REMOVALS_PER_CYCLE} per cycle: "
+                             f"removing {to_remove}, deferring {len(to_keep)} others")
 
             alive.add(VALIDATOR_ID)
 

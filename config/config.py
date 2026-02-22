@@ -9,12 +9,32 @@ DHT_PORT = 8001
 HEARTBEAT_INTERVAL = 30
 VALIDATOR_TIMEOUT = 90  # 90 seconds = 3 heartbeat intervals (was 270 seconds)
 MAX_HEARTBEAT_FAILURES = 3  # Max consecutive failures before removal (was hardcoded as 10)
-BOOTSTRAP_NODES = [("api.bitcoinqs.org", 8001)]
+# Bootstrap nodes for DHT discovery — first entry is primary, rest are fallbacks
+# Override via env: comma-separated "host:port" pairs
+_bootstrap_env = os.environ.get("BOOTSTRAP_NODES", "")
+if _bootstrap_env:
+    BOOTSTRAP_NODES = [
+        (h.strip(), int(p.strip()))
+        for h, p in (entry.split(":") for entry in _bootstrap_env.split(",") if ":" in entry)
+    ]
+else:
+    BOOTSTRAP_NODES = [("api.bitcoinqs.org", 8001)]
 VALIDATORS_LIST_KEY = "validators_list"
 
 # CRITICAL: Known validators that should NEVER be removed
+# Bootstrap node is always a known validator; additional ones can be added via env
 KNOWN_VALIDATORS = {
+    "api.bitcoinqs.org": {"port": 8002, "name": "bootstrap-primary"},
 }
+# Allow adding extra known validators via env: comma-separated "ip:port:name" entries
+_extra_validators = os.environ.get("EXTRA_KNOWN_VALIDATORS", "")
+if _extra_validators:
+    for entry in _extra_validators.split(","):
+        parts = entry.strip().split(":")
+        if len(parts) >= 2:
+            _ip, _port = parts[0], int(parts[1])
+            _name = parts[2] if len(parts) > 2 else "extra"
+            KNOWN_VALIDATORS[_ip] = {"port": _port, "name": _name}
 shutdown_event = asyncio.Event()
 MAX_CHECKPOINTS = 1000
 MAX_TX_HISTORY = 10000
