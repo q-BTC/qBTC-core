@@ -28,16 +28,37 @@ from gossip.gossip import GossipNode
 
 
 # ────────────────────────────── database stub ───────────────────────────────
+
+class _StubDB(dict):
+    """Dict-based stub that supports the write/put/delete API from rocksdict."""
+
+    def put(self, key, value):
+        self[key] = value
+
+    def write(self, batch):
+        """Accept WriteBatch calls (no-op — batch data is not needed by tests)."""
+        pass
+
+    def delete(self, key):
+        self.pop(key, None)
+
+
 @pytest.fixture(autouse=True)
 def _stub_database(monkeypatch):
-    db: dict[bytes, bytes] = {}
+    db = _StubDB()
+
+    _get_db = lambda: db
 
     # patch the original function
-    monkeypatch.setattr("database.database.get_db", lambda: db, raising=True)
+    monkeypatch.setattr("database.database.get_db", _get_db, raising=True)
 
-    # patch every module that imported it under a local name
-    monkeypatch.setattr("gossip.gossip.get_db", lambda: db, raising=True)
-    monkeypatch.setattr("web.web.get_db",      lambda: db, raising=True)   
+    # patch every module that imported get_db under a local name
+    monkeypatch.setattr("gossip.gossip.get_db",                _get_db, raising=True)
+    monkeypatch.setattr("web.web.get_db",                      _get_db, raising=True)
+    monkeypatch.setattr("rpc.rpc.get_db",                      _get_db, raising=True)
+    monkeypatch.setattr("blockchain.chain_manager.get_db",     _get_db, raising=True)
+    monkeypatch.setattr("blockchain.block_height_index.get_db", _get_db, raising=True)
+    monkeypatch.setattr("blockchain.wallet_index.get_db",      _get_db, raising=True)
 
     # (height helper unchanged)
     monkeypatch.setattr("database.database.get_current_height",
@@ -46,9 +67,21 @@ def _stub_database(monkeypatch):
                         lambda _db: (0, "0"*64), raising=True)
     monkeypatch.setattr("web.web.get_current_height",
                         lambda _db: (0, "0"*64), raising=True)
-    monkeypatch.setattr("rpc.rpc.get_db", lambda: db, raising=True)
+
+    async def _async_rpc_height(_db):
+        return (0, "0"*64)
+
     monkeypatch.setattr("rpc.rpc.get_current_height",
-                    lambda _db: (0, "0"*64), raising=True)             
+                    _async_rpc_height, raising=True)
+
+    # Reset singletons that cache db references between tests
+    import blockchain.wallet_index as bwi
+    import blockchain.block_height_index as bhi
+    import blockchain.chain_singleton as bcs
+    monkeypatch.setattr(bwi, "_wallet_index_instance", None)
+    monkeypatch.setattr(bhi, "_height_index_instance", None)
+    bcs.reset_chain_manager()
+
     yield db
 
 
@@ -68,8 +101,6 @@ def _maybe_stub_verify(monkeypatch, request):
                             lambda *a, **k: True, raising=True)
         monkeypatch.setattr("web.web.verify_transaction",       
                             lambda *a, **k: True, raising=True)
-        monkeypatch.setattr("rpc.rpc.verify_transaction",
-                    lambda *a, **k: True, raising=True)
 
 
 # ───────────────────────── event-loop fixture (nice to have) ─────────────────

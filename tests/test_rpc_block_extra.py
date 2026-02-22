@@ -55,8 +55,11 @@ def test_getblocktemplate_empty(monkeypatch, _stub_database):
     state_mod.mempool_manager.tx_fees.clear()
     state_mod.mempool_manager.tx_sizes.clear()
     state_mod.mempool_manager.current_memory_usage = 0
+    async def _mock_height(db):
+        return (10, "0"*64)
+
     monkeypatch.setattr("rpc.rpc.get_current_height",
-                        lambda db: (10, "0"*64), raising=True)
+                        _mock_height, raising=True)
 
     body = TestClient(rpc_app).post("/", json={"id": "1", "method": "getblocktemplate"}).json()
     assert body["result"]["height"] == 11

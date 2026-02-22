@@ -10,7 +10,22 @@ from blockchain.blockchain import serialize_transaction, sha256d
 class TestMempoolManagement:
     """Test suite for advanced mempool management features."""
     
-    def create_test_transaction(self, sender="sender1", receiver="receiver1", 
+    @staticmethod
+    def _store_utxos(inputs):
+        """Pre-populate UTXOs in the stub database so UTXO validation passes."""
+        from database.database import get_db
+        db = get_db()
+        for inp in inputs:
+            if inp.get("txid") == "0" * 64:
+                continue
+            utxo_key = f"utxo:{inp['txid']}:{inp.get('utxo_index', 0)}".encode()
+            db[utxo_key] = json.dumps({
+                "spent": False,
+                "amount": str(inp.get("amount", "10000")),
+                "version": 0
+            }).encode()
+
+    def create_test_transaction(self, sender="sender1", receiver="receiver1",
                                amount="100", fee_override=None, txid=None):
         """Helper to create a test transaction with configurable fee."""
         inputs = [{
@@ -21,25 +36,25 @@ class TestMempoolManagement:
             "amount": "10000",
             "spent": False
         }]
-        
+
         # Calculate fee (0.1% unless overridden)
         if fee_override is not None:
             fee = Decimal(str(fee_override))
         else:
             fee = (Decimal(amount) * Decimal("0.001")).quantize(Decimal("0.00000001"))
-        
+
         remaining = Decimal("10000") - Decimal(amount) - fee
-        
+
         outputs = [
-            {"utxo_index": 0, "sender": sender, "receiver": receiver, 
+            {"utxo_index": 0, "sender": sender, "receiver": receiver,
              "amount": str(amount), "spent": False},
-            {"utxo_index": 1, "sender": sender, "receiver": sender, 
+            {"utxo_index": 1, "sender": sender, "receiver": sender,
              "amount": str(remaining), "spent": False}
         ]
-        
+
         timestamp = int(time.time() * 1000)
         msg_str = f"{sender}:{receiver}:{amount}:{timestamp}:1"
-        
+
         transaction = {
             "type": "transaction",
             "inputs": inputs,
@@ -51,12 +66,14 @@ class TestMempoolManagement:
             },
             "timestamp": timestamp
         }
-        
+
         if txid is None:
             raw_tx = serialize_transaction(transaction)
             txid = sha256d(bytes.fromhex(raw_tx))[::-1].hex()
-        
+
         transaction["txid"] = txid
+        # Auto-populate UTXOs in stub database
+        self._store_utxos(inputs)
         return transaction
     
     def test_minimum_relay_fee_rejection(self):
@@ -153,16 +170,18 @@ class TestMempoolManagement:
         # Create two transactions with same fee but different sizes
         tx1 = self.create_test_transaction(sender="alice", amount="1000")  # Standard size
         
-        # Create larger transaction with more inputs/outputs  
+        # Create larger transaction with more inputs/outputs
         tx2 = self.create_test_transaction(sender="bob", amount="1000")
-        tx2["inputs"].append({
+        extra_input = {
             "txid": "extra_input",
             "utxo_index": 0,
             "sender": "genesis",
             "receiver": "bob",
             "amount": "5000",
             "spent": False
-        })
+        }
+        tx2["inputs"].append(extra_input)
+        self._store_utxos([extra_input])
         # Recalculate txid
         del tx2["txid"]
         raw_tx = serialize_transaction(tx2)

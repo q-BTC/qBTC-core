@@ -16,6 +16,17 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# M4: Cache version for staleness detection across restarts
+_CACHE_VERSION = "qbtc-cache-v2"
+_CACHE_VERSION_KEY = "blockchain:cache_version"
+
+# Default TTLs (in seconds)
+_TTL_CHAIN_INDEX = 3600       # 1 hour
+_TTL_HEIGHT_INDEX = 1800      # 30 minutes
+_TTL_DIFFICULTY = 3600        # 1 hour
+_TTL_BEST_CHAIN = 3600        # 1 hour
+_TTL_CHAIN_STATS = 3600       # 1 hour
+
 class BlockchainRedisCache:
     """Redis cache for blockchain indexes and computed values"""
     
@@ -40,6 +51,14 @@ class BlockchainRedisCache:
                 # Test connection
                 self.redis_client.ping()
                 self.enabled = True
+
+                # M4: Validate cache version — invalidate stale caches on mismatch
+                stored_version = self.redis_client.get(_CACHE_VERSION_KEY)
+                if stored_version != _CACHE_VERSION:
+                    logger.warning(f"Cache version mismatch (stored={stored_version}, expected={_CACHE_VERSION}) — invalidating all")
+                    self.invalidate_all()
+                    self.redis_client.set(_CACHE_VERSION_KEY, _CACHE_VERSION)
+
                 logger.info("Blockchain Redis cache initialized with connection pool")
             except Exception as e:
                 logger.warning(f"Failed to initialize Redis cache: {e}")
@@ -100,7 +119,7 @@ class BlockchainRedisCache:
             logger.error(f"Failed to get chain index from cache: {e}")
         return None
     
-    def set_chain_index(self, index: Dict[str, Any], ttl: int = 300):  # 5 minutes default
+    def set_chain_index(self, index: Dict[str, Any], ttl: int = _TTL_CHAIN_INDEX):
         """Cache the chain index"""
         if not self.enabled:
             logger.debug("Redis cache not enabled, skipping set_chain_index")
@@ -147,7 +166,7 @@ class BlockchainRedisCache:
             logger.error(f"Failed to get cumulative difficulty: {e}")
         return None
     
-    def set_cumulative_difficulty(self, block_hash: str, difficulty: Decimal, ttl: int = 3600):  # 1 hour
+    def set_cumulative_difficulty(self, block_hash: str, difficulty: Decimal, ttl: int = _TTL_DIFFICULTY):
         """Cache cumulative difficulty for a block"""
         if not self.enabled:
             return
@@ -178,7 +197,7 @@ class BlockchainRedisCache:
             logger.error(f"Failed to get height index: {e}")
         return None
     
-    def set_height_index(self, index: Dict[int, str], ttl: int = 300):  # 5 minutes
+    def set_height_index(self, index: Dict[int, str], ttl: int = _TTL_HEIGHT_INDEX):
         """Cache the height index"""
         if not self.enabled:
             return
@@ -209,7 +228,7 @@ class BlockchainRedisCache:
             logger.error(f"Failed to get best chain info: {e}")
         return None
     
-    def set_best_chain_info(self, info: Dict[str, Any], ttl: int = 3600):  # 1 hour - changes less frequently
+    def set_best_chain_info(self, info: Dict[str, Any], ttl: int = _TTL_BEST_CHAIN):
         """Cache best chain information"""
         if not self.enabled:
             return
@@ -238,7 +257,7 @@ class BlockchainRedisCache:
             logger.error(f"Failed to get chain stats: {e}")
         return None
     
-    def set_chain_stats(self, stats: Dict[str, Any], ttl: int = 3600):  # 1 hour
+    def set_chain_stats(self, stats: Dict[str, Any], ttl: int = _TTL_CHAIN_STATS):
         """Cache chain statistics"""
         if not self.enabled:
             return

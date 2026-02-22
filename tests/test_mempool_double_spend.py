@@ -24,7 +24,22 @@ class TestMempoolDoubleSpendPrevention:
         mempool_manager.tx_sizes.clear()
         mempool_manager.current_memory_usage = 0
         
-    def create_test_transaction(self, sender="sender1", receiver="receiver1", amount="100", 
+    @staticmethod
+    def _store_utxos(inputs):
+        """Pre-populate UTXOs in the stub database so UTXO validation passes."""
+        from database.database import get_db
+        db = get_db()
+        for inp in inputs:
+            if inp.get("txid") == "0" * 64:
+                continue
+            utxo_key = f"utxo:{inp['txid']}:{inp.get('utxo_index', 0)}".encode()
+            db[utxo_key] = json.dumps({
+                "spent": False,
+                "amount": str(inp.get("amount", "1000")),
+                "version": 0
+            }).encode()
+
+    def create_test_transaction(self, sender="sender1", receiver="receiver1", amount="100",
                               inputs=None, txid=None):
         """Helper to create a test transaction."""
         if inputs is None:
@@ -36,17 +51,17 @@ class TestMempoolDoubleSpendPrevention:
                 "amount": "1000",
                 "spent": False
             }]
-            
+
         outputs = [
-            {"utxo_index": 0, "sender": sender, "receiver": receiver, 
+            {"utxo_index": 0, "sender": sender, "receiver": receiver,
              "amount": str(amount), "spent": False},
-            {"utxo_index": 1, "sender": sender, "receiver": sender, 
+            {"utxo_index": 1, "sender": sender, "receiver": sender,
              "amount": str(Decimal("1000") - Decimal(amount) - Decimal("0.1")), "spent": False}
         ]
-        
+
         timestamp = int(time.time() * 1000)
         msg_str = f"{sender}:{receiver}:{amount}:{timestamp}:1"
-        
+
         transaction = {
             "type": "transaction",
             "inputs": inputs,
@@ -58,13 +73,15 @@ class TestMempoolDoubleSpendPrevention:
             },
             "timestamp": timestamp
         }
-        
+
         if txid is None:
             # Calculate txid
             raw_tx = serialize_transaction(transaction)
             txid = sha256d(bytes.fromhex(raw_tx))[::-1].hex()
-            
+
         transaction["txid"] = txid
+        # Auto-populate UTXOs in stub database
+        self._store_utxos(inputs)
         return transaction
         
     def test_mempool_manager_basic_functionality(self):
@@ -125,17 +142,19 @@ class TestMempoolDoubleSpendPrevention:
         
         # Second transaction with multiple inputs, one conflicting
         tx2 = self.create_test_transaction()
+        extra_input = {
+            "txid": "other_tx_456",
+            "utxo_index": 0,
+            "sender": "genesis",
+            "receiver": "alice",
+            "amount": "500",
+            "spent": False
+        }
         tx2["inputs"] = [
             tx1["inputs"][0],  # Conflicting input
-            {
-                "txid": "other_tx_456",
-                "utxo_index": 0,
-                "sender": "genesis",
-                "receiver": "alice",
-                "amount": "500",
-                "spent": False
-            }
+            extra_input
         ]
+        self._store_utxos([extra_input])
         
         # Recalculate txid
         del tx2["txid"]
@@ -282,7 +301,7 @@ class TestMempoolDoubleSpendPrevention:
         )
         success, error = manager.add_transaction(tx4)
         assert success is False
-        assert "limit" in error.lower()
+        assert "full mempool" in error.lower() or "limit" in error.lower()
         
     def test_remove_confirmed_transactions(self):
         """Test bulk removal of confirmed transactions."""
@@ -352,14 +371,11 @@ class TestMempoolDoubleSpendPrevention:
         """Test that gossip rejects double-spend transactions."""
         from gossip.gossip import GossipNode
         from state.state import mempool_manager
-        
+
         # Create gossip node
         node = GossipNode("test_node")
-        
-        # Mock database
-        mock_db = MagicMock()
-        
-        # Create first transaction
+
+        # Create first transaction (UTXOs auto-stored in conftest _StubDB)
         tx1 = self.create_test_transaction()
         tx1_msg = {
             "type": "transaction",
@@ -367,23 +383,23 @@ class TestMempoolDoubleSpendPrevention:
             "timestamp": int(time.time() * 1000),
             **tx1
         }
-        
-        # Mock verify_transaction to return True
+
+        # Use conftest's _StubDB (already patched into gossip.gossip.get_db)
+        # instead of MagicMock which returns truthy for all .get() calls
         with patch('gossip.gossip.verify_transaction', return_value=True):
-            with patch('gossip.gossip.get_db', return_value=mock_db):
-                # Process first transaction
-                await node.handle_gossip_message(tx1_msg, ("127.0.0.1", 8000), None)
-                
+            # Process first transaction
+            await node.handle_gossip_message(tx1_msg, ("127.0.0.1", 8000), None)
+
         # Verify transaction was added
         assert mempool_manager.get_transaction(tx1["txid"]) is not None
-        
+
         # Create conflicting transaction
         tx2 = self.create_test_transaction(receiver="charlie")
         tx2["inputs"] = tx1["inputs"].copy()
         del tx2["txid"]
         raw_tx = serialize_transaction(tx2)
         tx2["txid"] = sha256d(bytes.fromhex(raw_tx))[::-1].hex()
-        
+
         tx2_msg = {
             "type": "transaction",
             "txid": tx2["txid"],
@@ -393,8 +409,7 @@ class TestMempoolDoubleSpendPrevention:
         
         # Try to process conflicting transaction
         with patch('gossip.gossip.verify_transaction', return_value=True):
-            with patch('gossip.gossip.get_db', return_value=mock_db):
-                await node.handle_gossip_message(tx2_msg, ("127.0.0.1", 8000), None)
+            await node.handle_gossip_message(tx2_msg, ("127.0.0.1", 8000), None)
                 
         # Verify second transaction was rejected
         assert mempool_manager.get_transaction(tx2["txid"]) is None

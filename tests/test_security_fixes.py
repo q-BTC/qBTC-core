@@ -3,242 +3,130 @@ Test cases for critical security fixes:
 1. Coinbase validation
 2. Double-spending prevention within blocks
 3. Exact output amount validation
+
+These tests exercise the TransactionValidator directly to verify
+consensus-level security checks without requiring full block-level
+validation (hash, PoW, difficulty, parent lookup).
 """
 import pytest
 import json
 import time
-import asyncio
 from decimal import Decimal
-from unittest.mock import MagicMock, patch, AsyncMock
-from blockchain.chain_singleton import get_chain_manager
-from rocksdict import WriteBatch
-
-class DummyWriteBatch:
-    """Mimics RocksDB WriteBatch: just collects .put() calls."""
-    def __init__(self):
-        self.ops = []
-        self.deletes = []
-
-    def put(self, key, val):
-        self.ops.append((key, val))
-    
-    def delete(self, key):
-        self.deletes.append(key)
+from unittest.mock import patch
+from blockchain.transaction_validator import TransactionValidator
 
 
 class FakeDB(dict):
-    """dict with a .write(batch) method that commits DummyWriteBatch ops."""
+    """Dict-based stub with rocksdict-compatible API."""
+    def put(self, key, value):
+        self[key] = value
+
     def write(self, batch):
-        for k, v in batch.ops:
-            self[k] = v
-        for k in batch.deletes:
-            self.pop(k, None)
-    
+        pass
+
+    def delete(self, key):
+        self.pop(key, None)
+
     def get(self, key):
         return super().get(key, None)
-    
-    def items(self):
-        return super().items()
 
 
 class TestCoinbaseValidation:
     """Test Fix 1: Validate coinbase amounts against block subsidy + fees"""
-    
-    @patch('blockchain.chain_manager.get_db')
-    @patch('blockchain.chain_manager.WriteBatch', DummyWriteBatch)
-    @patch('blockchain.blockchain.calculate_merkle_root', return_value="00"*32)
-    def test_coinbase_exceeds_allowed_amount(self, mock_merkle, mock_get_db):
-        """Test that blocks with excessive coinbase rewards are rejected"""
+
+    def test_coinbase_exceeds_allowed_amount(self):
+        """Test that coinbase transactions with excessive rewards are rejected"""
         db = FakeDB()
-        mock_get_db.return_value = db
-        
-        # Create a transaction that pays 10 qBTC fee
-        # Store UTXO that will be spent
-        utxo_key = b"utxo:prev_tx:0"
-        utxo_data = {
-            "txid": "prev_tx",
-            "utxo_index": 0,
-            "sender": "alice",
-            "receiver": "alice",
-            "amount": "100",
-            "spent": False
+        validator = TransactionValidator(db=db)
+
+        # Coinbase claiming way too much (6 billion qBTC)
+        coinbase_tx = {
+            "txid": "coinbase_100",
+            "inputs": [{"txid": "0" * 64, "utxo_index": 0}],
+            "outputs": [{"amount": "6000000000", "receiver": "miner_addr"}]
         }
-        db[utxo_key] = json.dumps(utxo_data).encode()
-        
-        # Create block with coinbase claiming 50 qBTC (when only fees are allowed)
-        block = {
-            "height": 100,
-            "block_hash": "test_block_hash",
-            "previous_hash": "prev_hash",
-            "tx_ids": ["coinbase_100", "tx1"],
-            "nonce": 12345,
-            "timestamp": int(time.time()),
-            "miner_address": "miner_addr",
-            "merkle_root": "00"*32,
-            "version": 1,
-            "bits": 0x1f00ffff,
-            "full_transactions": [
-                {
-                    # Coinbase transaction claiming way too much (60 billion satoshis = 600 BTC)
-                    # At height 100, subsidy is 50 BTC = 5 billion satoshis, fees are 10
-                    # So max allowed is 5,000,000,010 but we claim 6,000,000,000
-                    "txid": "coinbase_100",
-                    "version": 1,
-                    "inputs": [{"coinbase": "00"*32}],
-                    "outputs": [{"amount": "6000000000", "receiver": "miner_addr"}]
-                },
-                {
-                    # Regular transaction paying fee
-                    "txid": "tx1",
-                    "inputs": [{"txid": "prev_tx", "utxo_index": 0}],
-                    "outputs": [{"receiver": "bob", "amount": "90", "utxo_index": 0}],
-                    "body": {
-                        "msg_str": f"alice:bob:90:{int(time.time()*1000)}:1",  # Added chain ID
-                        "signature": "dummy_sig",
-                        "pubkey": "dummy_pubkey",
-                        "transaction_data": ""
-                    }
-                }
-            ]
-        }
-        
-        # Mock signature verification and chain ID
-        with patch('blockchain.transaction_validator.verify_transaction', return_value=True), \
-             patch('config.config.CHAIN_ID', 1):
-            async def test_excessive_coinbase():
-                cm = await get_chain_manager()
-                success, error = await cm.add_block(block)
-                assert not success
-                assert "Invalid coinbase" in error or "coinbase" in error.lower()
-            
-            asyncio.run(test_excessive_coinbase())
-    
-    @patch('blockchain.chain_manager.get_db')
-    @patch('blockchain.chain_manager.WriteBatch', DummyWriteBatch)
-    @patch('blockchain.blockchain.calculate_merkle_root', return_value="00"*32)
-    def test_coinbase_valid_amount(self, mock_merkle, mock_get_db):
-        """Test that blocks with correct coinbase amounts are accepted"""
+
+        # At height 100, subsidy is ~0.4167 qBTC, fees are 10 qBTC
+        # max allowed = 10.4167, we claim 6 billion -> rejected
+        is_valid, error = validator.validate_coinbase_transaction(
+            coinbase_tx, 100, Decimal("10")
+        )
+        assert not is_valid
+        assert "coinbase" in error.lower() or "exceeds" in error.lower()
+
+    def test_coinbase_valid_amount(self):
+        """Test that coinbase transactions with correct amounts are accepted"""
         db = FakeDB()
-        mock_get_db.return_value = db
-        
-        # Store UTXO that will be spent
-        utxo_key = b"utxo:prev_tx:0"
-        utxo_data = {
-            "txid": "prev_tx",
-            "utxo_index": 0,
-            "sender": "alice",
-            "receiver": "alice",
-            "amount": "100",
-            "spent": False
+        validator = TransactionValidator(db=db)
+
+        # Coinbase claiming a small, valid amount (0.09 qBTC)
+        coinbase_tx = {
+            "txid": "coinbase_100",
+            "inputs": [{"txid": "0" * 64, "utxo_index": 0}],
+            "outputs": [{"amount": "0.09", "receiver": "miner_addr"}]
         }
-        db[utxo_key] = json.dumps(utxo_data).encode()
-        
-        # Create block with coinbase claiming exactly the fee amount (0.09 qBTC)
-        block = {
-            "height": 100,
-            "block_hash": "test_block_hash",
-            "previous_hash": "prev_hash",
-            "tx_ids": ["coinbase_100", "tx1"],
-            "nonce": 12345,
-            "timestamp": int(time.time()),
-            "miner_address": "miner_addr",
-            "merkle_root": "00"*32,
-            "version": 1,
-            "bits": 0x1f00ffff,
-            "full_transactions": [
-                {
-                    # Coinbase transaction claiming only fees
-                    "txid": "coinbase_100",
-                    "version": 1,
-                    "inputs": [{"coinbase": "00"*32}],
-                    "outputs": [{"amount": "0.09", "receiver": "miner_addr"}]
-                },
-                {
-                    # Regular transaction: 100 -> 90 to bob + 9.91 change (fee = 0.09)
-                    "txid": "tx1",
-                    "inputs": [{"txid": "prev_tx", "utxo_index": 0}],
-                    "outputs": [
-                        {"receiver": "bob", "amount": "90", "utxo_index": 0},
-                        {"receiver": "alice", "amount": "9.91", "utxo_index": 1}
-                    ],
-                    "body": {
-                        "msg_str": f"alice:bob:90:{int(time.time()*1000)}:1",  # Added chain ID
-                        "signature": "dummy_sig",
-                        "pubkey": "dummy_pubkey",
-                        "transaction_data": ""
-                    }
-                }
-            ]
-        }
-        
-        # Mock signature verification and chain ID
-        with patch('blockchain.transaction_validator.verify_transaction', return_value=True), \
-             patch('config.config.CHAIN_ID', 1):
-            async def test_valid_coinbase():
-                cm = await get_chain_manager()
-                # Might fail for other reasons (like missing parent), but not coinbase
-                success, error = await cm.add_block(block)
-                if not success and error:
-                    assert "coinbase" not in error.lower() or "Invalid coinbase" not in error
-            
-            asyncio.run(test_valid_coinbase())
+
+        # At height 100, subsidy is ~0.4167, fees are 0.09
+        # max allowed = ~0.5067, we claim 0.09 -> accepted
+        is_valid, error = validator.validate_coinbase_transaction(
+            coinbase_tx, 100, Decimal("0.09")
+        )
+        assert is_valid
+        assert error is None
 
 
 class TestDoubleSpendingPrevention:
     """Test Fix 2: Prevent double-spending within a single block"""
-    
-    @patch('blockchain.chain_manager.get_db')
-    @patch('blockchain.chain_manager.WriteBatch', DummyWriteBatch)
-    @patch('blockchain.blockchain.calculate_merkle_root', return_value="00"*32)
-    def test_double_spend_in_block_rejected(self, mock_merkle, mock_get_db):
-        """Test that blocks with double-spends are rejected"""
+
+    @patch('config.config.CHAIN_ID', 1)
+    @patch('blockchain.transaction_validator.derive_qsafe_address', return_value="alice")
+    @patch('blockchain.transaction_validator.verify_transaction', return_value=True)
+    def test_double_spend_in_block_rejected(self, _mock_verify, _mock_derive):
+        """Test that blocks with intra-block double-spends are rejected"""
         db = FakeDB()
-        mock_get_db.return_value = db
-        
+
         # Store UTXO that will be double-spent
         utxo_key = b"utxo:prev_tx:0"
         utxo_data = {
             "txid": "prev_tx",
             "utxo_index": 0,
-            "sender": "alice",
             "receiver": "alice",
-            "amount": "100.1",  # Include fee amount
+            "amount": "100.1",
             "spent": False
         }
         db[utxo_key] = json.dumps(utxo_data).encode()
-        
-        # Create block with two transactions spending the same UTXO
-        block = {
+
+        validator = TransactionValidator(db=db)
+
+        ts = str(int(time.time() * 1000))
+        block_data = {
             "height": 100,
-            "block_hash": "test_block_hash",
-            "previous_hash": "prev_hash",
-            "tx_ids": ["tx1", "tx2"],
-            "nonce": 12345,
-            "timestamp": int(time.time()),
-            "miner_address": "miner_addr",
-            "merkle_root": "00"*32,
-            "version": 1,
-            "bits": 0x1f00ffff,
             "full_transactions": [
+                {
+                    # Coinbase (skipped by validator)
+                    "txid": "coinbase_100",
+                    "inputs": [{"txid": "0" * 64, "utxo_index": 0}],
+                    "outputs": [{"amount": "0.1", "receiver": "miner_addr"}]
+                },
                 {
                     # First spend of UTXO
                     "txid": "tx1",
                     "inputs": [{"txid": "prev_tx", "utxo_index": 0}],
                     "outputs": [{"receiver": "bob", "amount": "100", "utxo_index": 0}],
                     "body": {
-                        "msg_str": f"alice:bob:100:{int(time.time()*1000)}:1",  # Added chain ID
+                        "msg_str": f"alice:bob:100:{ts}:1",
                         "signature": "dummy_sig1",
                         "pubkey": "dummy_pubkey",
                         "transaction_data": ""
                     }
                 },
                 {
-                    # Second spend of same UTXO (double-spend)
+                    # Second spend of SAME UTXO (double-spend)
                     "txid": "tx2",
                     "inputs": [{"txid": "prev_tx", "utxo_index": 0}],
                     "outputs": [{"receiver": "charlie", "amount": "100", "utxo_index": 0}],
                     "body": {
-                        "msg_str": f"alice:charlie:100:{int(time.time()*1000)}:1",  # Added chain ID
+                        "msg_str": f"alice:charlie:100:{ts}:1",
                         "signature": "dummy_sig2",
                         "pubkey": "dummy_pubkey",
                         "transaction_data": ""
@@ -246,81 +134,58 @@ class TestDoubleSpendingPrevention:
                 }
             ]
         }
-        
-        # Mock signature verification and chain ID
-        with patch('blockchain.transaction_validator.verify_transaction', return_value=True), \
-             patch('config.config.CHAIN_ID', 1):
-            async def test_double_spend():
-                cm = await get_chain_manager()
-                success, error = await cm.add_block(block)
-                assert not success
-                assert "Double spend detected" in error or "double" in error.lower()
-            
-            asyncio.run(test_double_spend())
-    
-    @patch('blockchain.chain_manager.get_db')
-    @patch('blockchain.chain_manager.WriteBatch', DummyWriteBatch)
-    @patch('blockchain.blockchain.calculate_merkle_root', return_value="00"*32)
-    def test_valid_multiple_spends(self, mock_merkle, mock_get_db):
-        """Test that blocks with valid multiple transactions are accepted"""
+
+        is_valid, error, fees = validator.validate_block_transactions(block_data)
+        assert not is_valid
+        assert "double spend" in error.lower() or "already spent" in error.lower()
+
+    @patch('config.config.CHAIN_ID', 1)
+    @patch('blockchain.transaction_validator.derive_qsafe_address', return_value="alice")
+    @patch('blockchain.transaction_validator.verify_transaction', return_value=True)
+    def test_valid_multiple_spends(self, _mock_verify, _mock_derive):
+        """Test that blocks with valid multiple transactions (different UTXOs) are accepted"""
         db = FakeDB()
-        mock_get_db.return_value = db
-        
+
         # Store two different UTXOs
-        utxo1_key = b"utxo:prev_tx1:0"
-        utxo1_data = {
-            "txid": "prev_tx1",
-            "utxo_index": 0,
-            "sender": "alice",
-            "receiver": "alice",
-            "amount": "100.1",  # Include fee
-            "spent": False
-        }
-        db[utxo1_key] = json.dumps(utxo1_data).encode()
-        
-        utxo2_key = b"utxo:prev_tx2:0"
-        utxo2_data = {
-            "txid": "prev_tx2",
-            "utxo_index": 0,
-            "sender": "alice",
-            "receiver": "alice",
-            "amount": "50.05",  # Include fee
-            "spent": False
-        }
-        db[utxo2_key] = json.dumps(utxo2_data).encode()
-        
-        # Create block with two valid transactions
-        block = {
+        db[b"utxo:prev_tx1:0"] = json.dumps({
+            "txid": "prev_tx1", "utxo_index": 0,
+            "receiver": "alice", "amount": "100.1", "spent": False
+        }).encode()
+        db[b"utxo:prev_tx2:0"] = json.dumps({
+            "txid": "prev_tx2", "utxo_index": 0,
+            "receiver": "alice", "amount": "50.05", "spent": False
+        }).encode()
+
+        validator = TransactionValidator(db=db)
+
+        ts = str(int(time.time() * 1000))
+        block_data = {
             "height": 100,
-            "block_hash": "test_block_hash",
-            "previous_hash": "prev_hash",
-            "tx_ids": ["tx1", "tx2"],
-            "nonce": 12345,
-            "timestamp": int(time.time()),
-            "miner_address": "miner_addr",
-            "merkle_root": "00"*32,
-            "version": 1,
-            "bits": 0x1f00ffff,
             "full_transactions": [
                 {
-                    # First transaction spending UTXO1
+                    "txid": "coinbase_100",
+                    "inputs": [{"txid": "0" * 64, "utxo_index": 0}],
+                    "outputs": [{"amount": "0.1", "receiver": "miner_addr"}]
+                },
+                {
+                    # Spending UTXO1
                     "txid": "tx1",
                     "inputs": [{"txid": "prev_tx1", "utxo_index": 0}],
                     "outputs": [{"receiver": "bob", "amount": "100", "utxo_index": 0}],
                     "body": {
-                        "msg_str": f"alice:bob:100:{int(time.time()*1000)}:1",  # Added chain ID
+                        "msg_str": f"alice:bob:100:{ts}:1",
                         "signature": "dummy_sig1",
                         "pubkey": "dummy_pubkey",
                         "transaction_data": ""
                     }
                 },
                 {
-                    # Second transaction spending UTXO2 (different UTXO)
+                    # Spending UTXO2 (different UTXO — not a double-spend)
                     "txid": "tx2",
                     "inputs": [{"txid": "prev_tx2", "utxo_index": 0}],
                     "outputs": [{"receiver": "charlie", "amount": "50", "utxo_index": 0}],
                     "body": {
-                        "msg_str": f"alice:charlie:50:{int(time.time()*1000)}:1",  # Added chain ID
+                        "msg_str": f"alice:charlie:50:{ts}:1",
                         "signature": "dummy_sig2",
                         "pubkey": "dummy_pubkey",
                         "transaction_data": ""
@@ -328,66 +193,45 @@ class TestDoubleSpendingPrevention:
                 }
             ]
         }
-        
-        # Mock signature verification and chain ID
-        with patch('blockchain.transaction_validator.verify_transaction', return_value=True), \
-             patch('config.config.CHAIN_ID', 1):
-            async def test_valid_multiple():
-                cm = await get_chain_manager()
-                # Might fail for other reasons, but not double-spend
-                success, error = await cm.add_block(block)
-                if not success and error:
-                    assert "double" not in error.lower()
-            
-            asyncio.run(test_valid_multiple())
+
+        is_valid, error, fees = validator.validate_block_transactions(block_data)
+        assert is_valid
+        assert error is None
 
 
 class TestExactOutputValidation:
     """Test Fix 3: Ensure exact authorized amounts are sent to recipients"""
-    
-    @patch('blockchain.chain_manager.get_db')
-    @patch('blockchain.chain_manager.WriteBatch', DummyWriteBatch)
-    @patch('blockchain.blockchain.calculate_merkle_root', return_value="00"*32)
+
+    @patch('config.config.CHAIN_ID', 1)
     @patch('config.config.ADMIN_ADDRESS', "admin_addr")
-    def test_insufficient_payment_rejected(self, mock_merkle, mock_get_db):
+    @patch('blockchain.transaction_validator.derive_qsafe_address', return_value="alice")
+    @patch('blockchain.transaction_validator.verify_transaction', return_value=True)
+    def test_insufficient_payment_rejected(self, _mock_verify, _mock_derive):
         """Test that transactions sending less than authorized are rejected"""
         db = FakeDB()
-        mock_get_db.return_value = db
-        
-        # Store UTXO
-        utxo_key = b"utxo:prev_tx:0"
-        utxo_data = {
-            "txid": "prev_tx",
-            "utxo_index": 0,
-            "sender": "alice",
-            "receiver": "alice",
-            "amount": "100.1",  # Include fee
-            "spent": False
-        }
-        db[utxo_key] = json.dumps(utxo_data).encode()
-        
-        # Create transaction that signs for 100 but only sends 90
-        block = {
+
+        # Store UTXO with enough balance
+        db[b"utxo:prev_tx:0"] = json.dumps({
+            "txid": "prev_tx", "utxo_index": 0,
+            "receiver": "alice", "amount": "100.1", "spent": False
+        }).encode()
+
+        validator = TransactionValidator(db=db)
+
+        ts = str(int(time.time() * 1000))
+        block_data = {
             "height": 100,
-            "block_hash": "test_block_hash",
-            "previous_hash": "prev_hash",
-            "tx_ids": ["tx1"],
-            "nonce": 12345,
-            "timestamp": int(time.time()),
-            "miner_address": "miner_addr",
-            "merkle_root": "00"*32,
-            "version": 1,
-            "bits": 0x1f00ffff,
             "full_transactions": [
                 {
+                    # Transaction authorizes 100 to bob but only sends 90
                     "txid": "tx1",
                     "inputs": [{"txid": "prev_tx", "utxo_index": 0}],
                     "outputs": [
-                        {"receiver": "bob", "amount": "90", "utxo_index": 0},  # Less than authorized
-                        {"receiver": "alice", "amount": "9.9", "utxo_index": 1}  # Extra change
+                        {"receiver": "bob", "amount": "90", "utxo_index": 0},
+                        {"receiver": "alice", "amount": "9.9", "utxo_index": 1}
                     ],
                     "body": {
-                        "msg_str": f"alice:bob:100:{int(time.time()*1000)}:1",  # Authorized 100
+                        "msg_str": f"alice:bob:100:{ts}:1",
                         "signature": "dummy_sig",
                         "pubkey": "dummy_pubkey",
                         "transaction_data": ""
@@ -395,58 +239,37 @@ class TestExactOutputValidation:
                 }
             ]
         }
-        
-        # Mock signature verification and chain ID
-        with patch('blockchain.transaction_validator.verify_transaction', return_value=True), \
-             patch('config.config.CHAIN_ID', 1):
-            async def test_amount_mismatch():
-                cm = await get_chain_manager()
-                success, error = await cm.add_block(block)
-                assert not success
-                assert "amount" in error.lower() or "mismatch" in error.lower()
-            
-            asyncio.run(test_amount_mismatch())
-    
-    @patch('blockchain.chain_manager.get_db')
-    @patch('blockchain.chain_manager.WriteBatch', DummyWriteBatch)
-    @patch('blockchain.blockchain.calculate_merkle_root', return_value="00"*32)
+
+        is_valid, error, fees = validator.validate_block_transactions(block_data)
+        assert not is_valid
+        assert "amount" in error.lower() or "authorized" in error.lower()
+
+    @patch('config.config.CHAIN_ID', 1)
     @patch('config.config.ADMIN_ADDRESS', "admin_addr")
-    def test_exact_payment_accepted(self, mock_merkle, mock_get_db):
-        """Test that transactions sending exact amounts are accepted"""
+    @patch('blockchain.transaction_validator.derive_qsafe_address', return_value="alice")
+    @patch('blockchain.transaction_validator.verify_transaction', return_value=True)
+    def test_exact_payment_accepted(self, _mock_verify, _mock_derive):
+        """Test that transactions sending exact authorized amounts are accepted"""
         db = FakeDB()
-        mock_get_db.return_value = db
-        
-        # Store UTXO
-        utxo_key = b"utxo:prev_tx:0"
-        utxo_data = {
-            "txid": "prev_tx",
-            "utxo_index": 0,
-            "sender": "alice",
-            "receiver": "alice",
-            "amount": "100.1",  # Include fee
-            "spent": False
-        }
-        db[utxo_key] = json.dumps(utxo_data).encode()
-        
-        # Create transaction with exact authorized amount
-        block = {
+
+        # Store UTXO with enough balance
+        db[b"utxo:prev_tx:0"] = json.dumps({
+            "txid": "prev_tx", "utxo_index": 0,
+            "receiver": "alice", "amount": "100.1", "spent": False
+        }).encode()
+
+        validator = TransactionValidator(db=db)
+
+        ts = str(int(time.time() * 1000))
+        block_data = {
             "height": 100,
-            "block_hash": "test_block_hash",
-            "previous_hash": "prev_hash",
-            "tx_ids": ["tx1"],
-            "nonce": 12345,
-            "timestamp": int(time.time()),
-            "miner_address": "miner_addr",
-            "merkle_root": "00"*32,
-            "version": 1,
-            "bits": 0x1f00ffff,
             "full_transactions": [
                 {
                     "txid": "tx1",
                     "inputs": [{"txid": "prev_tx", "utxo_index": 0}],
-                    "outputs": [{"receiver": "bob", "amount": "100", "utxo_index": 0}],  # Exact amount
+                    "outputs": [{"receiver": "bob", "amount": "100", "utxo_index": 0}],
                     "body": {
-                        "msg_str": f"alice:bob:100:{int(time.time()*1000)}:1",  # Authorized 100
+                        "msg_str": f"alice:bob:100:{ts}:1",
                         "signature": "dummy_sig",
                         "pubkey": "dummy_pubkey",
                         "transaction_data": ""
@@ -454,15 +277,7 @@ class TestExactOutputValidation:
                 }
             ]
         }
-        
-        # Mock signature verification and chain ID
-        with patch('blockchain.transaction_validator.verify_transaction', return_value=True), \
-             patch('config.config.CHAIN_ID', 1):
-            async def test_exact_amount():
-                cm = await get_chain_manager()
-                # Might fail for other reasons, but not amount validation
-                success, error = await cm.add_block(block)
-                if not success and error:
-                    assert "amount" not in error.lower() or "authorized" not in error.lower()
-            
-            asyncio.run(test_exact_amount())
+
+        is_valid, error, fees = validator.validate_block_transactions(block_data)
+        assert is_valid
+        assert error is None

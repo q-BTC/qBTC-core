@@ -35,19 +35,26 @@ class RateLimiter:
         })
     
     def _get_client_ip(self, request: Request) -> str:
-        """Extract real client IP considering proxies"""
-        # Check X-Forwarded-For header first (for reverse proxies)
-        forwarded_for = request.headers.get('x-forwarded-for')
-        if forwarded_for:
-            return forwarded_for.split(',')[0].strip()
-        
-        # Check X-Real-IP header
-        real_ip = request.headers.get('x-real-ip')
-        if real_ip:
-            return real_ip
-        
-        # Fall back to direct connection IP
-        return request.client.host if request.client else "unknown"
+        """Extract real client IP considering proxies.
+
+        H5: Only trust X-Forwarded-For/X-Real-IP if the direct connection
+        comes from a trusted proxy. Otherwise, use the direct connection IP
+        to prevent header spoofing.
+        """
+        from config.config import TRUSTED_PROXIES
+        direct_ip = request.client.host if request.client else "unknown"
+
+        # Only trust forwarded headers from known proxies
+        if direct_ip in TRUSTED_PROXIES:
+            forwarded_for = request.headers.get('x-forwarded-for')
+            if forwarded_for:
+                return forwarded_for.split(',')[0].strip()
+
+            real_ip = request.headers.get('x-real-ip')
+            if real_ip:
+                return real_ip
+
+        return direct_ip
     
     def _get_endpoint_key(self, path: str) -> str:
         """Get endpoint key for rate limiting rules"""

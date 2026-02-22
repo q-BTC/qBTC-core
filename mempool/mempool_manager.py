@@ -310,28 +310,35 @@ class MempoolManager:
         
     def _calculate_fee(self, tx: dict) -> Decimal:
         """
-        Calculate transaction fee.
-        
-        Args:
-            tx: Transaction
-            
-        Returns:
-            Fee amount
+        Calculate transaction fee with robust parsing and validation (M5).
+
+        Tries msg_str first, falls back to first output amount.
+        Returns the actual calculated fee (caller checks against MIN_RELAY_FEE).
         """
-        # For qBTC, fee is 0.1% of transaction amount
-        # We need to calculate from the message string
         body = tx.get("body", {})
         msg_str = body.get("msg_str", "")
-        
+
+        # Primary: parse amount from msg_str
         try:
             parts = msg_str.split(":")
             if len(parts) >= 3:
                 amount = Decimal(parts[2])
-                fee = (amount * Decimal("0.001")).quantize(Decimal("0.00000001"))
-                return fee
+                # Validate the parsed amount
+                if amount.is_finite() and amount > 0:
+                    return (amount * Decimal("0.001")).quantize(Decimal("0.00000001"))
         except Exception as e:
-            logger.warning(f"Failed to calculate fee for transaction: {e}")
-            
+            logger.warning(f"Failed to parse fee from msg_str: {e}")
+
+        # Fallback: use the first output amount (the payment, not change) for fee estimate
+        try:
+            outputs = tx.get("outputs", [])
+            if outputs:
+                amt = Decimal(str(outputs[0].get("amount", "0")))
+                if amt.is_finite() and amt > 0:
+                    return (amt * Decimal("0.001")).quantize(Decimal("0.00000001"))
+        except Exception as e:
+            logger.warning(f"Failed to calculate fee from outputs: {e}")
+
         return Decimal("0")
         
     def _check_size_limits(self, new_tx_size: int) -> bool:

@@ -1,0 +1,766 @@
+\documentclass[10pt,twocolumn,a4paper]{article}
+
+% ── Packages ──────────────────────────────────────────────────────────
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[top=2cm,bottom=2cm,left=1.8cm,right=1.8cm]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{titlesec}
+\usepackage{fancyhdr}
+\usepackage{caption}
+\usepackage{float}
+\usepackage{parskip}
+\usepackage{microtype}
+\usepackage{csquotes}
+\usepackage{tabularx}
+\usepackage{dblfloatfix}          % fixes table* at bottom of page
+\usepackage{stfloats}             % improved two-column float placement
+\usepackage{balance}              % balance final columns
+
+% ── Compact spacing ──────────────────────────────────────────────────
+\setlength{\parskip}{4pt plus 1pt minus 1pt}
+\setlength{\columnsep}{0.7cm}
+\setlist{nosep,leftmargin=1.2em}
+\captionsetup{font=small,labelfont=bf,skip=4pt}
+
+% ── Colours & hyperlinks ─────────────────────────────────────────────
+\definecolor{qbtcblue}{RGB}{23,47,77}
+\definecolor{qbtcaccent}{RGB}{207,126,43}
+\hypersetup{
+  colorlinks  = true,
+  linkcolor   = qbtcblue,
+  citecolor   = qbtcblue,
+  urlcolor    = qbtcaccent,
+}
+
+% ── Section styling (compact) ────────────────────────────────────────
+\titleformat{\section}
+  {\large\bfseries\color{qbtcblue}}{\thesection.}{0.5em}{}
+\titleformat{\subsection}
+  {\normalsize\bfseries\color{qbtcblue!80!black}}{\thesubsection}{0.5em}{}
+\titleformat{\subsubsection}
+  {\small\bfseries\color{qbtcblue!60!black}}{\thesubsubsection}{0.5em}{}
+\titlespacing*{\section}{0pt}{10pt}{4pt}
+\titlespacing*{\subsection}{0pt}{8pt}{3pt}
+\titlespacing*{\subsubsection}{0pt}{6pt}{2pt}
+
+% ── Header / footer ──────────────────────────────────────────────────
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\footnotesize\textcolor{qbtcblue}{qBTC: A Sovereign Quantum-Safe Blockchain}}
+\fancyhead[R]{\footnotesize\textcolor{qbtcblue}{\today}}
+\fancyfoot[C]{\footnotesize\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+% ── Math environments ────────────────────────────────────────────────
+\newtheorem{definition}{Definition}
+\newtheorem{property}{Property}
+
+% ══════════════════════════════════════════════════════════════════════
+\begin{document}
+
+% ── Title block (inline, no separate page) ───────────────────────────
+\twocolumn[{%
+\centering
+\vspace{0.5cm}
+{\LARGE\bfseries\color{qbtcblue} qBTC: A Sovereign Quantum-Safe Blockchain\par}
+\vspace{0.3cm}
+{\large Rationale, Architecture, and Protocol Specification\par}
+\vspace{0.2cm}
+{\normalsize Version 1.0 \quad---\quad \today\par}
+\vspace{0.15cm}
+{\small\textsc{bitcoinqs.org}\par}
+\vspace{0.5cm}
+
+\begin{minipage}{0.85\textwidth}
+\small
+\textbf{Abstract.}
+We present \textbf{qBTC}, a sovereign Layer-1 proof-of-work blockchain
+that inherits Bitcoin's consensus model---longest chain rule, UTXO
+accounting, SHA-256d block headers, difficulty adjustment, and a
+21\,M fixed supply---while replacing the ECDSA signature scheme with
+\textbf{ML-DSA-87} (CRYSTALS-Dilithium), the lattice-based digital
+signature standard published by NIST in FIPS~204.  The motivation is
+direct: Shor's algorithm renders every ECDSA-signed UTXO recoverable
+by a sufficiently powerful quantum computer, and Bitcoin's governance
+process is unlikely to produce a hard-fork migration before the threat
+window opens.  Rather than depend on that uncertain timeline, qBTC
+constructs the chain that should have existed from the start: one
+whose security does not degrade as physics advances.  This paper
+describes the threat model, design rationale, protocol architecture,
+network topology, and security properties of the system.
+\end{minipage}
+\vspace{0.6cm}
+}]
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Introduction}
+\label{sec:introduction}
+% ══════════════════════════════════════════════════════════════════════
+
+Bitcoin's security rests on two cryptographic pillars: the SHA-256
+hash function, which secures proof-of-work and address derivation, and
+the Elliptic Curve Digital Signature Algorithm (ECDSA) over
+\texttt{secp256k1}, which authorises spending.  Of these, only the
+second is vulnerable to quantum attack.
+
+Shor's algorithm~[1] provides a polynomial-time procedure for
+computing discrete logarithms on elliptic curves.  A quantum computer
+with approximately $2{,}500$ logical qubits---roughly $10^6$--$10^7$
+physical qubits under current error-correction overhead---would
+recover a \texttt{secp256k1} private key from its public key in hours
+rather than the $2^{128}$ classical operations that constitute today's
+security margin.
+
+The timeline is contested.  Optimistic estimates place
+cryptanalytically relevant quantum computers within the 2030--2035
+window; conservative estimates extend to 2040 or beyond.  But the
+debate over \emph{when} obscures a more urgent structural problem:
+Bitcoin's migration path is extraordinarily narrow.
+
+\subsection{The Migration Problem}
+
+Replacing ECDSA in Bitcoin requires a network-wide hard fork---or, at
+minimum, a soft fork introducing a new witness version with
+post-quantum verification.  The history of Bitcoin governance suggests
+years of deliberation, implementation, and activation.  SegWit took
+four years; Taproot took three.
+
+A post-quantum migration would be categorically more complex:
+
+\begin{enumerate}[label=(\roman*)]
+  \item \textbf{Signature size.}  ML-DSA-87 signatures are
+    $\approx$4{,}627 bytes versus 72 for ECDSA.  Public keys are
+    2{,}592 bytes versus 33.  This transforms block-size economics,
+    fee markets, and propagation latency.
+
+  \item \textbf{Address migration.}  Every ECDSA-locked UTXO must be
+    re-spent to a post-quantum address.  Dormant wallets---including
+    Satoshi's estimated 1.1\,M~BTC---remain permanently vulnerable.
+
+  \item \textbf{Consensus risk.}  Hard forks carry the risk of chain
+    splits and community fragmentation, as the Bitcoin Cash precedent
+    demonstrates.
+\end{enumerate}
+
+Even under optimistic assumptions, the window between \emph{plan
+announcement} and \emph{migration completion} will span years---years
+during which ``harvest now, decrypt later'' becomes increasingly
+rational for well-resourced adversaries.
+
+\subsection{The Case for Sovereign Construction}
+
+qBTC rejects the premise that the correct response is to wait for
+Bitcoin to upgrade itself.  Instead, it constructs the blockchain that
+Bitcoin would be if it were designed today: a sovereign Layer-1 network
+with its own genesis block, its own consensus, and its own security
+guarantees---built from the ground up on post-quantum cryptography.
+
+The design philosophy is deliberately conservative:
+
+\begin{itemize}
+  \item \textbf{Same supply curve.}  21\,M total coins, halving-based
+    emission, 8-decimal-place precision.
+  \item \textbf{Same consensus model.}  Proof-of-work with SHA-256d,
+    longest cumulative-difficulty chain rule, UTXO accounting.
+  \item \textbf{Same operational model.}  JSON-RPC mining interface
+    compatible with existing pool software.
+  \item \textbf{Different cryptography.}  ML-DSA-87 replaces ECDSA at
+    every signing and verification point.
+\end{itemize}
+
+qBTC is not a fork, not a sidechain, not a Layer-2.  It is a
+sovereign chain that inherits Bitcoin's proven economic architecture
+while eliminating its single largest cryptographic liability.  Users
+do not depend on Bitcoin governance to protect their assets; they hold
+keys whose security is not contingent on the pace of quantum hardware.
+
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Cryptographic Foundation}
+\label{sec:crypto}
+% ══════════════════════════════════════════════════════════════════════
+
+\subsection{ML-DSA-87 Selection Rationale}
+
+NIST's Post-Quantum Cryptography Standardization Process (initiated
+2016, primary standards published 2024) produced three signature
+schemes: ML-DSA (FIPS~204), SLH-DSA (FIPS~205), and the forthcoming
+FN-DSA.  qBTC adopts \textbf{ML-DSA-87}, the highest security level
+of the lattice-based scheme:
+
+\begin{enumerate}[label=(\alph*)]
+  \item \textbf{Security level.}  NIST Level~5: at least $2^{256}$
+    classical and $2^{128}$ quantum security, matching or exceeding
+    \texttt{secp256k1}.
+  \item \textbf{Performance.}  Sub-millisecond signing and
+    verification on commodity hardware.  SLH-DSA imposes 10--100\,ms
+    signing, degrading block validation throughput.
+  \item \textbf{Maturity.}  FIPS~204 is a final standard with
+    reference implementations in \texttt{liboqs}~[9] (C/Python)
+    and \texttt{@noble/post-quantum} (JavaScript).
+  \item \textbf{Conservative margin.}  Level~5 over Level~2/3
+    because the cost of a future security-level upgrade is high,
+    while the marginal verification cost is negligible relative to
+    SHA-256d proof-of-work.
+\end{enumerate}
+
+\subsection{Address Derivation}
+
+\begin{definition}[qBTC Address]
+Given an ML-DSA-87 public key $pk$ (1{,}312 bytes):
+\begin{align}
+  h       &= \mathrm{SHA3\text{-}256}(pk)[0{:}20] \notag\\
+  v       &= \mathtt{0x00} \,\|\, h \notag\\
+  c       &= \mathrm{SHA3\text{-}256}(v)[0{:}4] \notag\\
+  \mathrm{addr} &= \texttt{``bqs1''} \,\|\, \mathrm{Base58}(v \,\|\, c) \notag
+\end{align}
+\end{definition}
+
+The prefix \texttt{bqs1} (Bitcoin Quantum-Safe, version~1) is
+visually distinct from Bitcoin addresses (\texttt{1}, \texttt{3},
+\texttt{bc1}).  SHA3-256 is chosen over SHA-256/RIPEMD-160 to avoid
+dependence on hash families whose quantum resistance is less
+rigorously characterised.
+
+\subsection{Wallet Encryption}
+
+Private keys are encrypted at rest with AES-256-GCM, keyed via
+PBKDF2-HMAC-SHA256 (310{,}000 iterations, 16-byte salt, 12-byte IV).
+The ML-DSA-87 secret key (4{,}896 bytes) is size-validated at signing
+time to prevent truncation or key-confusion attacks.  The wallet file
+contains ciphertext, salt, IV, public key, and derived
+address---enabling read-only operations without decryption.
+
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Consensus Protocol}
+\label{sec:consensus}
+% ══════════════════════════════════════════════════════════════════════
+
+\subsection{Proof-of-Work}
+
+qBTC employs SHA-256d proof-of-work over an 80-byte block header
+identical in structure to Bitcoin's:
+
+\begin{table}[H]
+\centering\small
+\caption{Block header (80 bytes)}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Field} & \textbf{Size} & \textbf{Encoding} \\
+\midrule
+Version         & 4\,B  & LE uint32 \\
+Prev.\ hash    & 32\,B & LE SHA-256d \\
+Merkle root     & 32\,B & LE SHA-256d \\
+Timestamp       & 4\,B  & LE uint32 \\
+Bits            & 4\,B  & Compact target \\
+Nonce           & 4\,B  & LE uint32 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Validity requires $\mathrm{SHA256d}(\text{header}) <
+\mathrm{target}(\text{bits})$.  Retaining SHA-256d---rather than a
+``quantum-resistant'' hash---is deliberate: Grover's algorithm~[5]
+provides only a quadratic speedup against preimage search, reducing
+$2^{256}$ to $2^{128}$, which remains infeasible.  The vulnerability
+is in the signature scheme, not the hash function.
+
+\subsection{Difficulty Adjustment}
+
+Target block time: \textbf{10~seconds}.  Every $120{,}960$ blocks
+($\approx$14~days), the target is recalculated:
+\[
+  T_{\text{new}} = T_{\text{cur}} \cdot
+    \frac{t_{\text{actual}}}{t_{\text{expected}}}
+  \;,\quad
+  \tfrac{1}{4} \leq \frac{T_{\text{new}}}{T_{\text{cur}}} \leq 4
+\]
+The clamping bound prevents oscillatory instability.  The interval
+preserves Bitcoin's two-week adjustment rhythm.
+
+\subsection{Chain Selection and Reorgs}
+
+Fork resolution uses cumulative difficulty (total work), not
+longest chain by height.  Reorganisations are capped at
+\textbf{100~blocks} to prevent deep-reorg attacks.  Reorgs execute
+atomically via RocksDB \texttt{WriteBatch} with a persistent
+completion marker enabling deterministic crash recovery.
+
+\subsection{Merkle Tree}
+
+Transactions are committed via a standard binary Merkle tree using
+SHA-256d, with final-hash duplication for odd counts (consistent with
+Bitcoin).  The root is embedded in the block header and verified during
+validation.
+
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Transaction Model}
+\label{sec:transactions}
+% ══════════════════════════════════════════════════════════════════════
+
+\subsection{UTXO Accounting}
+
+qBTC uses a UTXO model semantically identical to Bitcoin.  Each
+transaction consumes unspent outputs and produces new ones; the input
+surplus constitutes the miner fee.
+
+\begin{definition}[Transaction]
+$\mathrm{tx} = (\mathrm{inputs}, \mathrm{outputs}, \mathrm{body},
+\mathrm{timestamp})$ where $\mathrm{body}$ contains the message
+string \texttt{sender:receiver:amount:timestamp:chain\_id}, the
+ML-DSA-87 signature~$\sigma$, and the public key~$pk$.  The
+identifier is $txid = \mathrm{SHA256d}(\mathrm{serialize}(\mathrm{tx}))$
+with JSON sorted-key serialisation.
+\end{definition}
+
+\subsection{Validation Rules}
+
+\begin{enumerate}[label=(\roman*)]
+  \item \textbf{Signature.}
+    $\mathrm{ML\text{-}DSA.Verify}(pk, \mathrm{msg}, \sigma) =
+    \texttt{true}$.
+  \item \textbf{Key--address binding.}  Derived address from $pk$
+    matches the sender in the message string.
+  \item \textbf{Chain ID.}  Embedded chain ID matches the node's
+    configured value---prevents cross-network replay.
+  \item \textbf{Temporal freshness.}  Timestamp within 1~hour of
+    current time (5-min future tolerance; relaxed during sync).
+  \item \textbf{UTXO availability.}  All inputs exist and are
+    unspent; concurrent mempool conflicts detected via pessimistic
+    locking.
+  \item \textbf{Value conservation.}
+    $\sum\!\mathrm{in} \geq \sum\!\mathrm{out}$.
+  \item \textbf{Amount bounds.}  Positive, $\leq$8 decimals,
+    $\leq$21\,M.
+\end{enumerate}
+
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Economic Parameters}
+\label{sec:economics}
+% ══════════════════════════════════════════════════════════════════════
+
+qBTC inherits Bitcoin's supply curve, adapted to a 10-second block
+time:
+
+\begin{table}[H]
+\centering\small
+\caption{Chain parameters}
+\begin{tabular}{@{}lr@{}}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+Total supply          & 21{,}000{,}000 \\
+Mining allocation     & 10{,}500{,}000 (50\%) \\
+Treasury allocation   & 10{,}500{,}000 (50\%) \\
+Initial block reward  & 0.4167 qBTC \\
+Halving interval      & 12.6\,M blocks \\
+Block time target     & 10\,s \\
+Diff.\ adjustment     & 120{,}960 blocks \\
+Chain ID              & 1 \\
+Min.\ relay fee       & 0.00001 qBTC \\
+Max reorg depth       & 100 blocks \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The 50/50 mining--treasury split departs from Bitcoin's 100\% mining
+allocation.  Bootstrapping a new proof-of-work chain requires initial
+liquidity for development, audits, and ecosystem incentives.  The
+treasury is fully transparent and subject to on-chain accounting from
+the genesis block.
+
+The halving interval of 12{,}600{,}000 blocks ($\approx$4~years at
+10\,s) preserves Bitcoin's four-year halving rhythm.  The initial
+reward is calibrated so that mining allocation is exhausted over 64
+halvings, after which the network is sustained by transaction fees.
+
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Network Architecture}
+\label{sec:network}
+% ══════════════════════════════════════════════════════════════════════
+
+The qBTC peer-to-peer network operates across three layers: peer
+discovery, data propagation, and mining coordination.
+
+\subsection{Peer Discovery: Kademlia DHT}
+
+Node discovery uses a Kademlia~[8] distributed hash table over UDP
+(port~8001).  Each node announces its gossip endpoint, identity, and
+NAT type.  New nodes bootstrap via a seed node and perform iterative
+lookups to populate their routing table.  NAT traversal is supported
+via STUN-based address detection and TCP hole-punching.
+
+\subsection{Data Propagation: Gossip}
+
+Blocks and transactions propagate via asynchronous gossip over TCP
+(port~8002), using newline-delimited JSON (max 30\,MB).
+
+\begin{table}[H]
+\centering\small
+\caption{Connection limits}
+\begin{tabular}{@{}lr@{}}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+Inbound connections    & 117 \\
+Outbound connections   & 10 \\
+Peers per /16 subnet   & 4 \\
+Anchor peers           & 2 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Rate limiting} per peer: transactions 200/min, block
+responses 30/min, control messages 120/min.  A broadcast tracker
+deduplicates by hash.  \textbf{Reputation scoring} tracks protocol
+compliance; peers below threshold are disconnected and banned.
+
+\subsection{Mining Interface}
+
+The RPC interface (port~8332) exposes \texttt{getblocktemplate},
+\texttt{submitblock}, \texttt{getmininginfo}, and
+\texttt{getblockchaininfo}, enabling compatibility with standard
+mining software such as \texttt{cpuminer-opt}.
+
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Security Model}
+\label{sec:security}
+% ══════════════════════════════════════════════════════════════════════
+
+\subsection{Threat Taxonomy}
+
+\begin{table}[H]
+\centering\small
+\caption{Attack classes and mitigations}
+\begin{tabularx}{\columnwidth}{@{}lX@{}}
+\toprule
+\textbf{Attack} & \textbf{Mitigation} \\
+\midrule
+Sybil &
+  Max 4 peers per /16 subnet; IP-based identity \\
+Eclipse &
+  Anchor peers; reputation scoring; DHT rediscovery \\
+Deep reorg &
+  100-block depth cap; cumulative-difficulty rule \\
+DoS &
+  Per-peer rate limits; Redis API limits; IP blocking \\
+Double spend &
+  Pessimistic UTXO locking; mempool conflict detection \\
+Replay &
+  Chain ID in signed message; signature domain separation \\
+Timestamp &
+  1-hour expiry; 5-min future tolerance \\
+Key mismatch &
+  Mandatory pubkey $\to$ address derivation check \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{UTXO Integrity}
+
+Double-spend prevention operates at two levels: the mempool
+serialises UTXO access via pessimistic locking, and block
+validation rejects intra-block conflicts.  No UTXO can be consumed
+more than once, even under concurrent submission.
+
+\subsection{Reorganisation Atomicity}
+
+Reorgs execute as atomic \texttt{WriteBatch} operations with a
+persistent completion marker.  On restart, presence or absence of the
+marker deterministically indicates completion.  Incomplete reorgs are
+rolled back automatically, preventing UTXO state corruption.
+
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Cross-Chain Identity}
+\label{sec:crosschain}
+% ══════════════════════════════════════════════════════════════════════
+
+Although qBTC is a sovereign chain with independent consensus, it
+provides an optional mechanism for establishing cryptographic identity
+linkage with Bitcoin.
+
+\subsection{Commitment Protocol}
+
+The commitment protocol binds a Bitcoin address to a qBTC address
+through a Bitcoin-signed attestation:
+
+\begin{enumerate}
+  \item User constructs a message containing both addresses.
+  \item User signs with their Bitcoin private key.
+  \item Signed commitment is submitted to the qBTC network.
+  \item After signature verification, the binding is recorded
+    on-chain with bidirectional indexes.
+\end{enumerate}
+
+This establishes proof of identity without transferring value---a
+verifiable record that a given Bitcoin key holder also controls a
+specific qBTC address.  It serves as a foundation for future
+interoperability protocols without introducing trust assumptions or
+federation dependencies.
+
+\subsection{Bitcoin Timestamping}
+
+Commitments may optionally be timestamped to the Bitcoin blockchain
+via OpenTimestamps~[10], producing a proof-of-existence anchored to a
+Bitcoin block height.  This provides an independent temporal reference
+resistant to qBTC chain reorganisations.
+
+qBTC does not implement a direct value peg to Bitcoin.  Peg
+mechanisms require either federated signers (trust assumptions) or
+validity proofs (complexity and latency).  The commitment protocol
+provides identity linkage cleanly, preserving the option of a bridge
+as the technology matures.
+
+
+% ══════════════════════════════════════════════════════════════════════
+\section{State Management}
+\label{sec:indexing}
+% ══════════════════════════════════════════════════════════════════════
+
+Storage uses RocksDB, a log-structured merge-tree store aligned with
+blockchain access patterns (sequential writes, prefix scans).  An
+optional Redis layer provides sub-millisecond access to hot data.
+
+\subsection{Indexing}
+
+Three specialised indexes are built incrementally:
+
+\textbf{Block height index.}  Maps heights to block hashes; $O(1)$
+retrieval via in-memory LRU cache backed by RocksDB.
+
+\textbf{Wallet index.}  Per-address balance ($O(1)$ cached),
+transaction history ($O(T)$), and UTXO set.  Updated atomically via
+\texttt{WriteBatch}.
+
+\textbf{Explorer index.}  The $k$ most recent non-coinbase
+transactions ($k = 1{,}000$), sorted by timestamp, serving the
+real-time explorer feed.
+
+\subsection{Mempool}
+
+Capacity: 10{,}000 transactions or 300\,MB.  Indexed by fee rate
+and affected address.  When full, the lowest-fee-rate transaction is
+evicted.  Per-address indexing enables $O(1)$ lookup of pending
+transactions.
+
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Client Architecture}
+\label{sec:client}
+% ══════════════════════════════════════════════════════════════════════
+
+\subsection{Browser-Based Wallet}
+
+qBTC ships a browser wallet in TypeScript/React.  Key generation and
+signing use \texttt{@noble/post-quantum} (pure-JS ML-DSA-87).  Private
+keys never leave the browser; they are AES-256-GCM encrypted before
+storage.
+
+\subsection{Real-Time Updates}
+
+Persistent WebSocket connections deliver subscription-based updates:
+\texttt{combined\_update} (wallet-scoped balance and history),
+\texttt{all\_transactions} (global feed), and
+\texttt{l1\_proofs\_testnet} (block proofs).  A 30-second keepalive
+ping prevents proxy timeouts.
+
+\subsection{Transaction Flow}
+
+The wallet queries UTXOs, selects inputs covering amount plus 0.1\%
+fee, constructs the message string
+\texttt{sender:receiver:amount:timestamp:chain\_id}, signs with
+ML-DSA-87, and submits.  The node validates, mempools, and gossips.
+
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Deployment}
+\label{sec:deployment}
+% ══════════════════════════════════════════════════════════════════════
+
+Two node configurations:
+
+\textbf{Bootstrap server.}  Network hub: maintains the DHT, accepts
+gossip, stores genesis, optionally mines.  Deployed behind Nginx with
+TLS.
+
+\textbf{Validator node.}  Full consensus participant: syncs history,
+validates, gossips, optionally mines.  Independent of bootstrap.
+
+Both expose ports 8080 (API), 8001 (DHT), 8002 (Gossip), 8332
+(Mining RPC).  Docker Compose templates cover local testing (3-node),
+bootstrap production, and validator production.  Prometheus metrics at
+\texttt{/health}; Grafana dashboards for monitoring.
+
+\textbf{Synchronisation.}  Nodes request missing blocks via gossip,
+validate (PoW, signatures, UTXO state, Merkle root, difficulty),
+add in height order with atomic index updates, and prune confirmed
+transactions from mempool.  Timestamp checks are relaxed during sync.
+
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Discussion: Why Not Wait?}
+\label{sec:discussion}
+% ══════════════════════════════════════════════════════════════════════
+
+A natural objection is that qBTC is premature---that the quantum
+threat is distant enough for an orderly migration within Bitcoin.
+Three arguments suggest otherwise.
+
+\textbf{Asymmetry of outcomes.}  If quantum computers arrive late,
+early adoption costs nothing: post-quantum assets are no less secure
+than classical ones.  If they arrive early, delayed migration is
+catastrophic.  Prudent risk management favours early action when the
+downside of inaction is unbounded.
+
+\textbf{Governance bottleneck.}  Bitcoin's change process is, by
+design, slow and conservative---a feature for a settlement layer, a
+liability against cryptographic obsolescence.  A sovereign chain
+sidesteps governance entirely: users opt in by choice, not by
+committee.
+
+\textbf{Harvest now, decrypt later.}  Nation-state adversaries are
+collecting cryptographic material today for future decryption.  Public
+keys exposed on Bitcoin's blockchain---through address reuse, P2PK
+outputs, or signing---constitute a permanent, immutable record.  Every
+day with ECDSA-signed UTXOs on a public ledger is a day the harvest
+grows.
+
+qBTC does not claim Bitcoin will fail.  It observes that the
+migration path is uncertain, the timeline ambiguous, and the
+consequences of miscalculation severe.  A sovereign quantum-safe
+blockchain preserving Bitcoin's economic model is not a
+competitor---it is a rational hedge against the most significant
+cryptographic risk of this era.
+
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Conclusion}
+\label{sec:conclusion}
+% ══════════════════════════════════════════════════════════════════════
+
+qBTC demonstrates that post-quantum security and Bitcoin's economic
+model are complementary.  By replacing ECDSA with ML-DSA-87 while
+retaining SHA-256d proof-of-work, UTXO accounting, difficulty
+adjustment, and the 21\,M supply cap, qBTC provides a sovereign
+Layer-1 chain whose security does not erode with advances in quantum
+hardware.
+
+The system is operational: blocks are mined, transactions validated
+and propagated, wallets sign with post-quantum keys, and the network
+self-organises via DHT discovery and reputation-scored gossip.  The
+architecture is conservative by choice: no novel consensus mechanism,
+no unproven primitive, no speculative economic model.  The single
+departure from Bitcoin is the one that matters.
+
+The quantum threat to public-key cryptography is not a question of
+\emph{if} but \emph{when}.  qBTC is built so that, when the answer
+arrives, the question is already irrelevant.
+
+\vspace{0.3cm}
+\begin{center}
+\small\textit{``The best time to migrate was yesterday. \\
+The second best time is now.''}
+\end{center}
+
+
+% ══════════════════════════════════════════════════════════════════════
+% References (spanning both columns)
+% ══════════════════════════════════════════════════════════════════════
+\balance   % balance final two columns
+
+\vspace{0.4cm}
+\noindent\rule{\columnwidth}{0.4pt}
+
+{\small
+\subsection*{References}
+
+\begin{enumerate}[label={[\arabic*]},leftmargin=1.5em,nosep]
+  \item P.\,W.\ Shor, ``Algorithms for quantum computation,''
+    \textit{Proc.\ 35th FOCS}, IEEE, 1994.
+  \item NIST, ``FIPS~204: ML-DSA,'' U.S.\ Dept.\ of Commerce, 2024.
+  \item NIST, ``FIPS~205: SLH-DSA,'' U.S.\ Dept.\ of Commerce, 2024.
+  \item S.\ Nakamoto, ``Bitcoin: A Peer-to-Peer Electronic Cash
+    System,'' 2008.
+  \item L.\,K.\ Grover, ``A fast quantum mechanical algorithm for
+    database search,'' \textit{Proc.\ 28th STOC}, 1996.
+  \item D.\,J.\ Bernstein and T.\ Lange, ``Post-quantum
+    cryptography,'' \textit{Nature} 549, 2017.
+  \item M.\ Mosca, ``Cybersecurity in an era with quantum
+    computers,'' \textit{IEEE S\&P} 16(5), 2018.
+  \item P.\ Maymounkov and D.\ Mazi\`{e}res, ``Kademlia,''
+    \textit{IPTPS}, 2002.
+  \item Open Quantum Safe, ``liboqs,'' 2024.
+    \url{https://openquantumsafe.org}.
+  \item P.\ Todd, ``OpenTimestamps,'' 2016.
+    \url{https://opentimestamps.org}.
+\end{enumerate}
+}
+
+
+% ══════════════════════════════════════════════════════════════════════
+% Appendix (still two-column)
+% ══════════════════════════════════════════════════════════════════════
+
+\vspace{0.4cm}
+\appendix
+
+\section{Protocol Constants}
+\label{app:constants}
+
+\begin{table}[H]
+\centering\small
+\begin{tabular}{@{}lr@{}}
+\toprule
+\textbf{Constant} & \textbf{Value} \\
+\midrule
+\texttt{TOTAL\_SUPPLY}       & 21{,}000{,}000 \\
+\texttt{MINING\_SUPPLY}      & 10{,}500{,}000 \\
+\texttt{BLOCK\_REWARD}       & 0.4167 \\
+\texttt{HALVING\_INTERVAL}   & 12{,}600{,}000 \\
+\texttt{BLOCK\_TIME}         & 10\,s \\
+\texttt{DIFF\_INTERVAL}      & 120{,}960 \\
+\texttt{MAX\_REORG}          & 100 \\
+\texttt{CHAIN\_ID}           & 1 \\
+\texttt{MIN\_FEE}            & 0.00001 \\
+\texttt{TX\_EXPIRY}          & 3{,}600\,s \\
+\texttt{MAX\_MEMPOOL}        & 10{,}000 / 300\,MB \\
+\texttt{MAX\_INBOUND}        & 117 \\
+\texttt{MAX\_OUTBOUND}       & 10 \\
+\texttt{SUBNET\_LIMIT}       & 4 per /16 \\
+\texttt{ANCHOR\_PEERS}       & 2 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Key and Signature Sizes}
+\label{app:keysizes}
+
+\begin{table}[H]
+\centering\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+ & \textbf{ML-DSA-87} & \textbf{ECDSA} \\
+\midrule
+Public key  & 2{,}592\,B & 33\,B \\
+Secret key  & 4{,}896\,B & 32\,B \\
+Signature   & 4{,}627\,B & 72\,B \\
+\bottomrule
+\end{tabular}
+\caption{The $\approx$64$\times$ signature increase is the
+primary trade-off for quantum resistance.}
+\end{table}
+
+\end{document}

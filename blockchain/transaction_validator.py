@@ -174,11 +174,28 @@ class TransactionValidator:
 
                 except (ValueError, TypeError):
                     return False, f"Invalid timestamp in tx {txid}: {time_str}", Decimal("0")
-            
+            else:
+                # Sync mode: apply basic sanity bounds on timestamps
+                try:
+                    tx_timestamp = int(time_str)
+                    current_time = int(time.time() * 1000)
+                    # Timestamp must be positive
+                    if tx_timestamp <= 0:
+                        return False, f"Transaction {txid} has non-positive timestamp: {tx_timestamp}", Decimal("0")
+                    # Timestamp must not be more than 1 day in the future
+                    if tx_timestamp > current_time + 86400000:  # 86400 seconds * 1000 ms
+                        return False, f"Transaction {txid} has timestamp too far in the future during sync", Decimal("0")
+                except (ValueError, TypeError):
+                    return False, f"Invalid timestamp in tx {txid}: {time_str}", Decimal("0")
+
             try:
                 total_authorized = Decimal(amount_str)
             except (ValueError, ArithmeticError, TypeError):
                 return False, f"Invalid amount in tx {txid}: {amount_str}", Decimal("0")
+
+            # Reject Decimal special values (Infinity, NaN, sNaN)
+            if total_authorized.is_infinite() or total_authorized.is_nan() or total_authorized.is_snan():
+                return False, f"Invalid amount in tx {txid}: special value not allowed ({amount_str})", Decimal("0")
 
             # Amount bounds validation
             if total_authorized <= 0:
@@ -246,6 +263,10 @@ class TransactionValidator:
             except (ValueError, ArithmeticError, TypeError):
                 return False, f"Invalid output amount in tx {txid}", Decimal("0")
 
+            # Reject Decimal special values in outputs
+            if amt.is_infinite() or amt.is_nan() or amt.is_snan():
+                return False, f"Invalid output amount in tx {txid}: special value not allowed", Decimal("0")
+
             # Output amount bounds validation
             if amt <= 0:
                 return False, f"Invalid output amount in tx {txid}: must be > 0", Decimal("0")
@@ -281,9 +302,9 @@ class TransactionValidator:
         )
         grand_total_required = total_authorized + miner_fee
 
-        # Validate admin fee amount — must not exceed 2x the expected miner fee
+        # Validate admin fee amount — must not exceed the expected miner fee
         # This prevents attackers from routing arbitrary amounts to admin address
-        max_admin_fee = miner_fee * 2
+        max_admin_fee = miner_fee
         if height > 0 and total_admin_fee > max_admin_fee:
             return False, f"Admin fee in tx {txid} exceeds maximum: {total_admin_fee} > {max_admin_fee}", Decimal("0")
 

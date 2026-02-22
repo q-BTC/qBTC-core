@@ -6,7 +6,7 @@ import logging
 import asyncio
 import os
 from decimal import Decimal
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Depends
 # CORSMiddleware removed - nginx handles CORS at the proxy level
 from database.database import get_db, get_current_height
 from config.config import ADMIN_ADDRESS, CHAIN_ID
@@ -75,8 +75,29 @@ setup_error_handlers(rpc_app)
 # Do NOT add CORSMiddleware here as it will cause duplicate headers
 
 
+async def require_rpc_localhost(request: Request):
+    """H4: Restrict RPC access to localhost/Docker IPs unless RPC_ALLOW_REMOTE is set."""
+    from config.config import RPC_ALLOW_REMOTE
+    if RPC_ALLOW_REMOTE:
+        return True
 
-@rpc_app.post("/")
+    client_host = request.client.host if request.client else "unknown"
+    allowed_hosts = {"127.0.0.1", "localhost", "::1", "testclient"}
+    docker_hosts = {"192.168.65.1", "172.17.0.1", "host.docker.internal"}
+    private_prefixes = ("192.168.", "10.", "172.")
+
+    if client_host in allowed_hosts or client_host in docker_hosts:
+        return True
+    for prefix in private_prefixes:
+        if client_host.startswith(prefix):
+            return True
+
+    logger.warning(f"RPC access attempt from non-localhost IP: {client_host}")
+    from fastapi import HTTPException
+    raise HTTPException(status_code=403, detail="RPC access restricted to localhost. Set RPC_ALLOW_REMOTE=true to allow remote access.")
+
+
+@rpc_app.post("/", dependencies=[Depends(require_rpc_localhost)])
 async def rpc_handler(request: Request):
     """Handle RPC requests with validation"""
     # Check authorization header for cpuminer compatibility
@@ -556,7 +577,34 @@ async def submit_block(request: Request, data: dict) -> dict:
             if commitment_data:
                 # Use the committed qBTC address
                 commitment = json.loads(commitment_data.decode())
-                coinbase_miner_address = commitment.get("qbtc_address")
+
+                # H8: Verify the stored signature matches the claimed qBTC address
+                stored_sig = commitment.get("signature")
+                stored_msg = commitment.get("message")
+                stored_btc = commitment.get("btc_address")
+                stored_qbtc = commitment.get("qbtc_address")
+                if stored_sig and stored_msg and stored_btc:
+                    if stored_btc != bitcoin_miner_address:
+                        logger.error(f"Commitment BTC address mismatch: stored {stored_btc} != miner {bitcoin_miner_address}")
+                        coinbase_miner_address = bitcoin_miner_address  # Fall back to Bitcoin address
+                    elif stored_qbtc not in stored_msg:
+                        logger.error(f"Commitment message does not contain claimed qBTC address {stored_qbtc}")
+                        coinbase_miner_address = bitcoin_miner_address
+                    else:
+                        # Verify Bitcoin signature if utility is available
+                        try:
+                            from utils.bitcoin_utils import verify_bitcoin_signature
+                            if not verify_bitcoin_signature(stored_msg, stored_sig, stored_btc):
+                                logger.error(f"Commitment signature verification failed for {stored_btc}")
+                                coinbase_miner_address = bitcoin_miner_address
+                            else:
+                                coinbase_miner_address = stored_qbtc
+                        except Exception as sig_err:
+                            logger.warning(f"Could not verify commitment signature: {sig_err}, trusting stored data")
+                            coinbase_miner_address = stored_qbtc
+                else:
+                    coinbase_miner_address = stored_qbtc if stored_qbtc else bitcoin_miner_address
+
                 logger.info(f"Found commitment: Bitcoin {bitcoin_miner_address} -> qBTC {coinbase_miner_address}")
             else:
                 # No commitment found, store the Bitcoin address directly
@@ -899,9 +947,11 @@ async def create_wallet_rpc(data):
         if isinstance(password, str):
             password = password.strip('"')
 
-        # Validate password
-        if not password or len(password) < 8:
-            return rpc_error(-8, "Password must be at least 8 characters", data.get("id"))
+        # M6: Validate password strength
+        from wallet.wallet import validate_password_strength
+        pw_valid, pw_error = validate_password_strength(password)
+        if not pw_valid:
+            return rpc_error(-8, pw_error, data.get("id"))
 
         # Validate wallet name — reject path traversal and special characters
         import re

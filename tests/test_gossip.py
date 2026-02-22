@@ -1,7 +1,8 @@
 # tests/test_gossip.py
 import asyncio
+import json
 import time
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -11,13 +12,28 @@ import pytest
 # ──────────────────────────────────────────────────────────────────────────────
 @pytest.mark.asyncio
 @pytest.mark.stub_verify          # <<–– uses stub verifier
-async def test_handle_valid_transaction(node, dummy_writer):
+async def test_handle_valid_transaction(node, dummy_writer, _stub_database):
     now_ms = int(time.time() * 1000)
+
+    # Store UTXO referenced by the transaction
+    from database.database import get_db
+    db = get_db()
+    db[b"utxo:prev_tx_123:0"] = json.dumps({
+        "txid": "prev_tx_123", "utxo_index": 0,
+        "receiver": "alice", "amount": "100.1", "spent": False
+    }).encode()
+
     tx_msg = {
         "type": "transaction",
         "timestamp": now_ms,
-        "txid": "tx-abc",
-        "body": {"msg_str": "hello", "signature": "sig", "pubkey": "pk"},
+        "txid": "placeholder",
+        "inputs": [{"txid": "prev_tx_123", "utxo_index": 0, "amount": "100.1"}],
+        "outputs": [{"receiver": "bob", "amount": "100", "utxo_index": 0}],
+        "body": {
+            "msg_str": f"alice:bob:100:{now_ms}:1",
+            "signature": "sig",
+            "pubkey": "pk",
+        },
     }
 
     # clear global mempool before running
@@ -28,7 +44,9 @@ async def test_handle_valid_transaction(node, dummy_writer):
     state_mod.mempool_manager.tx_sizes.clear()
     state_mod.mempool_manager.current_memory_usage = 0
 
-    await node.handle_gossip_message(tx_msg, ("somepeer", 1234), dummy_writer)
+    # Mock serialize_transaction to avoid complex binary serialization
+    with patch('blockchain.blockchain.serialize_transaction', return_value="00"):
+        await node.handle_gossip_message(tx_msg, ("somepeer", 1234), dummy_writer)
 
     # The gossip code calculates its own txid from the message content
     # We need to check that SOME transaction was added (not the specific txid)

@@ -83,7 +83,11 @@ def calculate_next_bits(
     
     # Calculate expected time
     expected_time = BLOCK_TIME_TARGET * (block_count - 1)  # -1 because we measure between blocks
-    
+
+    # Guard against division-by-zero when block_count <= 1
+    if expected_time <= 0:
+        expected_time = BLOCK_TIME_TARGET
+
     # Prevent negative or zero time
     if actual_time <= 0:
         logger.warning(f"Invalid actual time: {actual_time}, using expected time")

@@ -10,6 +10,7 @@ import base64
 import json
 import time
 import importlib
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 import pytest
@@ -22,16 +23,16 @@ web_mod = importlib.import_module("web.web")   # web/web.py
 app = web_mod.app                              # the FastAPI instance
 
 
-@pytest.mark.stub_verify          # use the “always-True” verifier stub
+@pytest.mark.stub_verify          # use the "always-True" verifier stub
 def test_broadcast_tx_success(_stub_database):
     """
-    • Seeds an unspent UTXO so the sender has funds.
-    • Sends a JSON payload with base64-encoded message/signature/pubkey.
-    • Expects 200 OK, status=="success", a tx_id, and that the in-process
+    - Seeds an unspent UTXO so the sender has funds.
+    - Sends a JSON payload with base64-encoded message/signature/pubkey.
+    - Expects 200 OK, status=="success", a tx_id, and that the in-process
       gossip client gets called with the transaction.
     """
     # ------------------------------------------------------------------ #
-    # 1.  Fake gossip client that records the transaction it’s sent      #
+    # 1.  Fake gossip client that records the transaction it's sent      #
     # ------------------------------------------------------------------ #
     class DummyGossip:
         def __init__(self):
@@ -50,14 +51,22 @@ def test_broadcast_tx_success(_stub_database):
     receiver = "bqs1receiverwallet00000000000000000000000"
     amount   = "1"
     db = _stub_database                                 # provided by conftest
-    db[b"utxo:coinbase001"] = json.dumps({
+
+    # Store UTXO with correct key format (txid:utxo_index)
+    utxo_data = {
         "txid": "coinbase001",
         "utxo_index": 0,
         "sender":  "",
         "receiver": sender,
         "amount":  "10",
         "spent":   False,
-    }).encode()
+    }
+    db[b"utxo:coinbase001:0"] = json.dumps(utxo_data).encode()
+
+    # Populate the wallet index so get_wallet_utxos finds this UTXO
+    db[f"wallet_utxo_set:{sender}".encode()] = json.dumps(
+        ["utxo:coinbase001:0"]
+    ).encode()
 
     # ------------------------------------------------------------------ #
     # 3.  Build the request payload                                      #
@@ -72,8 +81,10 @@ def test_broadcast_tx_success(_stub_database):
         "pubkey":    base64.b64encode(b"dummy-pub").decode(),
     }
 
-    client = TestClient(app)
-    resp   = client.post("/worker", json=payload)
+    # Mock derive_qsafe_address since dummy pubkey won't derive correctly
+    with patch('web.web.derive_qsafe_address', return_value=sender):
+        client = TestClient(app)
+        resp   = client.post("/worker", json=payload)
 
     # ------------------------------------------------------------------ #
     # 4.  Assertions                                                     #

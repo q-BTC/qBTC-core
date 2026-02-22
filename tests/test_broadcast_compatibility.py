@@ -56,28 +56,17 @@ def test_broadcast_tx_old_format_compatibility(_stub_database):
     client = TestClient(app)
     resp = client.post("/worker", json=payload)
 
-    # Should succeed
-    assert resp.status_code == 200
+    # Old 3-part format is now explicitly rejected by the security hardening
+    assert resp.status_code == 400
     body = resp.json()
-    assert body["status"] == "success"
-    assert "txid" in body
-
-    # Check that the transaction was upgraded with timestamp and chain_id
-    assert dummy_gossip.received is not None
-    tx_body = dummy_gossip.received["body"]
-    msg_parts = tx_body["msg_str"].split(":")
-    
-    # Should have 5 parts now: sender:receiver:amount:timestamp:chain_id
-    assert len(msg_parts) == 5
-    assert msg_parts[0] == sender
-    assert msg_parts[1] == receiver
-    assert msg_parts[2] == amount
-    # Check timestamp is reasonable (within last minute)
-    timestamp = int(msg_parts[3])
-    assert timestamp > (time.time() - 60) * 1000
-    assert timestamp < (time.time() + 60) * 1000
-    # Check chain_id is 1 (default)
-    assert msg_parts[4] == "1"
+    assert "error" in body
+    # Verify the error is specifically about the deprecated format
+    error_msg = ""
+    if isinstance(body["error"], dict):
+        error_msg = body["error"].get("message", "")
+    elif isinstance(body["error"], str):
+        error_msg = body["error"]
+    assert "deprecated" in error_msg.lower() or "3-part" in error_msg.lower() or "format" in error_msg.lower()
 
 
 @pytest.mark.stub_verify

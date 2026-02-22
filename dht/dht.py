@@ -29,6 +29,9 @@ except ImportError:
 kad_server = None
 own_ip = None
 
+# C9: Per-IP rate limiting for validator registrations (Sybil resistance)
+_validator_registration_ips: dict[str, list[float]] = {}  # ip -> list of timestamps
+
 def b2s(v: bytes | str | None) -> str | None:
     """Decode bytes from DB/DHT to str; leave str or None unchanged."""
     return v.decode() if isinstance(v, bytes) else v
@@ -182,8 +185,28 @@ async def run_kad_server(port, bootstrap_addr=None, wallet=None, gossip_node=Non
     
     return kad_server
 
+def _check_validator_ip_rate_limit(ip: str) -> bool:
+    """Check if an IP has exceeded the validator registration rate limit (C9)."""
+    from config.config import MAX_VALIDATORS_PER_IP
+    now = time.time()
+    timestamps = _validator_registration_ips.get(ip, [])
+    # Remove entries older than 1 hour
+    timestamps = [t for t in timestamps if now - t < 3600]
+    _validator_registration_ips[ip] = timestamps
+    if len(timestamps) >= MAX_VALIDATORS_PER_IP:
+        logger.warning(f"Sybil protection: IP {ip} exceeded {MAX_VALIDATORS_PER_IP} validator registrations per hour")
+        return False
+    timestamps.append(now)
+    return True
+
+
 async def register_validator_once():
     """Register validator using individual keys to avoid race conditions"""
+    # C9: Check per-IP rate limit before registering
+    if own_ip and not _check_validator_ip_rate_limit(own_ip):
+        logger.error(f"Validator registration blocked by per-IP rate limit for {own_ip}")
+        return
+
     max_retries = 5
     for attempt in range(max_retries):
         try:
@@ -203,7 +226,8 @@ async def register_validator_once():
             # Use retry-and-re-merge to mitigate TOCTOU race:
             # If another validator registered between our read and write,
             # re-read and merge again to avoid overwriting their entry.
-            for merge_attempt in range(3):
+            import random as _random
+            for merge_attempt in range(5):
                 try:
                     existing_json = b2s(await kad_server.get(VALIDATORS_LIST_KEY))
                     all_validators = known_validators.copy()
@@ -224,8 +248,9 @@ async def register_validator_once():
                             break
                         else:
                             # Our write was overwritten by another validator — re-merge
-                            logger.warning(f"Validator list write conflict (attempt {merge_attempt + 1}), re-merging")
-                            await asyncio.sleep(0.5 * (merge_attempt + 1))
+                            logger.warning(f"Validator list write conflict (attempt {merge_attempt + 1}/5), re-merging")
+                            # Random jitter to prevent thundering herd
+                            await asyncio.sleep(0.1 + _random.random() * 1.0)
                             continue
                     else:
                         logger.info(f"Updated validator list with {len(all_validators)} validators")
@@ -233,7 +258,10 @@ async def register_validator_once():
                 except Exception as e:
                     logger.warning(f"Failed to update validator list (attempt {merge_attempt + 1}): {e}")
                     break
-            
+            else:
+                # Exhausted all merge attempts
+                logger.critical(f"Failed to merge validator list after 5 attempts — TOCTOU conflict unresolved")
+
             return  # Success
             
         except Exception as e:

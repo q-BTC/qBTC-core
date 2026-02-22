@@ -726,6 +726,10 @@ class ChainManager:
             # Compute Median Time Past (MTP) for enhanced timestamp security
             mtp = get_median_time_past(height, self.block_index, self.db)
 
+            # After sufficient chain height, MTP must be computable
+            if mtp is None and height > 11:
+                return False, f"Cannot compute MTP at height {height} — rejecting block (insufficient block data for MTP)"
+
             # During sync, we can't use current time for historical blocks
             # But we still enforce MTP to prevent timestamp manipulation
             if self.is_syncing:
@@ -1588,7 +1592,19 @@ class ChainManager:
         logger.warning(f"Starting chain reorganization to {new_tip_hash}")
         
         current_tip, _ = await self.get_best_chain_tip()
-        
+
+        # Quick height-based depth pre-check to avoid wasting resources
+        current_info = self.block_index.get(current_tip, {})
+        new_tip_info = self.block_index.get(new_tip_hash, {})
+        current_height = current_info.get("height", 0)
+        new_tip_height = new_tip_info.get("height", 0)
+        if abs(current_height - new_tip_height) > MAX_REORG_DEPTH:
+            logger.error(
+                f"Rejecting reorg: height difference {abs(current_height - new_tip_height)} "
+                f"exceeds MAX_REORG_DEPTH ({MAX_REORG_DEPTH})"
+            )
+            return False
+
         # Find common ancestor
         common_ancestor = self._find_common_ancestor(current_tip, new_tip_hash)
         if not common_ancestor:

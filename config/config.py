@@ -82,3 +82,15 @@ GOSSIP_RATE_LIMIT_QUERY = int(os.getenv("GOSSIP_RATE_LIMIT_QUERY", "60"))
 GOSSIP_RATE_LIMIT_DEFAULT = int(os.getenv("GOSSIP_RATE_LIMIT_DEFAULT", "120"))
 MAX_PEERS_PER_SUBNET = int(os.getenv("MAX_PEERS_PER_SUBNET", "4"))  # /16 netgroup limit
 NUM_ANCHOR_PEERS = int(os.getenv("NUM_ANCHOR_PEERS", "2"))
+
+# Security hardening constants
+MAX_WS_CONNECTIONS = int(os.getenv("MAX_WS_CONNECTIONS", "100"))
+MAX_WS_PER_IP = int(os.getenv("MAX_WS_PER_IP", "5"))
+TRUSTED_PROXIES = set(
+    p.strip() for p in os.getenv("TRUSTED_PROXIES", "127.0.0.1,172.17.0.1,192.168.65.1").split(",") if p.strip()
+)
+RPC_ALLOW_REMOTE = os.getenv("RPC_ALLOW_REMOTE", "false").lower() == "true"
+BANNED_PEER_DURATION = int(os.getenv("BANNED_PEER_DURATION", "300"))  # 5 minutes
+MAX_VALIDATORS_PER_IP = int(os.getenv("MAX_VALIDATORS_PER_IP", "3"))
+MIN_PASSWORD_LENGTH = int(os.getenv("MIN_PASSWORD_LENGTH", "12"))
+MAX_CONNECTIONS_PER_IP = int(os.getenv("MAX_CONNECTIONS_PER_IP", "2"))

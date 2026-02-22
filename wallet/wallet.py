@@ -45,9 +45,11 @@ def _pbkdf2_key(password: str, salt: bytes) -> bytes:
         salt=salt, iterations=_PBKDF2_ROUNDS
     ).derive(password.encode())
 
+_WALLET_AAD = b"qbtc-wallet-v1"  # M1: Associated Authenticated Data for AES-GCM
+
 def _encrypt_privkey(priv_hex: str, password: str):
     salt, iv = os.urandom(_SALT_LEN), os.urandom(_IV_LEN)
-    ct_tag = AESGCM(_pbkdf2_key(password, salt)).encrypt(iv, priv_hex.encode(), None)
+    ct_tag = AESGCM(_pbkdf2_key(password, salt)).encrypt(iv, priv_hex.encode(), _WALLET_AAD)
     return (
         base64.b64encode(ct_tag).decode(),
         base64.b64encode(salt).decode(),
@@ -56,7 +58,26 @@ def _encrypt_privkey(priv_hex: str, password: str):
 
 def _decrypt_privkey(enc_b64, password, salt_b64, iv_b64) -> str:
     ct_tag, salt, iv = map(base64.b64decode, (enc_b64, salt_b64, iv_b64))
-    return AESGCM(_pbkdf2_key(password, salt)).decrypt(iv, ct_tag, None).decode()
+    try:
+        return AESGCM(_pbkdf2_key(password, salt)).decrypt(iv, ct_tag, _WALLET_AAD).decode()
+    except Exception:
+        # Fallback: try without AAD for backwards compatibility with pre-v1 wallets
+        return AESGCM(_pbkdf2_key(password, salt)).decrypt(iv, ct_tag, None).decode()
+
+
+def validate_password_strength(password: str) -> tuple[bool, str]:
+    """M6: Validate password meets minimum strength requirements.
+    Returns (is_valid, error_message)."""
+    from config.config import MIN_PASSWORD_LENGTH
+    if not password or len(password) < MIN_PASSWORD_LENGTH:
+        return False, f"Password must be at least {MIN_PASSWORD_LENGTH} characters"
+    if not any(c.isupper() for c in password):
+        return False, "Password must contain at least 1 uppercase letter"
+    if not any(c.islower() for c in password):
+        return False, "Password must contain at least 1 lowercase letter"
+    if not any(c.isdigit() for c in password):
+        return False, "Password must contain at least 1 digit"
+    return True, ""
 
 
 def load_wallet_file(fname=WALLET_FILENAME) -> Optional[dict]:
@@ -144,6 +165,11 @@ def get_or_create_wallet(fname=WALLET_FILENAME, password: str | None = None):
         password = getpass.getpass("Enter a new password: ")
         if password != getpass.getpass("Confirm password: "):
             logging.error("Passwords do not match"); sys.exit(1)
+
+    # M6: Enforce password strength for new wallets
+    pw_valid, pw_error = validate_password_strength(password)
+    if not pw_valid:
+        logging.error(f"Weak password: {pw_error}"); sys.exit(1)
 
     wallet_json = generate_wallet(password)
     save_wallet_file(wallet_json, fname)

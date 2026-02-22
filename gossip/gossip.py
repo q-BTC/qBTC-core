@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import time
@@ -16,6 +17,8 @@ from config.config import (
     GOSSIP_RATE_LIMIT_DEFAULT,
     MAX_PEERS_PER_SUBNET,
     NUM_ANCHOR_PEERS,
+    BANNED_PEER_DURATION,
+    MAX_CONNECTIONS_PER_IP,
 )
 from state.state import mempool_manager
 from wallet.wallet import verify_transaction
@@ -40,8 +43,16 @@ except ImportError:
     NAT_TRAVERSAL_AVAILABLE = False
 
 GENESIS_HASH = "0" * 64
-MAX_LINE_BYTES = 30 * 1024 * 1024
+MAX_LINE_BYTES = 5 * 1024 * 1024  # 5MB — sufficient for largest valid block
 MAX_SEEN_TX_SIZE = 10000  # Maximum number of transaction IDs to remember
+
+# Known valid gossip message types for deserialization safety (C12)
+_VALID_MSG_TYPES = {
+    "transaction", "blocks_response", "blocks_by_hash_response",
+    "blocks_response_chunked", "get_height", "get_blocks",
+    "get_blocks_by_hash", "get_transactions", "height_response",
+    "transactions_response", "error",
+}
 
 # Map gossip message types to rate-limit categories
 _MSG_TYPE_CATEGORY = {
@@ -132,6 +143,10 @@ class GossipNode:
         self.gossip_rate_limiter = GossipRateLimiter()
         self.inbound_connections = 0
         self._inbound_lock = asyncio.Lock()
+        # H7: Temporary ban tracking {ip: expiry_timestamp}
+        self.banned_peers: dict[str, float] = {}
+        # C13: Per-IP connection tracking {ip: active_count}
+        self.connections_per_ip: dict[str, int] = {}
         # Subnet diversity: /16 prefix -> count of connected peers
         self.subnet_counts: dict[str, int] = {}
         # Anchor peers file path (persistent across restarts)
@@ -164,9 +179,24 @@ class GossipNode:
             f"rate_window={GOSSIP_RATE_LIMIT_WINDOW}s, subnet_limit={MAX_PEERS_PER_SUBNET})"
         )
 
+    def _cleanup_expired_bans(self):
+        """Remove expired bans from the banned_peers dict."""
+        now = time.time()
+        expired = [ip for ip, expiry in self.banned_peers.items() if now >= expiry]
+        for ip in expired:
+            del self.banned_peers[ip]
+
     async def handle_client(self, reader: StreamReader, writer: StreamWriter):
         peer_info = writer.get_extra_info('peername')
         peer_ip, peer_port = peer_info[0], peer_info[1]
+
+        # H7: Check if peer is temporarily banned
+        self._cleanup_expired_bans()
+        if peer_ip in self.banned_peers:
+            logger.warning(f"Rejecting banned peer {peer_ip}:{peer_port}")
+            writer.close()
+            await writer.wait_closed()
+            return
 
         # --- Inbound connection limit ---
         async with self._inbound_lock:
@@ -178,7 +208,18 @@ class GossipNode:
                 writer.close()
                 await writer.wait_closed()
                 return
+            # C13: Per-IP connection limit
+            current_ip_conns = self.connections_per_ip.get(peer_ip, 0)
+            if current_ip_conns >= MAX_CONNECTIONS_PER_IP:
+                logger.warning(
+                    f"Rejecting {peer_ip}:{peer_port} — IP already has "
+                    f"{current_ip_conns}/{MAX_CONNECTIONS_PER_IP} connections"
+                )
+                writer.close()
+                await writer.wait_closed()
+                return
             self.inbound_connections += 1
+            self.connections_per_ip[peer_ip] = current_ip_conns + 1
 
         logger.info(f"New peer connection: {peer_ip}:{peer_port}")
 
@@ -187,6 +228,11 @@ class GossipNode:
             logger.warning(f"Rejecting connection from banned/malicious peer {peer_ip}:{peer_port}")
             async with self._inbound_lock:
                 self.inbound_connections -= 1
+                ip_count = self.connections_per_ip.get(peer_ip, 1)
+                if ip_count <= 1:
+                    self.connections_per_ip.pop(peer_ip, None)
+                else:
+                    self.connections_per_ip[peer_ip] = ip_count - 1
             writer.close()
             await writer.wait_closed()
             return
@@ -205,17 +251,37 @@ class GossipNode:
                 if not line:
                     break
 
+                # C12: Explicit line size check before parsing
+                if len(line) > MAX_LINE_BYTES:
+                    logger.warning(f"Oversized message ({len(line)} bytes) from {peer_ip}:{peer_port} — disconnecting")
+                    peer_reputation_manager.record_spam_message(peer_ip, peer_port)
+                    break
+
                 try:
-                    msg = json.loads(line.decode('utf-8').strip())
+                    # C12: Guard against deeply nested JSON causing recursion
+                    try:
+                        msg = json.loads(line.decode('utf-8').strip())
+                    except RecursionError:
+                        logger.warning(f"Deeply nested JSON from {peer_ip}:{peer_port} — disconnecting")
+                        peer_reputation_manager.record_invalid_message(peer_ip, peer_port, "recursion_bomb")
+                        break
+
+                    # C12: Validate required 'type' field and known message type
+                    msg_type = msg.get("type", "unknown")
+                    if not isinstance(msg_type, str) or msg_type not in _VALID_MSG_TYPES:
+                        logger.warning(f"Unknown message type '{msg_type}' from {peer_ip}:{peer_port}")
+                        peer_reputation_manager.record_invalid_message(peer_ip, peer_port, f"unknown_type:{msg_type}")
+                        continue  # skip unknown types but don't disconnect
 
                     # --- Per-peer gossip rate limiting ---
-                    msg_type = msg.get("type", "unknown")
                     if not self.gossip_rate_limiter.check_rate_limit(
                         peer_ip, peer_port, msg_type
                     ):
+                        # H7: Ban peer for BANNED_PEER_DURATION on rate limit violation
+                        self.banned_peers[peer_ip] = time.time() + BANNED_PEER_DURATION
                         logger.warning(
                             f"Rate limit exceeded for {peer_ip}:{peer_port} "
-                            f"on {msg_type} — disconnecting"
+                            f"on {msg_type} — banning for {BANNED_PEER_DURATION}s and disconnecting"
                         )
                         peer_reputation_manager.record_spam_message(peer_ip, peer_port)
                         break  # disconnect the flooding peer
@@ -247,9 +313,14 @@ class GossipNode:
                 peer_ip, peer_port, str(e)
             )
         finally:
-            # Decrement inbound counter and clean up rate limiter state
+            # Decrement inbound counter, per-IP counter, and clean up rate limiter state
             async with self._inbound_lock:
                 self.inbound_connections -= 1
+                ip_count = self.connections_per_ip.get(peer_ip, 1)
+                if ip_count <= 1:
+                    self.connections_per_ip.pop(peer_ip, None)
+                else:
+                    self.connections_per_ip[peer_ip] = ip_count - 1
             self.gossip_rate_limiter.cleanup_peer(peer_ip, peer_port)
 
             # Record disconnection
@@ -288,7 +359,16 @@ class GossipNode:
             self.seen_tx_timestamps.pop(txid, None)
     
     async def handle_gossip_message(self, msg, from_peer, writer):
-        db = get_db()  
+        # M2: Verify message integrity hash if present
+        received_hash = msg.pop("msg_hash", None)
+        if received_hash is not None:
+            verify_json = json.dumps(msg, sort_keys=True)
+            expected_hash = hashlib.sha256(verify_json.encode('utf-8')).hexdigest()
+            if received_hash != expected_hash:
+                logger.warning(f"Message integrity check failed from {from_peer} — possible corruption")
+                # Don't reject (could be benign serialization difference), just log
+
+        db = get_db()
         msg_type = msg.get("type")
         timestamp = msg.get("timestamp", int(time.time() * 1000))
         txid = msg.get("txid")
@@ -806,6 +886,9 @@ class GossipNode:
         # Log broadcast details
         logger.info(f"Broadcasting {msg_type} to {len(peers_to_send)} peers: {peers_to_send}")
         
+        # M2: Add message integrity hash for corruption detection
+        msg_json = json.dumps(msg_dict, sort_keys=True)
+        msg_dict["msg_hash"] = hashlib.sha256(msg_json.encode('utf-8')).hexdigest()
         payload = (json.dumps(msg_dict) + "\n").encode('utf-8')
         results = await asyncio.gather(
             *[self._send_message(p, payload) for p in peers_to_send],

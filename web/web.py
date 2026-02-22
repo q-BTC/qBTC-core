@@ -171,14 +171,41 @@ class WebSocketManager:
         self.wallet_map: Dict[str, Set[WebSocket]] = {}
         self.bridge_sessions: Dict[str, Dict] = {}
         self.background_tasks: Dict[str, asyncio.Task] = {}
+        # H6: Per-IP connection tracking for WebSocket limits
+        self._ws_ip_counts: Dict[str, int] = {}
 
     async def connect(self, websocket: WebSocket):
+        from config.config import MAX_WS_CONNECTIONS, MAX_WS_PER_IP
+
+        # H6: Enforce total WebSocket connection limit
+        if len(self.active_connections) >= MAX_WS_CONNECTIONS:
+            logger.warning(f"WebSocket connection rejected — at total limit ({MAX_WS_CONNECTIONS})")
+            await websocket.close(code=1008, reason="Server connection limit reached")
+            return False
+
+        # H6: Enforce per-IP WebSocket connection limit
+        client_ip = websocket.client.host if websocket.client else "unknown"
+        current_ip_count = self._ws_ip_counts.get(client_ip, 0)
+        if current_ip_count >= MAX_WS_PER_IP:
+            logger.warning(f"WebSocket connection rejected for {client_ip} — at per-IP limit ({MAX_WS_PER_IP})")
+            await websocket.close(code=1008, reason="Per-IP connection limit reached")
+            return False
+
         await websocket.accept()
         self.active_connections[websocket] = set()
+        self._ws_ip_counts[client_ip] = current_ip_count + 1
+        return True
 
     async def disconnect(self, websocket: WebSocket):
         if websocket in self.active_connections:
             self.active_connections.pop(websocket)
+            # H6: Decrement per-IP WebSocket count
+            client_ip = websocket.client.host if websocket.client else "unknown"
+            ip_count = self._ws_ip_counts.get(client_ip, 1)
+            if ip_count <= 1:
+                self._ws_ip_counts.pop(client_ip, None)
+            else:
+                self._ws_ip_counts[client_ip] = ip_count - 1
             for wallet in list(self.wallet_map.keys()):
                 if websocket in self.wallet_map[wallet]:
                     self.wallet_map[wallet].discard(websocket)
@@ -1137,8 +1164,10 @@ async def worker_endpoint(request: Request):
 async def websocket_endpoint(websocket: WebSocket):
     logging.info(f"WebSocket connection attempt from {websocket.client} with headers: {dict(websocket.headers)}")
     try:
+        accepted = await websocket_manager.connect(websocket)
+        if not accepted:
+            return
         logging.info(f"WebSocket accepted: {websocket.client}")
-        await websocket_manager.connect(websocket)
         while True:
             try:
                 data = await websocket.receive_json()
