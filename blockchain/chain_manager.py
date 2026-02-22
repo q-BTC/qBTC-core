@@ -1395,14 +1395,16 @@ class ChainManager:
             block_hash = block_data.get("previous_hash")
             height -= 1
         
-        # Actually disconnect the blocks
+        # Actually disconnect the blocks — collect deferred mempool txs
         batch = WriteBatch()
         utxo_backups = {}  # Track UTXO states for potential rollback
         utxo_overlay = {}  # Consistent reads during multi-block disconnect
+        all_deferred_txs = []
         for block_hash, block_data in blocks_to_disconnect:
             logger.info(f"[REWIND] Disconnecting block {block_hash} at height {block_data.get('height')}")
-            self._disconnect_block(block_hash, batch, utxo_backups, utxo_overlay)
-        
+            deferred = self._disconnect_block(block_hash, batch, utxo_backups, utxo_overlay)
+            all_deferred_txs.extend(deferred)
+
         # Update best block to the new tip using the correct key
         new_tip_hash = blocks_to_disconnect[-1][1].get("previous_hash")
         if new_tip_hash:
@@ -1411,13 +1413,16 @@ class ChainManager:
                 "height": target_height
             }).encode())
             logger.warning(f"[REWIND] New chain tip: {new_tip_hash} at height {target_height}")
-        
+
         # Write the batch atomically
         self.db.write(batch)
-        
+
+        # Re-add disconnected txs to mempool AFTER batch commit
+        self._readd_to_mempool(all_deferred_txs)
+
         # Invalidate height cache
         invalidate_height_cache()
-        
+
         return True
     
     async def _evaluate_orphan_chains(self):
@@ -1628,12 +1633,14 @@ class ChainManager:
             # Track UTXOs restored (unspent) by disconnection for cross-checking
             restored_utxos = set()
             utxo_overlay = {}  # Tracks pending UTXO changes for consistent reads
+            all_deferred_txs = []  # Collect txs for deferred mempool re-add
             for block_hash in blocks_to_disconnect:
                 # Backup block state before disconnecting
                 block_key = f"block:{block_hash}".encode()
                 backup_state["block_states"][block_hash] = self.db.get(block_key)
 
-                self._disconnect_block(block_hash, batch, backup_state["utxo_backups"], utxo_overlay)
+                deferred = self._disconnect_block(block_hash, batch, backup_state["utxo_backups"], utxo_overlay)
+                all_deferred_txs.extend(deferred)
 
             # Collect the set of UTXOs that were restored (marked unspent) during disconnect
             for utxo_key_str, _ in backup_state["utxo_backups"].items():
@@ -1693,7 +1700,11 @@ class ChainManager:
 
             # Commit the reorganization atomically - ALL changes in one write
             self.db.write(batch)
-            
+
+            # Re-add disconnected txs to mempool AFTER batch commit
+            # so mempool validation sees the updated UTXO state
+            self._readd_to_mempool(all_deferred_txs)
+
             logger.info(f"Chain reorganization complete. New tip: {new_tip_hash}")
             
             # Update caches after reorganization
@@ -1821,9 +1832,10 @@ class ChainManager:
         return transactions
     
     def _disconnect_block(self, block_hash: str, batch: WriteBatch, utxo_backups: Dict[str, bytes],
-                          utxo_overlay: Dict[bytes, Optional[bytes]] = None):
+                          utxo_overlay: Dict[bytes, Optional[bytes]] = None) -> List[dict]:
         """Disconnect a block from the active chain (revert its effects).
-        utxo_overlay provides consistent reads during multi-block disconnect."""
+        utxo_overlay provides consistent reads during multi-block disconnect.
+        Returns list of non-coinbase transactions to re-add to mempool AFTER batch commit."""
         logger.info(f"Disconnecting block {block_hash}")
 
         if utxo_overlay is None:
@@ -1833,7 +1845,7 @@ class ChainManager:
         block_key = f"block:{block_hash}".encode()
         block_data = json.loads(self.db.get(block_key).decode())
 
-        # Get full transactions to re-add to mempool
+        # Get full transactions for deferred mempool re-add
         full_transactions = self._get_block_transactions(block_data)
 
         # Revert all transactions in this block
@@ -1842,33 +1854,42 @@ class ChainManager:
             # Remove tx_block index entry
             tx_block_key = f"tx_block:{txid}".encode()
             batch.delete(tx_block_key)
-        
-        # Re-add non-coinbase transactions back to mempool
-        # (they might be valid again after reorg)
-        readded_count = 0
-        for tx in full_transactions:
-            if tx and "txid" in tx and not self.validator._is_coinbase_transaction(tx):
-                try:
-                    # Try to add back to mempool - it might fail if invalid
-                    success, _ = mempool_manager.add_transaction(tx)
-                    if success:
-                        readded_count += 1
-                except Exception as e:
-                    logger.debug(f"Could not re-add transaction {tx.get('txid')} to mempool: {e}")
-        
-        if readded_count > 0:
-            logger.info(f"Re-added {readded_count} transactions to mempool after disconnecting block {block_hash}")
-        
+
+        # Collect non-coinbase transactions for deferred mempool re-add.
+        # Callers must re-add these AFTER the WriteBatch commits to ensure
+        # the DB state is consistent before mempool validation runs.
+        deferred_txs = [
+            tx for tx in full_transactions
+            if tx and "txid" in tx and not self.validator._is_coinbase_transaction(tx)
+        ]
+
         # Mark block as disconnected (don't delete - might reconnect later)
         block_data["connected"] = False
         # Normalize before storing
         block_data = normalize_block(block_data, add_defaults=False)
         batch.put(block_key, json.dumps(block_data).encode())
-        
+
         # Remove from height index during disconnection
         height_index = get_height_index()
         height_index.remove_block_from_index(block_data["height"])
+
+        return deferred_txs
     
+    def _readd_to_mempool(self, deferred_txs: List[dict]):
+        """Re-add disconnected transactions to mempool after batch commit.
+        Must only be called AFTER the WriteBatch has been committed so the
+        mempool validates against the updated UTXO state."""
+        readded = 0
+        for tx in deferred_txs:
+            try:
+                success, _ = mempool_manager.add_transaction(tx)
+                if success:
+                    readded += 1
+            except Exception as e:
+                logger.debug(f"Could not re-add transaction {tx.get('txid')} to mempool: {e}")
+        if readded > 0:
+            logger.info(f"Re-added {readded}/{len(deferred_txs)} transactions to mempool after disconnect")
+
     def _connect_block(self, block_data: dict, batch: WriteBatch):
         """Connect a block to the active chain (apply its effects)"""
         logger.info(f"Connecting block {block_data['block_hash']} at height {block_data['height']}")

@@ -299,7 +299,19 @@ class GossipNode:
 
         if msg_type == "transaction":
             self.tx_stats['received'] += 1
-            
+
+            # --- Cheap structural checks BEFORE expensive ML-DSA-87 sig verification ---
+            body = msg.get("body")
+            if not body or not isinstance(body, dict):
+                self.tx_stats['invalid'] += 1
+                return
+            if not all(k in body for k in ("msg_str", "signature", "pubkey")):
+                self.tx_stats['invalid'] += 1
+                return
+            if not msg.get("inputs") or not msg.get("outputs"):
+                self.tx_stats['invalid'] += 1
+                return
+
             # Recalculate txid to ensure consistency
             from blockchain.blockchain import serialize_transaction, sha256d
             msg_copy = msg.copy()
@@ -307,28 +319,31 @@ class GossipNode:
                 del msg_copy["txid"]
             raw_tx = serialize_transaction(msg_copy)
             calculated_txid = sha256d(bytes.fromhex(raw_tx))[::-1].hex()
-            
+
             # Verify txid matches
             if txid and txid != calculated_txid:
                 logger.warning(f"[TX MISMATCH] Received txid {txid} but calculated {calculated_txid}")
                 txid = calculated_txid  # Use the calculated one for consistency
             else:
                 txid = calculated_txid
-            
-            # Check for duplicates BEFORE logger
+
+            # --- All cheap duplicate / already-confirmed checks before sig verification ---
             if txid in self.seen_tx:
-                # Transaction was already seen and processed
                 self.tx_stats['duplicates'] += 1
                 return
             if mempool_manager.get_transaction(txid) is not None:
-                # Transaction is already in mempool
                 self.tx_stats['duplicates'] += 1
                 return
-            
+            # Check if transaction is already confirmed on-chain
+            if db.get(f"tx:{txid}".encode()):
+                self.tx_stats['duplicates'] += 1
+                return
+
             # Only log if this is a new transaction
             logger.debug(f"Received transaction {txid} from {from_peer}")
 
-            if not verify_transaction(msg["body"]["msg_str"], msg["body"]["signature"], msg["body"]["pubkey"]):
+            # --- Expensive: ML-DSA-87 post-quantum signature verification ---
+            if not verify_transaction(body["msg_str"], body["signature"], body["pubkey"]):
                 logger.warning(f"Transaction {txid} failed verification")
                 self.tx_stats['invalid'] += 1
                 return

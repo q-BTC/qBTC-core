@@ -10,6 +10,7 @@ from fastapi import FastAPI, Request
 # CORSMiddleware removed - nginx handles CORS at the proxy level
 from database.database import get_db, get_current_height
 from config.config import ADMIN_ADDRESS, CHAIN_ID
+from blockchain.difficulty import MAX_FUTURE_TIME
 from blockchain.blockchain import Block, bits_to_target, serialize_transaction,scriptpubkey_to_address, read_varint, parse_tx, validate_pow, sha256d, calculate_merkle_root
 from blockchain.difficulty import get_next_bits
 from blockchain.block_factory import create_block, normalize_block
@@ -350,8 +351,10 @@ async def get_block_template(data):
     from config.config import MAX_TRANSACTIONS_PER_BLOCK
     mempool_txs = mempool_manager.get_transactions_for_block(max_count=MAX_TRANSACTIONS_PER_BLOCK)
     
-    # Also need to check against confirmed UTXOs in database
-    for orig_tx in mempool_txs:
+    # Hold state_lock while checking UTXOs to prevent concurrent block commits
+    # from modifying UTXO state mid-template-build
+    async with state_lock:
+      for orig_tx in mempool_txs:
         tx = copy.deepcopy(orig_tx)
         stored_txid = tx.get("txid")  # Get the txid if it exists
         
@@ -525,7 +528,7 @@ async def submit_block(request: Request, data: dict) -> dict:
             logger.error(f"Block references unknown previous block: {prev_block}")
             return rpc_error(-1, "bad-prevblk", data["id"])
 
-        future_limit = int(time.time()) + 2*60 # 2 mins in the future
+        future_limit = int(time.time()) + MAX_FUTURE_TIME  # 2 hours, consistent with ChainManager
 
         if (timestamp > future_limit):
             logger.warning(f"Block timestamp too far in future: {timestamp}")
