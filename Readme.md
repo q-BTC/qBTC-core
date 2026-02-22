@@ -22,7 +22,7 @@ The cryptographic layer is modular, allowing ML-DSA to be replaced with other po
 - 🔁 **UTXO-Based Ledger** with Merkle root verification
 - 🌱 **Validator Discovery** via Kademlia DHT
 - 📡 **Gossip Protocol** for fast block and transaction propagation
-- 🧠 **Protobuf-encoded Transactions and Blocks**
+- 🧠 **JSON-encoded Transactions and Blocks**
 - 📊 **Prometheus Metrics & Grafana Dashboards**
 - 🔄 **Automatic Genesis Block Creation** (21M coins)
 - 🌐 **Full P2P Networking** with NAT traversal support
@@ -44,7 +44,7 @@ The cryptographic layer is modular, allowing ML-DSA to be replaced with other po
          |                               |
          v                               v
 +-------------------+         +----------------------+
-| Blockchain Logic  | <-----> | Protobuf Structures  |
+| Blockchain Logic  | <-----> | JSON Structures      |
 | - Merkle Root     |         | - Blocks, Txns       |
 | - UTXO State      |         +----------------------+
 | - Chain Manager   |                 |
@@ -159,8 +159,6 @@ The project includes three Docker Compose configurations for different deploymen
 - **docker-compose.test.yml** - Development/testing environment with 3 nodes
 - **docker-compose.bootstrap.yml** - Production bootstrap server with monitoring
 - **docker-compose.validator.yml** - Production validator node that connects to mainnet
-
-For detailed deployment instructions, see [DEPLOYMENT.md](./DEPLOYMENT.md).
 
 ### Quick Start: Test Network (3 Nodes)
 
@@ -323,7 +321,7 @@ All nodes automatically discover each other and maintain peer connections.
 You can broadcast a signed transaction using the test harness:
 
 ```bash
-python3 broadcast_tx_test_harness.py \
+python3 harness.py \
   --node http://localhost:8080 \
   --receiver bqs1Bo4quBsE6f5aitv42X5n1S9kASsphn9At \
   --amount 500 \
@@ -392,7 +390,7 @@ Pre-configured dashboards show:
 - **Rate Limiting**: Redis-based rate limiting on all API endpoints
 - **DDoS Protection**: Integrated security middleware with IP blocking
 - **Peer Reputation**: Automatic tracking and scoring of peer reliability
-- **Secure WebSockets**: Authenticated WebSocket connections for real-time updates
+- **WebSockets**: Real-time updates via WebSocket connections
 
 ### Security Audits
 
