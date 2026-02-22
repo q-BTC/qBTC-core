@@ -737,7 +737,7 @@ async def submit_block(request: Request, data: dict) -> dict:
             "outputs": [{
                 "utxo_index": idx,
                 "receiver": coinbase_miner_address,
-                "amount": str(out.get("value", out.get("amount", "0"))),  # Use value from parsed tx, fallback to amount
+                "amount": str(Decimal(str(out.get("value", out.get("amount", "0")))) / Decimal("100000000")),  # Convert satoshis to qBTC
                 "script_pubkey": out.get("script_pubkey", "")
             } for idx, out in enumerate(coinbase_tx["outputs"])],
             "body": {
