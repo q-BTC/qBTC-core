@@ -1188,7 +1188,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             for idx, tx in enumerate(transactions):
                                 logging.debug(f"WebSocket TX {idx+1}: txid={tx['txid']}, direction={tx['direction']}, from={tx.get('from', 'N/A')}, to={tx.get('to', 'N/A')}, timestamp={tx['timestamp']}")
 
-                                tx_type = "send" if tx["direction"] == "sent" else "receive"
+                                tx_type = "sent" if tx["direction"] == "sent" else "received"
                                 amt_dec = Decimal(tx["amount"])
                                 amount_fmt = f"{abs(amt_dec):.8f} qBTC"
 

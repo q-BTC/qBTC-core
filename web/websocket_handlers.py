@@ -72,17 +72,8 @@ class WebSocketEventHandlers:
             
             # Update all_transactions subscribers
             await self._broadcast_all_transactions_update()
-            
-            # Check for affected wallets from outputs (for regular confirmed transactions)
-            affected_wallets = set()
-            
-            # Try new structure first
-            if transaction.get('sender'):
-                affected_wallets.add(transaction.get('sender'))
-            if transaction.get('receiver'):
-                affected_wallets.add(transaction.get('receiver'))
-            
-            # Fall back to old structure if needed
+
+            # Fall back to old structure if needed (extend the existing set)
             if not affected_wallets:
                 for output in tx_data.get('outputs', []):
                     sender = output.get('sender')
@@ -91,10 +82,11 @@ class WebSocketEventHandlers:
                         affected_wallets.add(sender)
                     if receiver:
                         affected_wallets.add(receiver)
-            
-            # Update each affected wallet
-            for wallet in affected_wallets:
-                await self._broadcast_wallet_update(wallet)
+
+            # Update each affected wallet (immediate, for non-mempool confirmed txs)
+            if not confirmed_from_mempool:
+                for wallet in affected_wallets:
+                    await self._broadcast_wallet_update(wallet)
                 
         except Exception as e:
             logger.error(f"Error handling transaction confirmed: {e}")
@@ -137,11 +129,13 @@ class WebSocketEventHandlers:
             if tx_data.get('receiver'):
                 affected_wallets.add(tx_data.get('receiver'))
             
-            # Broadcast mempool transaction to affected wallet subscribers
+            # Broadcast mempool transaction to affected wallet subscribers (via "combined_update" routing)
             for wallet in affected_wallets:
-                # Send targeted message to wallet subscribers
-                await self.websocket_manager.broadcast(mempool_msg, "mempool_transaction", wallet)
-            
+                await self.websocket_manager.broadcast(mempool_msg, "combined_update", wallet)
+
+            # Also broadcast to explorer subscribers (via "all_transactions" routing)
+            await self.websocket_manager.broadcast(mempool_msg, "all_transactions")
+
             logger.info(f"Broadcasted mempool transaction {txid} to affected wallets: {affected_wallets}")
             
             # Also trigger wallet balance updates
@@ -256,7 +250,7 @@ class WebSocketEventHandlers:
 
             # Now process all transactions with cached block data
             for tx in transactions:
-                tx_type = "send" if tx["direction"] == "sent" else "receive"
+                tx_type = "sent" if tx["direction"] == "sent" else "received"
                 amt_dec = Decimal(tx["amount"])
                 amount_fmt = f"{abs(amt_dec):.8f} qBTC"
 
@@ -334,35 +328,45 @@ class WebSocketEventHandlers:
             logger.error(f"Error broadcasting wallet update: {e}")
     
     async def _broadcast_l1_proofs_update(self):
-        """Broadcast L1 proofs update"""
+        """Broadcast L1 proofs update — O(50) via height index instead of full DB scan"""
         try:
+            from blockchain.block_height_index import get_height_index
+
             db = get_db()
-            proofs = {}
-            
-            for key, value in db.items():
-                if key.startswith(b"block:"):
-                    block = json.loads(value.decode())
-                    tx_ids = block["tx_ids"]
-                    proofs[block["height"]] = {
-                        "blockHeight": block["height"],
-                        "merkleRoot": block["block_hash"],
-                        "bitcoinTxHash": None,
-                        "timestamp": datetime.fromtimestamp(block["timestamp"] / 1000).isoformat(),
-                        "transactions": [
-                            {"id": tx_id, "hash": tx_id, "status": "confirmed"}
-                            for tx_id in tx_ids
-                        ],
-                        "status": "confirmed"
-                    }
-            
+            height_index = get_height_index()
+            current_height_tuple = await get_current_height(db)
+            current_height = current_height_tuple[0] if current_height_tuple else None
+
+            if current_height is None:
+                logger.warning("Cannot broadcast L1 proofs: current height unknown")
+                return
+
+            proofs = []
+            for h in range(max(0, current_height - 50), current_height + 1):
+                block = height_index.get_block_by_height(h)
+                if not block:
+                    continue
+                tx_ids = block.get("tx_ids", [])
+                proofs.append({
+                    "blockHeight": block["height"],
+                    "merkleRoot": block["block_hash"],
+                    "bitcoinTxHash": None,
+                    "timestamp": datetime.fromtimestamp(block["timestamp"] / 1000).isoformat(),
+                    "transactions": [
+                        {"id": tx_id, "hash": tx_id, "status": "confirmed"}
+                        for tx_id in tx_ids
+                    ],
+                    "status": "confirmed"
+                })
+
             update_data = {
                 "type": "l1proof_update",
-                "proofs": list(proofs.values()),
+                "proofs": proofs,
                 "timestamp": datetime.now().isoformat()
             }
-            
+
             await self.websocket_manager.broadcast(update_data, "l1_proofs_testnet")
-            
+
         except Exception as e:
             logger.error(f"Error broadcasting L1 proofs: {e}")
     
