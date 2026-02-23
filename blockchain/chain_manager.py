@@ -238,6 +238,8 @@ class ChainManager:
                 }
 
                 block_count += 1
+                if block_count % 500 == 0:
+                    await asyncio.sleep(0)
                 if block_count % 1000 == 0:
                     logger.info(f"Processed {block_count} blocks...")
         

@@ -221,7 +221,7 @@ class WalletIndexManager:
             self._invalidate_balance(address, batch)
         
         if not use_batch:
-            self.db.write_batch(batch)
+            self.db.write(batch)
     
     def _add_to_tx_list(self, address: str, txid: str, batch):
         """Add transaction to wallet's transaction list."""
@@ -352,7 +352,7 @@ class WalletIndexManager:
             b"tx_by_receiver:"
         ]
         
-        for key in list(self.db.keys()):
+        for key, _ in self.db.items():
             for prefix in prefixes_to_clear:
                 if key.startswith(prefix):
                     batch.delete(key)
@@ -369,7 +369,7 @@ class WalletIndexManager:
             "cache_size": len(self._cache)
         }
         
-        for key in self.db.keys():
+        for key, _ in self.db.items():
             if key.startswith(b"wallet_balance:"):
                 stats["wallet_balances"] += 1
             elif key.startswith(b"wallet_tx:"):

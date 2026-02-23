@@ -6,7 +6,6 @@ import json
 import logging
 from typing import Optional, Dict, Any, List
 from decimal import Decimal
-import threading
 
 try:
     import redis
@@ -33,7 +32,6 @@ class BlockchainRedisCache:
     def __init__(self, redis_url: Optional[str] = None):
         self.redis_client = None
         self.enabled = False
-        self._lock = threading.Lock()
         
         if redis_url and REDIS_AVAILABLE:
             try:
@@ -71,11 +69,10 @@ class BlockchainRedisCache:
             return None
 
         try:
-            with self._lock:
-                logger.debug(f"Executing Redis operation: {func.__name__} with args: {args[:2] if args else 'none'}...")
-                result = func(*args, **kwargs)
-                logger.debug(f"Redis operation {func.__name__} completed with result: {result}")
-                return result
+            logger.debug(f"Executing Redis operation: {func.__name__} with args: {args[:2] if args else 'none'}...")
+            result = func(*args, **kwargs)
+            logger.debug(f"Redis operation {func.__name__} completed with result: {result}")
+            return result
         except Exception as e:
             logger.error(f"Redis operation failed: {e}")
             return None
@@ -312,6 +309,43 @@ class BlockchainRedisCache:
         except Exception as e:
             logger.error(f"Failed to update height index entry: {e}")
     
+    def delete_best_chain_info(self):
+        """Delete cached best chain information"""
+        if not self.enabled:
+            return
+        try:
+            self._execute(self.redis_client.delete, "blockchain:best_chain")
+        except Exception as e:
+            logger.error(f"Failed to delete best chain info: {e}")
+
+    def remove_chain_index_entry(self, block_hash: str):
+        """Remove a single entry from the cached chain index"""
+        if not self.enabled:
+            return
+        try:
+            cached_data = self.get_chain_index()
+            if cached_data and block_hash in cached_data.get("block_index", {}):
+                del cached_data["block_index"][block_hash]
+                # Remove from chain tips if present
+                tips = cached_data.get("chain_tips", [])
+                if block_hash in tips:
+                    tips.remove(block_hash)
+                self.set_chain_index(cached_data)
+        except Exception as e:
+            logger.error(f"Failed to remove chain index entry: {e}")
+
+    def remove_height_index_entry(self, height: int):
+        """Remove a single entry from the cached height index"""
+        if not self.enabled:
+            return
+        try:
+            cached_index = self.get_height_index()
+            if cached_index and height in cached_index:
+                del cached_index[height]
+                self.set_height_index(cached_index)
+        except Exception as e:
+            logger.error(f"Failed to remove height index entry: {e}")
+
     # Batch Operations
     def invalidate_all(self):
         """Invalidate all cached data"""
@@ -319,10 +353,17 @@ class BlockchainRedisCache:
             return
             
         try:
-            keys = self._execute(self.redis_client.keys, "blockchain:*")
-            if keys:
-                self._execute(self.redis_client.delete, *keys)
-                logger.info(f"Invalidated {len(keys)} cache entries")
+            deleted = 0
+            cursor = 0
+            while True:
+                cursor, keys = self.redis_client.scan(cursor, match="blockchain:*", count=100)
+                if keys:
+                    self._execute(self.redis_client.delete, *keys)
+                    deleted += len(keys)
+                if cursor == 0:
+                    break
+            if deleted:
+                logger.info(f"Invalidated {deleted} cache entries")
         except Exception as e:
             logger.error(f"Failed to invalidate cache: {e}")
     

@@ -48,7 +48,7 @@ class HeightCache:
             self.cache_time = 0
 
 # Global height cache instance
-height_cache = HeightCache(ttl_seconds=1.0)
+height_cache = HeightCache(ttl_seconds=10.0)
 
 async def get_current_height(db, max_retries: int = 3) -> Tuple[int, str]:
     """
