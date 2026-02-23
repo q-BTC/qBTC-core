@@ -341,9 +341,13 @@ async def shutdown():
             await event_bus.stop()
             logger.info("Event bus stopped")
         
+        # Shutdown thread pool executors
+        from utils.executors import shutdown_executors
+        shutdown_executors()
+
         # Close database connections
         # Database cleanup happens automatically
-        
+
         logger.info("Node shutdown completed")
         
     except Exception as e:

@@ -18,6 +18,7 @@ from rocksdict import WriteBatch
 from state.state import mempool_manager
 from blockchain.block_height_index import get_height_index
 from blockchain.redis_cache import BlockchainRedisCache
+from utils.executors import run_in_block_executor
 import os
 import asyncio
 import threading
@@ -942,9 +943,10 @@ class ChainManager:
                         if not is_coinbase:
                             explorer_txs.append((tx['txid'], tx.get('timestamp', 0), is_coinbase))
 
-            # Write the batch atomically
+            # Write the batch atomically (offloaded to block executor)
             try:
-                self.db.write(batch)
+                db_ref = self.db
+                await run_in_block_executor(db_ref.write, batch)
                 logger.info(f"Batch write completed for block {block_hash}")
             except Exception as e:
                 logger.error(f"Batch write failed for block {block_hash}: {e}")
@@ -1052,17 +1054,19 @@ class ChainManager:
                                 batch.put(tx_key, json.dumps(tx).encode())
                                 logger.info(f"Storing genesis transaction {tx['txid']}")
 
-            self._connect_block(block_data, batch)
+            # Bundle _connect_block + tip update + db.write into block executor
+            # to avoid blocking the event loop during heavy I/O
+            def _connect_and_write():
+                self._connect_block(block_data, batch)
+                tip_key = b"chain:best_tip"
+                batch.put(tip_key, json.dumps({
+                    "hash": block_hash,
+                    "height": height
+                }).encode())
+                self.db.write(batch)
 
-            # Include tip update in the same atomic batch
-            tip_key = b"chain:best_tip"
-            batch.put(tip_key, json.dumps({
-                "hash": block_hash,
-                "height": height
-            }).encode())
+            await run_in_block_executor(_connect_and_write)
 
-            self.db.write(batch)
-            
             # CRITICAL: Invalidate height cache so next call gets fresh data
             invalidate_height_cache()
             logger.info(f"Height cache invalidated after new block at height {height}")

@@ -13,6 +13,7 @@ from prometheus_client import Gauge, Histogram, Info, generate_latest, CONTENT_T
 
 from database.database import get_db, get_current_height
 from state.state import mempool_manager
+from utils.executors import run_in_general_executor
 from log_utils import get_logger
 
 logger = get_logger(__name__)
@@ -59,18 +60,25 @@ class HealthMonitor:
         """Check database connectivity and performance"""
         try:
             start_time = time.time()
-            db = get_db()
-            
-            # Test read operation
-            height, tip = await get_current_height(db)
-            
-            # Test performance
+
+            # Offload blocking DB read to general executor
+            def _check_db():
+                db = get_db()
+                tip_data = db.get(b"chain:best_tip")
+                if tip_data:
+                    import json as _json
+                    tip_info = _json.loads(tip_data.decode())
+                    return tip_info.get("height", -1), tip_info.get("hash", "")
+                return -1, ""
+
+            height, tip = await run_in_general_executor(_check_db)
+
             check_duration = time.time() - start_time
-            
+
             # Update Prometheus metrics
             database_response_time.observe(check_duration)
             blockchain_height.set(height)
-            
+
             if check_duration > 1.0:  # Slow response
                 health_check_status.labels(component='database').set(0.5)  # Degraded
                 return ComponentHealth(
@@ -79,7 +87,7 @@ class HealthMonitor:
                     last_check=time.time(),
                     details={"response_time": check_duration, "height": height}
                 )
-            
+
             health_check_status.labels(component='database').set(1.0)  # Healthy
             return ComponentHealth(
                 status=HealthStatus.HEALTHY,
@@ -87,7 +95,7 @@ class HealthMonitor:
                 last_check=time.time(),
                 details={"response_time": check_duration, "height": height}
             )
-            
+
         except Exception as e:
             logger.error(f"Database health check failed: {str(e)}")
             health_check_status.labels(component='database').set(0.0)  # Unhealthy
@@ -100,34 +108,44 @@ class HealthMonitor:
     async def check_blockchain_health(self) -> ComponentHealth:
         """Check blockchain sync status"""
         try:
-            db = get_db()
-            height, tip = await get_current_height(db)
-            
-            # Check if we're receiving new blocks
+            # Offload all blocking DB reads to general executor
+            def _check_blockchain():
+                db = get_db()
+                tip_data = db.get(b"chain:best_tip")
+                if not tip_data:
+                    return -1, "", None
+
+                tip_info = json.loads(tip_data.decode())
+                height = tip_info.get("height", -1)
+                tip = tip_info.get("hash", "")
+
+                block_time = None
+                if tip and tip != "0" * 64:
+                    block_key = f"block:{tip}".encode()
+                    block_data = db.get(block_key)
+                    if block_data:
+                        block = json.loads(block_data.decode())
+                        block_time = block.get("timestamp", 0) / 1000
+                return height, tip, block_time
+
+            height, tip, block_time = await run_in_general_executor(_check_blockchain)
+
             current_time = time.time()
-            
-            # Get latest block timestamp
-            if tip and tip != "0" * 64:
-                block_key = f"block:{tip}".encode()
-                block_data = db.get(block_key)
-                if block_data:
-                    block = json.loads(block_data.decode())
-                    block_time = block.get("timestamp", 0) / 1000  # Convert to seconds
-                    time_since_block = current_time - block_time
-                    
-                    # Update Prometheus metrics
-                    last_block_time.set(block_time)
-                    
-                    if time_since_block > 3600:  # No blocks for 1 hour
-                        blockchain_sync_status.set(0)
-                        health_check_status.labels(component='blockchain').set(0.5)  # Degraded
-                        return ComponentHealth(
-                            status=HealthStatus.DEGRADED,
-                            message=f"No new blocks for {time_since_block/60:.1f} minutes",
-                            last_check=current_time,
-                            details={"height": height, "last_block_time": block_time}
-                        )
-            
+
+            if block_time is not None:
+                last_block_time.set(block_time)
+                time_since_block = current_time - block_time
+
+                if time_since_block > 3600:  # No blocks for 1 hour
+                    blockchain_sync_status.set(0)
+                    health_check_status.labels(component='blockchain').set(0.5)  # Degraded
+                    return ComponentHealth(
+                        status=HealthStatus.DEGRADED,
+                        message=f"No new blocks for {time_since_block/60:.1f} minutes",
+                        last_check=current_time,
+                        details={"height": height, "last_block_time": block_time}
+                    )
+
             blockchain_sync_status.set(1)
             health_check_status.labels(component='blockchain').set(1.0)  # Healthy
             return ComponentHealth(
@@ -136,7 +154,7 @@ class HealthMonitor:
                 last_check=current_time,
                 details={"height": height, "tip": tip}
             )
-            
+
         except Exception as e:
             logger.error(f"Blockchain health check failed: {str(e)}")
             blockchain_sync_status.set(0)

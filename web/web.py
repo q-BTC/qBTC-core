@@ -31,6 +31,9 @@ from security.integrated_security import get_security_status, block_client, unbl
 
 # Import event system
 from events.event_bus import event_bus, EventTypes
+
+# Import executors for offloading blocking DB operations
+from utils.executors import run_in_ws_executor
 from web.websocket_handlers import WebSocketEventHandlers
 
 # Import Bitcoin utilities
@@ -661,9 +664,9 @@ async def get_balance_endpoint(wallet_address: str):
     # Validate address format
     if not wallet_address.startswith('bqs') or len(wallet_address) < 20:
         raise ValidationError("Invalid wallet address format")
-    
+
     try:
-        balance = get_balance(wallet_address)
+        balance = await run_in_ws_executor(get_balance, wallet_address)
         return {"wallet_address": wallet_address, "balance": str(balance)}
     except Exception as e:
         logger.error(f"Error getting balance for {wallet_address}: {str(e)}")
@@ -683,7 +686,7 @@ async def get_transactions_endpoint(wallet_address: str, limit: int = 50, includ
         raise ValidationError("Limit must be between 1 and 1000")
     
     try:
-        transactions = get_transactions(wallet_address, limit, include_coinbase)
+        transactions = await run_in_ws_executor(get_transactions, wallet_address, limit, include_coinbase)
         logging.info(f"API returning {len(transactions)} transactions for {wallet_address}")
         return {"wallet_address": wallet_address, "transactions": transactions}
     except Exception as e:
@@ -696,15 +699,18 @@ async def get_all_transactions_endpoint(limit: int = 100):
     try:
         from blockchain.explorer_index import get_explorer_index
 
-        # Get transactions using the efficient index
-        explorer_index = get_explorer_index()
-        formatted = explorer_index.get_recent_transactions(limit)
-        
+        # Offload blocking DB read to thread pool
+        def _fetch_all_transactions():
+            explorer_index = get_explorer_index()
+            return explorer_index.get_recent_transactions(limit)
+
+        formatted = await run_in_ws_executor(_fetch_all_transactions)
+
         return {
             "transactions": formatted[:limit],
             "count": len(formatted[:limit])
         }
-        
+
     except Exception as e:
         logger.error(f"Error getting all transactions: {e}")
         raise HTTPException(status_code=500, detail="Error retrieving transactions")
@@ -718,10 +724,13 @@ async def get_utxos_endpoint(wallet_address: str):
     
     try:
         from blockchain.wallet_index import get_wallet_index
-        wallet_index = get_wallet_index()
-        
-        utxos = wallet_index.get_wallet_utxos(wallet_address)
-        
+
+        def _fetch_utxos():
+            wallet_index = get_wallet_index()
+            return wallet_index.get_wallet_utxos(wallet_address)
+
+        utxos = await run_in_ws_executor(_fetch_utxos)
+
         # Format for API response
         formatted_utxos = []
         for utxo in utxos:
@@ -1203,16 +1212,34 @@ async def websocket_endpoint(websocket: WebSocket):
                     if update_type == "combined_update" and wallet_address:
                         # Send initial data directly without relying on event system
                         try:
-                            db = get_db()
-                            balance = get_balance(wallet_address)
-                            transactions = get_transactions(wallet_address, include_coinbase=False)
-                            
+                            # Bundle all blocking DB reads into thread pool
+                            def _fetch_initial_wallet_data():
+                                db = get_db()
+                                balance = get_balance(wallet_address)
+                                transactions = get_transactions(wallet_address, include_coinbase=False)
+
+                                # Read current height directly from DB (sync)
+                                current_height = None
+                                tip_data = db.get(b"chain:best_tip")
+                                if tip_data:
+                                    tip_info = json.loads(tip_data.decode())
+                                    current_height = tip_info.get("height")
+
+                                # Batch fetch tx_block data
+                                tx_block_data_cache = {}
+                                for tx in transactions:
+                                    tx_block_key = f"tx_block:{tx['txid']}".encode()
+                                    tx_block_data = db.get(tx_block_key)
+                                    if tx_block_data:
+                                        tx_block_data_cache[tx['txid']] = json.loads(tx_block_data.decode())
+
+                                return balance, transactions, current_height, tx_block_data_cache
+
+                            balance, transactions, current_height, tx_block_data_cache = await run_in_ws_executor(_fetch_initial_wallet_data)
+
+                            # Format transactions on the event loop (CPU-only, fast)
                             formatted = []
                             logging.debug(f"=== WEBSOCKET FORMATTING {len(transactions)} TRANSACTIONS ===")
-
-                            # Get current height ONCE before the loop - O(1) optimization
-                            current_height_tuple = await get_current_height(db)
-                            current_height = current_height_tuple[0] if current_height_tuple else None
 
                             for idx, tx in enumerate(transactions):
                                 logging.debug(f"WebSocket TX {idx+1}: txid={tx['txid']}, direction={tx['direction']}, from={tx.get('from', 'N/A')}, to={tx.get('to', 'N/A')}, timestamp={tx['timestamp']}")
@@ -1221,40 +1248,24 @@ async def websocket_endpoint(websocket: WebSocket):
                                 amt_dec = Decimal(tx["amount"])
                                 amount_fmt = f"{abs(amt_dec):.8f} qBTC"
 
-                                # Get from/to from transaction
                                 from_address = tx.get("from", "Unknown")
                                 to_address = tx.get("to", "Unknown")
 
-                                # Set address to counterparty for backward compatibility
                                 if tx["direction"] == "sent":
                                     address = to_address
                                 else:
                                     address = from_address
 
-                                # Check if this is a genesis transaction
-                                logging.debug(f"  Checking genesis conditions:")
-                                logging.debug(f"    - txid == 'genesis_tx'? {tx['txid'] == 'genesis_tx'}")
-                                logging.debug(f"    - direction == 'received'? {tx['direction'] == 'received'}")
-                                logging.debug(f"    - from == 'GENESIS'? {from_address == 'GENESIS'}")
-
-                                # Check if this is a genesis transaction
                                 if tx["txid"] == "genesis_tx" or from_address == "bqs1genesis00000000000000000000000000000000":
                                     timestamp_str = "Genesis Block"
-                                    logging.debug(f"  *** GENESIS BLOCK TIMESTAMP SET ***")
                                 else:
                                     timestamp_str = datetime.fromtimestamp(tx["timestamp"] / 1000).isoformat() if tx["timestamp"] else "Unknown"
-                                    logging.debug(f"  Regular timestamp: {timestamp_str}")
 
-                                # Get block height and calculate confirmations for this transaction
                                 block_height = None
-                                confirmations = 0  # Default to 0 confirmations
-                                tx_block_key = f"tx_block:{tx['txid']}".encode()
-                                tx_block_data = db.get(tx_block_key)
-                                if tx_block_data:
-                                    tx_block = json.loads(tx_block_data.decode())
+                                confirmations = 0
+                                tx_block = tx_block_data_cache.get(tx['txid'])
+                                if tx_block:
                                     block_height = tx_block.get("height")
-
-                                    # Calculate confirmations if we have the block height
                                     if block_height is not None and current_height is not None:
                                         if current_height >= 0 and current_height >= block_height:
                                             confirmations = current_height - block_height + 1
@@ -1274,16 +1285,16 @@ async def websocket_endpoint(websocket: WebSocket):
                                     "isMempool": tx.get("isMempool", False),
                                     "isPending": tx.get("isPending", False)
                                 })
-                            
+
                             initial_data = {
                                 "type": "combined_update",
                                 "balance": f"{balance:.8f}",
                                 "transactions": formatted
                             }
-                            
+
                             await websocket.send_json(initial_data)
                             logging.info(f"Sent initial data for wallet {wallet_address}: balance={balance}, txs={len(transactions)}")
-                            
+
                         except Exception as e:
                             logging.error(f"Error sending initial data: {e}")
                         

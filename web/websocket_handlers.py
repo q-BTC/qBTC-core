@@ -11,6 +11,7 @@ from typing import Set, Dict
 
 from events.event_bus import Event, EventTypes
 from database.database import get_db, get_current_height
+from utils.executors import run_in_ws_executor
 
 logger = logging.getLogger(__name__)
 
@@ -184,37 +185,40 @@ class WebSocketEventHandlers:
                 logger.debug("Skipping all_transactions broadcast - broadcasting disabled")
                 return
 
-            # Get transactions using the efficient index
-            explorer_index = get_explorer_index()
-            formatted = explorer_index.get_recent_transactions(limit=100)
-            
+            # Offload blocking DB read to thread pool
+            def _fetch_recent_transactions():
+                explorer_index = get_explorer_index()
+                return explorer_index.get_recent_transactions(limit=100)
+
+            formatted = await run_in_ws_executor(_fetch_recent_transactions)
+
             update_data = {
                 "type": "transaction_update",
                 "transactions": formatted,
                 "timestamp": datetime.utcnow().isoformat()
             }
-            
+
             logger.info(f"Broadcasting {len(formatted)} transactions to all_transactions subscribers")
             if formatted:
                 logger.info(f"First transaction: {formatted[0]}")
             await self.websocket_manager.broadcast(update_data, "all_transactions")
-            
+
         except Exception as e:
             logger.error(f"Error broadcasting all transactions: {e}")
     
     async def _broadcast_wallet_update(self, wallet_address: str):
         """Broadcast update for specific wallet"""
         try:
-            from web.web import get_balance, get_transactions, get_broadcast_transactions, get_db
+            from web.web import get_balance, get_transactions, get_broadcast_transactions
             from state.state import mempool_manager
-            
+
             # Check if transaction broadcasting is enabled
             if not get_broadcast_transactions():
                 logger.debug(f"Skipping wallet update broadcast for {wallet_address} - broadcasting disabled")
                 return
-            
+
             logger.info(f"Broadcasting wallet update for: {wallet_address}")
-            
+
             # Safely log mempool state
             if mempool_manager is not None:
                 mempool_txs = mempool_manager.get_all_transactions()
@@ -224,42 +228,48 @@ class WebSocketEventHandlers:
                     logger.warning("Mempool manager returned None for get_all_transactions()")
             else:
                 logger.warning("Mempool manager is None")
-            
-            balance = get_balance(wallet_address)
-            transactions = get_transactions(wallet_address, include_coinbase=False)
+
+            # Bundle all blocking DB reads into a single sync function for the thread pool
+            def _fetch_wallet_data():
+                db = get_db()
+                balance = get_balance(wallet_address)
+                transactions = get_transactions(wallet_address, include_coinbase=False)
+
+                # Read current height directly from DB (sync, since we're in a thread)
+                current_height = None
+                tip_data = db.get(b"chain:best_tip")
+                if tip_data:
+                    tip_info = json.loads(tip_data.decode())
+                    current_height = tip_info.get("height")
+
+                # Batch fetch all transaction block data
+                tx_block_data_cache = {}
+                for tx in transactions:
+                    txid = tx["txid"]
+                    tx_block_key = f"tx_block:{txid}".encode()
+                    tx_block_data = db.get(tx_block_key)
+                    if tx_block_data:
+                        tx_block_data_cache[txid] = json.loads(tx_block_data.decode())
+
+                return balance, transactions, current_height, tx_block_data_cache
+
+            balance, transactions, current_height, tx_block_data_cache = await run_in_ws_executor(_fetch_wallet_data)
 
             logger.info(f"Wallet {wallet_address} - Balance: {balance}, Transactions: {len(transactions)}")
             if transactions:
                 logger.debug(f"First transaction data: {transactions[0]}")
 
+            # Format transactions on the event loop (CPU-only, fast)
             formatted = []
-            db = get_db()
-
-            # Get current height ONCE before the loop - O(1) optimization
-            current_height_tuple = await get_current_height(db)
-            current_height = current_height_tuple[0] if current_height_tuple else None
-
-            # PERFORMANCE OPTIMIZATION: Batch fetch all transaction block data
-            tx_block_data_cache = {}
-            for tx in transactions:
-                txid = tx["txid"]
-                tx_block_key = f"tx_block:{txid}".encode()
-                tx_block_data = db.get(tx_block_key)
-                if tx_block_data:
-                    tx_block_data_cache[txid] = json.loads(tx_block_data.decode())
-
-            # Now process all transactions with cached block data
             for tx in transactions:
                 tx_type = "sent" if tx["direction"] == "sent" else "received"
                 amt_dec = Decimal(tx["amount"])
                 amount_fmt = f"{abs(amt_dec):.8f} qBTC"
 
-                # Get from/to addresses from transaction
                 txid = tx["txid"]
                 from_address = tx.get("from", "Unknown")
                 to_address = tx.get("to", "Unknown")
 
-                # For backward compatibility, set address field to the counterparty
                 if tx["direction"] == "sent":
                     address = to_address
                 else:
@@ -267,24 +277,17 @@ class WebSocketEventHandlers:
 
                 logger.debug(f"Processing tx {txid}: direction={tx['direction']}, from={from_address}, to={to_address}")
 
-                # Find block height for this transaction - O(1) lookup from cache
                 block_height = None
-                confirmations = 0  # Default to 0 confirmations
+                confirmations = 0
 
                 tx_block = tx_block_data_cache.get(txid)
                 if tx_block:
                     block_height = tx_block.get("height")
-
-                    # Calculate confirmations if we have the block height
                     if block_height is not None and current_height is not None:
                         if current_height >= 0 and current_height >= block_height:
                             confirmations = current_height - block_height + 1
                             logger.debug(f"Calculated confirmations for tx {txid}: height={block_height}, current={current_height}, confirmations={confirmations}")
-                # If no index exists, block_height will remain None and confirmations will be 0
-                # We won't do O(N) search - the index should be maintained when blocks are added
 
-                # Check if this is a genesis transaction
-                # Genesis transactions have either txid "genesis_tx" or from "bqs1genesis..."
                 if tx["txid"] == "genesis_tx" or from_address == "bqs1genesis00000000000000000000000000000000":
                     timestamp_str = "Genesis Block"
                     logger.debug(f"Setting Genesis Block timestamp for tx {tx['txid']}")
@@ -306,13 +309,13 @@ class WebSocketEventHandlers:
                     "isMempool": tx.get("isMempool", False),
                     "isPending": tx.get("isPending", False)
                 })
-            
+
             update_data = {
                 "type": "combined_update",
                 "balance": f"{balance:.8f}",
                 "transactions": formatted
             }
-            
+
             # Check if data actually changed
             cached = self.wallet_cache.get(wallet_address)
             if cached != update_data:
@@ -323,7 +326,7 @@ class WebSocketEventHandlers:
                     wallet_address
                 )
                 logger.debug(f"Broadcasted update for wallet: {wallet_address}")
-            
+
         except Exception as e:
             logger.error(f"Error broadcasting wallet update: {e}")
     
@@ -332,32 +335,44 @@ class WebSocketEventHandlers:
         try:
             from blockchain.block_height_index import get_height_index
 
-            db = get_db()
-            height_index = get_height_index()
-            current_height_tuple = await get_current_height(db)
-            current_height = current_height_tuple[0] if current_height_tuple else None
+            # Offload all blocking DB reads to thread pool
+            def _fetch_l1_proofs():
+                db = get_db()
+                height_index = get_height_index()
 
-            if current_height is None:
+                # Read current height directly from DB (sync)
+                tip_data = db.get(b"chain:best_tip")
+                if not tip_data:
+                    return None
+                tip_info = json.loads(tip_data.decode())
+                current_height = tip_info.get("height")
+                if current_height is None:
+                    return None
+
+                proofs = []
+                for h in range(max(0, current_height - 50), current_height + 1):
+                    block = height_index.get_block_by_height(h)
+                    if not block:
+                        continue
+                    tx_ids = block.get("tx_ids", [])
+                    proofs.append({
+                        "blockHeight": block["height"],
+                        "merkleRoot": block["block_hash"],
+                        "bitcoinTxHash": None,
+                        "timestamp": datetime.fromtimestamp(block["timestamp"] / 1000).isoformat(),
+                        "transactions": [
+                            {"id": tx_id, "hash": tx_id, "status": "confirmed"}
+                            for tx_id in tx_ids
+                        ],
+                        "status": "confirmed"
+                    })
+                return proofs
+
+            proofs = await run_in_ws_executor(_fetch_l1_proofs)
+
+            if proofs is None:
                 logger.warning("Cannot broadcast L1 proofs: current height unknown")
                 return
-
-            proofs = []
-            for h in range(max(0, current_height - 50), current_height + 1):
-                block = height_index.get_block_by_height(h)
-                if not block:
-                    continue
-                tx_ids = block.get("tx_ids", [])
-                proofs.append({
-                    "blockHeight": block["height"],
-                    "merkleRoot": block["block_hash"],
-                    "bitcoinTxHash": None,
-                    "timestamp": datetime.fromtimestamp(block["timestamp"] / 1000).isoformat(),
-                    "transactions": [
-                        {"id": tx_id, "hash": tx_id, "status": "confirmed"}
-                        for tx_id in tx_ids
-                    ],
-                    "status": "confirmed"
-                })
 
             update_data = {
                 "type": "l1proof_update",
