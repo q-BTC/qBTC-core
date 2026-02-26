@@ -22,7 +22,11 @@ class ExplorerIndex:
     def _ensure_index(self):
         """Initialize index if it doesn't exist"""
         if not self.db.get(self.index_key):
-            # Initialize with empty index instead of full rebuild
+            # Skip write in secondary mode (read-only DB)
+            from database.database import is_secondary
+            if is_secondary():
+                logger.info("Explorer index not found (secondary mode, skip init)")
+                return
             from rocksdict import WriteBatch
             batch = WriteBatch()
             batch.put(self.index_key, json.dumps([]).encode())

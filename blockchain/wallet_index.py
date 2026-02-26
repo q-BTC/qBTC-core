@@ -47,14 +47,16 @@ class WalletIndexManager:
         
         # If no pre-computed balance, calculate from UTXO set
         balance = self._calculate_balance_from_utxos(address)
-        
-        # Store for next time using WriteBatch for atomicity
-        from rocksdict import WriteBatch
-        batch = WriteBatch()
-        batch.put(balance_key, str(balance).encode())
-        self.db.write(batch)
+
+        # Store for next time (skip in secondary mode — read-only DB)
+        from database.database import is_secondary
+        if not is_secondary():
+            from rocksdict import WriteBatch
+            batch = WriteBatch()
+            batch.put(balance_key, str(balance).encode())
+            self.db.write(batch)
         self._cache[cache_key] = (balance, time.time())
-        
+
         return balance
     
     def _calculate_balance_from_utxos(self, address: str) -> Decimal:
