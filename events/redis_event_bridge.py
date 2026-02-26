@@ -183,13 +183,18 @@ class NodeEventBridge:
             logger.info(f"[BRIDGE] Added transaction {txid} to mempool. Size: {mempool_manager.size()}")
 
             # Emit mempool event locally (for RPC/node-side consumers)
-            await event_bus.emit(EventTypes.TRANSACTION_PENDING, {
+            event_data = {
                 "txid": txid,
                 "transaction": transaction,
                 "sender": transaction.get("sender"),
                 "receiver": transaction.get("receiver"),
                 "amount": transaction.get("amount"),
-            }, source="bridge")
+            }
+            await event_bus.emit(EventTypes.TRANSACTION_PENDING, event_data, source="bridge")
+
+            # Publish to Redis so the web process picks it up
+            # (populates _mempool_cache and triggers WebSocket broadcasts)
+            await self.publish_event(EventTypes.TRANSACTION_PENDING, event_data)
 
             # Broadcast to network (fire-and-forget with timeout — don't block the reply)
             import sys
