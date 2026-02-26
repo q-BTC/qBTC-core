@@ -28,6 +28,7 @@
         RATE_LIMIT_HEALTH: "100"
         RATE_LIMIT_UTXOS: "100"
         RATE_LIMIT_DEFAULT: "60"
+        MAX_WS_PER_IP: "20"
       # Bootstrap nodes automatically have websocket transaction broadcasting enabled
       command: ["--bootstrap", "--dht-port", "8001", "--gossip-port", "8002"]
       ports:
