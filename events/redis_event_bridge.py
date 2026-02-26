@@ -16,6 +16,7 @@ import json
 import uuid
 import logging
 import asyncio
+import time
 from typing import Any, Dict, Optional
 
 try:
@@ -88,38 +89,79 @@ class NodeEventBridge:
         Long-running loop: BRPOP on qbtc:tx_submit, process each transaction
         via the node's mempool, push results to qbtc:tx_result:{request_id}.
         """
-        client = aioredis.from_url(self.redis_url, decode_responses=True)
-        logger.info("NodeEventBridge: listening for transaction submissions on Redis")
+        # Store client as instance var for proper lifecycle management
+        self._tx_client = aioredis.from_url(self.redis_url, decode_responses=True)
+        client = self._tx_client
+
+        # Verify Redis connectivity before entering the loop
+        try:
+            await client.ping()
+            logger.info("NodeEventBridge: Redis connection verified, listening for tx submissions")
+        except Exception as e:
+            logger.error(f"NodeEventBridge: Redis connection FAILED: {e}")
+            return
+
+        last_heartbeat = time.time()
 
         while True:
             try:
+                # Periodic heartbeat log so we can confirm the loop is alive
+                now = time.time()
+                if now - last_heartbeat > 30:
+                    last_heartbeat = now
+                    qlen = await client.llen(TX_SUBMIT_QUEUE)
+                    logger.info(f"[BRIDGE] TX listener alive, queue length: {qlen}")
+
                 result = await client.brpop(TX_SUBMIT_QUEUE, timeout=1)
                 if result is None:
                     continue
 
                 _key, raw = result
+                logger.info(f"[BRIDGE] Received tx submission from Redis queue")
                 submission = json.loads(raw)
                 request_id = submission.get("request_id")
                 transaction = submission.get("transaction")
 
                 if not request_id or not transaction:
-                    logger.warning("Malformed tx submission, skipping")
+                    logger.warning("[BRIDGE] Malformed tx submission, skipping")
                     continue
 
-                # Process the transaction via node's mempool and gossip
-                reply = await self._process_tx_submission(transaction)
+                txid = transaction.get("txid", "unknown")
+                logger.info(f"[BRIDGE] Processing tx {txid} (request_id={request_id[:8]}...)")
+
+                # Process with a 4s timeout to prevent broadcast from blocking the listener
+                try:
+                    reply = await asyncio.wait_for(
+                        self._process_tx_submission(transaction),
+                        timeout=4.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(f"[BRIDGE] Processing tx {txid} timed out after 4s")
+                    reply = {"status": "error", "error": "Transaction processing timed out on node"}
+
                 reply["request_id"] = request_id
 
                 result_key = f"{TX_RESULT_PREFIX}{request_id}"
                 await client.lpush(result_key, json.dumps(reply))
-                # Expire the result key after 30s to avoid leaks
                 await client.expire(result_key, 30)
+                logger.info(f"[BRIDGE] Sent reply for tx {txid}: {reply.get('status')}")
 
             except asyncio.CancelledError:
                 logger.info("TX submission listener cancelled")
                 break
             except Exception as e:
-                logger.error(f"Error processing tx submission: {e}")
+                logger.error(f"Error processing tx submission: {e}", exc_info=True)
+                # Reconnect Redis client if connection broke
+                try:
+                    await client.ping()
+                except Exception:
+                    logger.warning("[BRIDGE] Redis connection lost, reconnecting...")
+                    try:
+                        await client.aclose()
+                    except Exception:
+                        pass
+                    client = aioredis.from_url(self.redis_url, decode_responses=True)
+                    self._tx_client = client
                 await asyncio.sleep(0.5)
 
         await client.aclose()
@@ -131,6 +173,7 @@ class NodeEventBridge:
             from events.event_bus import event_bus, EventTypes
 
             txid = transaction.get("txid")
+            logger.info(f"[BRIDGE] _process_tx_submission called for {txid}")
 
             success, error = mempool_manager.add_transaction(transaction)
             if not success:
@@ -148,26 +191,34 @@ class NodeEventBridge:
                 "amount": transaction.get("amount"),
             }, source="bridge")
 
-            # Broadcast to network
+            # Broadcast to network (fire-and-forget with timeout — don't block the reply)
             import sys
             gossip_node = getattr(sys.modules.get("__main__", None), "gossip_node", None)
             if gossip_node:
-                await gossip_node.randomized_broadcast(transaction)
-                logger.info(f"[BRIDGE] Transaction {txid} broadcast to network")
+                try:
+                    await asyncio.wait_for(
+                        gossip_node.randomized_broadcast(transaction),
+                        timeout=2.0
+                    )
+                    logger.info(f"[BRIDGE] Transaction {txid} broadcast to network")
+                except asyncio.TimeoutError:
+                    logger.warning(f"[BRIDGE] Gossip broadcast timed out for {txid} (tx still in mempool)")
             else:
                 logger.warning(f"[BRIDGE] No gossip node — tx {txid} in mempool only")
 
             return {"status": "success", "txid": txid}
 
         except Exception as e:
-            logger.error(f"Error processing transaction: {e}")
+            logger.error(f"Error processing transaction: {e}", exc_info=True)
             return {"status": "error", "error": str(e)}
 
     async def close(self):
-        if self._pub_client:
-            await self._pub_client.aclose()
-        if self._sub_client:
-            await self._sub_client.aclose()
+        for client in (self._pub_client, self._sub_client, getattr(self, '_tx_client', None)):
+            if client:
+                try:
+                    await client.aclose()
+                except Exception:
+                    pass
 
 
 class WebEventBridge:
@@ -248,6 +299,7 @@ class WebEventBridge:
         """
         client = await self._get_client()
         request_id = str(uuid.uuid4())
+        txid = transaction.get("txid", "unknown")
 
         submission = json.dumps({
             "request_id": request_id,
@@ -258,14 +310,20 @@ class WebEventBridge:
 
         try:
             await client.lpush(TX_SUBMIT_QUEUE, submission)
+            logger.info(f"[WEB_BRIDGE] Submitted tx {txid} to Redis queue (request_id={request_id[:8]}...)")
 
-            # Wait for result with 5s timeout
-            result = await client.brpop(result_key, timeout=5)
+            # Wait for result with 8s timeout (node has 4s processing budget + margin)
+            result = await client.brpop(result_key, timeout=8)
             if result is None:
-                return {"status": "error", "error": "Transaction submission timed out (node did not respond in 5s)"}
+                # Check queue length to help diagnose
+                qlen = await client.llen(TX_SUBMIT_QUEUE)
+                logger.error(f"[WEB_BRIDGE] Timeout waiting for tx {txid} reply (queue length: {qlen})")
+                return {"status": "error", "error": "Transaction submission timed out (node did not respond in 8s)"}
 
             _key, raw = result
-            return json.loads(raw)
+            reply = json.loads(raw)
+            logger.info(f"[WEB_BRIDGE] Got reply for tx {txid}: {reply.get('status')}")
+            return reply
 
         except Exception as e:
             logger.error(f"Error submitting transaction via Redis: {e}")
