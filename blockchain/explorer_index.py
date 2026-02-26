@@ -92,8 +92,9 @@ class ExplorerIndex:
         self.db.write(batch)
         logger.info(f"Explorer index rebuilt with {len(transactions)} transactions")
 
-    def add_transaction(self, txid: str, timestamp: int, is_coinbase: bool = False):
-        """Add a new transaction to the index"""
+    def add_transaction(self, txid: str, timestamp: int, is_coinbase: bool = False,
+                        sender: str = "", receiver: str = "", amount: str = ""):
+        """Add a new transaction to the index with denormalized sender/receiver/amount"""
         if is_coinbase:
             return  # Skip coinbase transactions
 
@@ -104,11 +105,16 @@ class ExplorerIndex:
         else:
             transactions = []
 
-        # Add new transaction at the beginning
-        transactions.insert(0, {
-            "txid": txid,
-            "timestamp": timestamp
-        })
+        # Add new transaction at the beginning with denormalized fields
+        entry = {"txid": txid, "timestamp": timestamp}
+        if sender:
+            entry["sender"] = sender
+        if receiver:
+            entry["receiver"] = receiver
+        if amount:
+            entry["amount"] = amount
+
+        transactions.insert(0, entry)
 
         # Trim to max size
         transactions = transactions[:self.max_transactions]
@@ -120,7 +126,11 @@ class ExplorerIndex:
         self.db.write(batch)
 
     def get_recent_transactions(self, limit: int = 100) -> List[Dict]:
-        """Get recent transactions efficiently using the index"""
+        """Get recent transactions efficiently using denormalized index data.
+
+        New index entries contain sender/receiver/amount directly, avoiding
+        N+1 DB lookups. Falls back to DB lookup for legacy entries only.
+        """
         formatted = []
 
         # Get the index
@@ -136,6 +146,32 @@ class ExplorerIndex:
                 break
 
             txid = tx_ref["txid"]
+
+            # Fast path: use denormalized data if available
+            sender = tx_ref.get("sender", "")
+            receiver = tx_ref.get("receiver", "")
+            amount_str = tx_ref.get("amount", "")
+            ts = tx_ref.get("timestamp", 0)
+
+            if sender and receiver and amount_str:
+                # Denormalized entry — no DB lookup needed
+                try:
+                    amount = Decimal(amount_str)
+                except Exception:
+                    amount = Decimal("0")
+                timestamp_iso = datetime.fromtimestamp(ts / 1000).isoformat() if ts else datetime.utcnow().isoformat()
+                formatted.append({
+                    "id": txid,
+                    "hash": txid,
+                    "sender": sender,
+                    "receiver": receiver,
+                    "amount": f"{amount:.8f} qBTC",
+                    "timestamp": timestamp_iso,
+                    "status": "confirmed"
+                })
+                continue
+
+            # Slow path: legacy entry without denormalized fields — do DB lookups
             tx_key = f"tx:{txid}".encode()
             tx_data_raw = self.db.get(tx_key)
 
@@ -147,18 +183,28 @@ class ExplorerIndex:
                 inputs = tx_data.get("inputs", [])
                 outputs = tx_data.get("outputs", [])
 
-                # Get sender from input UTXOs
-                sender = ""
-                for inp in inputs:
-                    inp_txid = inp.get("txid", "")
-                    inp_index = inp.get("utxo_index", 0)
-                    if inp_txid and inp_txid != "0" * 64:
-                        utxo_key = f"utxo:{inp_txid}:{inp_index}".encode()
-                        utxo_data = self.db.get(utxo_key)
-                        if utxo_data:
-                            utxo = json.loads(utxo_data.decode())
-                            sender = utxo.get("receiver", "")
-                            break
+                # Try sender field / msg_str before falling back to UTXO lookup
+                sender = tx_data.get("sender", "")
+                if not sender:
+                    body = tx_data.get("body", {})
+                    msg_str = body.get("msg_str", "")
+                    if msg_str:
+                        parts = msg_str.split(":")
+                        if parts:
+                            sender = parts[0]
+
+                if not sender:
+                    # Last resort: UTXO lookup for a single input
+                    for inp in inputs:
+                        inp_txid = inp.get("txid", "")
+                        inp_index = inp.get("utxo_index", 0)
+                        if inp_txid and inp_txid != "0" * 64:
+                            utxo_key = f"utxo:{inp_txid}:{inp_index}".encode()
+                            utxo_data = self.db.get(utxo_key)
+                            if utxo_data:
+                                utxo = json.loads(utxo_data.decode())
+                                sender = utxo.get("receiver", "")
+                                break
 
                 if not sender:
                     continue
@@ -170,17 +216,14 @@ class ExplorerIndex:
                     out_receiver = out.get("receiver", "")
                     out_amount = Decimal(str(out.get("amount", 0)))
 
-                    # Skip genesis address
                     if out_receiver == "bqs1genesis00000000000000000000000000000000":
                         continue
 
-                    # Use first non-change output
                     if out_receiver and out_receiver != sender:
                         receiver = out_receiver
                         amount = out_amount
                         break
 
-                # If all outputs are to self, take the first one
                 if not receiver and outputs:
                     out = outputs[0]
                     receiver = out.get("receiver", "")

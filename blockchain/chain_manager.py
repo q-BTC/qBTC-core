@@ -157,7 +157,7 @@ class ChainManager:
         # Try to load from Redis cache first
         if self.redis_cache:
             try:
-                cached_index = self.redis_cache.get_chain_index()
+                cached_index = await self.redis_cache.get_chain_index()
                 if cached_index and isinstance(cached_index, dict):
                     # Validate cache structure
                     block_index = cached_index.get("block_index", {})
@@ -187,7 +187,7 @@ class ChainManager:
                                 "chain_tips": list(self.chain_tips)
                             }
                             try:
-                                self.redis_cache.set_chain_index(cache_data)
+                                await self.redis_cache.set_chain_index(cache_data)
                             except Exception as e:
                                 logger.warning(f"Failed to re-cache cleaned index: {e}")
                         return
@@ -217,7 +217,7 @@ class ChainManager:
                     cached_difficulty = None
                     if self.redis_cache:
                         try:
-                            cached_difficulty = self.redis_cache.get_cumulative_difficulty(block_hash)
+                            cached_difficulty = await self.redis_cache.get_cumulative_difficulty(block_hash)
                         except:
                             pass
 
@@ -255,13 +255,13 @@ class ChainManager:
                     "block_index": self.block_index,
                     "chain_tips": list(self.chain_tips)
                 }
-                self.redis_cache.set_chain_index(cache_data)
-                
+                await self.redis_cache.set_chain_index(cache_data)
+
                 # Cache cumulative difficulties individually
                 if cumulative_difficulties:
                     logger.info(f"Caching {len(cumulative_difficulties)} cumulative difficulties to Redis")
                     for block_hash, difficulty in cumulative_difficulties.items():
-                        self.redis_cache.set_cumulative_difficulty(block_hash, difficulty)
+                        await self.redis_cache.set_cumulative_difficulty(block_hash, difficulty)
                 else:
                     logger.info("No cumulative difficulties to cache")
 
@@ -503,7 +503,7 @@ class ChainManager:
         # Try Redis cache first
         if self.redis_cache:
             try:
-                cached_best = self.redis_cache.get_best_chain_info()
+                cached_best = await self.redis_cache.get_best_chain_info()
                 if cached_best:
                     # Verify the cached tip is actually connected
                     if await self._is_block_connected(cached_best["block_hash"]):
@@ -561,7 +561,7 @@ class ChainManager:
         # Cache the result
         if self.redis_cache:
             try:
-                self.redis_cache.set_best_chain_info({
+                await self.redis_cache.set_best_chain_info({
                     "block_hash": best_tip,
                     "height": best_height,
                     "difficulty": str(best_difficulty)
@@ -941,7 +941,28 @@ class ChainManager:
                         inputs = tx.get("inputs", [])
                         is_coinbase = len(inputs) == 1 and inputs[0].get("txid", "") == "0" * 64
                         if not is_coinbase:
-                            explorer_txs.append((tx['txid'], tx.get('timestamp', 0), is_coinbase))
+                            # Extract sender/receiver/amount for denormalized index
+                            tx_sender = tx.get("sender", "")
+                            if not tx_sender:
+                                body = tx.get("body", {})
+                                msg_str = body.get("msg_str", "")
+                                if msg_str:
+                                    parts = msg_str.split(":")
+                                    if parts:
+                                        tx_sender = parts[0]
+                            tx_receiver = tx.get("receiver", "")
+                            if not tx_receiver:
+                                for out in tx.get("outputs", []):
+                                    r = out.get("receiver", "")
+                                    if r and r != tx_sender and r != "bqs1genesis00000000000000000000000000000000":
+                                        tx_receiver = r
+                                        break
+                            tx_amount = ""
+                            for out in tx.get("outputs", []):
+                                if out.get("receiver") == tx_receiver:
+                                    tx_amount = str(out.get("amount", "0"))
+                                    break
+                            explorer_txs.append((tx['txid'], tx.get('timestamp', 0), is_coinbase, tx_sender, tx_receiver, tx_amount))
 
             # Write the batch atomically (offloaded to block executor)
             try:
@@ -956,8 +977,8 @@ class ChainManager:
             if explorer_txs:
                 from blockchain.explorer_index import get_explorer_index
                 explorer_index = get_explorer_index()
-                for txid_val, ts_val, is_cb in explorer_txs:
-                    explorer_index.add_transaction(txid_val, ts_val, is_cb)
+                for txid_val, ts_val, is_cb, sender, receiver, amount in explorer_txs:
+                    explorer_index.add_transaction(txid_val, ts_val, is_cb, sender=sender, receiver=receiver, amount=amount)
 
             logger.debug(f"Block {block_hash} and its transactions stored atomically")
         elif is_genesis_becoming_tip:
@@ -981,20 +1002,20 @@ class ChainManager:
         # Cache cumulative difficulty to Redis
         if self.redis_cache:
             try:
-                self.redis_cache.set_cumulative_difficulty(block_hash, cumulative_difficulty)
+                await self.redis_cache.set_cumulative_difficulty(block_hash, cumulative_difficulty)
             except Exception as e:
                 logger.debug(f"Failed to cache cumulative difficulty: {e}")
-        
+
         # Check if this creates a new chain tip or extends existing one
         # Incrementally update chain tips for the new block
         # This is much more efficient than recalculating all tips
         self._update_chain_tips_incremental(block_hash, prev_hash)
-        
+
         # Force recalculation of best chain tip after adding new block
         # Clear any cached best tip to ensure fresh calculation
         if self.redis_cache:
             try:
-                self.redis_cache.delete_best_chain_info()
+                await self.redis_cache.delete_best_chain_info()
             except:
                 pass
         
@@ -1012,7 +1033,7 @@ class ChainManager:
             if self.redis_cache:
                 try:
                     # Update chain index entry for new block
-                    self.redis_cache.update_chain_index_entry(block_hash, {
+                    await self.redis_cache.update_chain_index_entry(block_hash, {
                         "height": height,
                         "previous_hash": block_data["previous_hash"],
                         "timestamp": block_data["timestamp"],
@@ -1020,12 +1041,12 @@ class ChainManager:
                         "cumulative_difficulty": self.block_index[block_hash]["cumulative_difficulty"],
                         "is_tip": True
                     })
-                    
+
                     # Update height index
-                    self.redis_cache.update_height_index_entry(height, block_hash)
-                    
+                    await self.redis_cache.update_height_index_entry(height, block_hash)
+
                     # Update best chain info
-                    self.redis_cache.set_best_chain_info({
+                    await self.redis_cache.set_best_chain_info({
                         "block_hash": block_hash,
                         "height": height,
                         "timestamp": block_data["timestamp"],
@@ -1734,20 +1755,20 @@ class ChainManager:
                 try:
                     # Update cache for disconnected blocks
                     for block_hash in blocks_to_disconnect:
-                        self.redis_cache.remove_chain_index_entry(block_hash)
+                        await self.redis_cache.remove_chain_index_entry(block_hash)
                         if block_hash in self.block_index:
                             height = self.block_index[block_hash]["height"]
-                            self.redis_cache.remove_height_index_entry(height)
-                    
+                            await self.redis_cache.remove_height_index_entry(height)
+
                     # Update cache for connected blocks
                     for block_hash in blocks_to_connect:
                         if block_hash in self.block_index:
                             block_info = self.block_index[block_hash]
-                            self.redis_cache.update_chain_index_entry(block_hash, block_info)
-                            self.redis_cache.update_height_index_entry(block_info["height"], block_hash)
-                    
+                            await self.redis_cache.update_chain_index_entry(block_hash, block_info)
+                            await self.redis_cache.update_height_index_entry(block_info["height"], block_hash)
+
                     # Update best chain info
-                    self.redis_cache.set_best_chain_info({
+                    await self.redis_cache.set_best_chain_info({
                         "block_hash": new_tip_hash,
                         "height": self.block_index[new_tip_hash]["height"],
                         "timestamp": self.block_index[new_tip_hash]["timestamp"],

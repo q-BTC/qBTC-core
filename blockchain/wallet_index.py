@@ -358,8 +358,22 @@ class WalletIndexManager:
                     batch.delete(key)
                     break
     
+    def has_any_indexes(self) -> bool:
+        """Quick O(1)-ish check for whether any wallet indexes exist.
+        Scans at most 200 keys before giving up — avoids the full O(N) scan."""
+        checked = 0
+        wallet_prefixes = (b"wallet_tx:", b"wallet_balance:", b"wallet_utxo_set:")
+        for key, _ in self.db.items():
+            for prefix in wallet_prefixes:
+                if key.startswith(prefix):
+                    return True
+            checked += 1
+            if checked >= 200:
+                break
+        return False
+
     def get_statistics(self) -> Dict:
-        """Get statistics about indexes."""
+        """Get statistics about indexes (bounded scan, max 10000 keys)."""
         stats = {
             "wallet_balances": 0,
             "wallet_tx_lists": 0,
@@ -368,7 +382,8 @@ class WalletIndexManager:
             "tx_by_receiver": 0,
             "cache_size": len(self._cache)
         }
-        
+
+        checked = 0
         for key, _ in self.db.items():
             if key.startswith(b"wallet_balance:"):
                 stats["wallet_balances"] += 1
@@ -380,7 +395,11 @@ class WalletIndexManager:
                 stats["tx_by_sender"] += 1
             elif key.startswith(b"tx_by_receiver:"):
                 stats["tx_by_receiver"] += 1
-        
+            checked += 1
+            if checked >= 10000:
+                stats["truncated"] = True
+                break
+
         return stats
 
 # Global singleton instance

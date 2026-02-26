@@ -347,18 +347,31 @@ def get_transactions(wallet_address: str, limit: int = 50, include_coinbase: boo
         if not include_coinbase and tx.get("inputs", [{}])[0].get("txid") == "0" * 64:
             continue
             
-        # Determine transaction direction
+        # Determine transaction direction — check direct sender field and msg_str
+        # before falling back to expensive UTXO lookups
         is_sender = False
-        for inp in tx.get("inputs", []):
-            if inp.get("txid") == "0" * 64:  # Coinbase
-                continue
-            utxo_key = f"utxo:{inp['txid']}:{inp.get('utxo_index', 0)}".encode()
-            utxo_data = db.get(utxo_key)
-            if utxo_data:
-                utxo = json.loads(utxo_data.decode())
-                if utxo.get("receiver") == wallet_address:
-                    is_sender = True
-                    break
+        direct_sender = tx.get("sender", "")
+        if not direct_sender:
+            body = tx.get("body", {})
+            msg_str = body.get("msg_str", "")
+            if msg_str:
+                parts = msg_str.split(":")
+                if parts:
+                    direct_sender = parts[0]
+        if direct_sender == wallet_address:
+            is_sender = True
+        elif not direct_sender:
+            # Fallback: UTXO lookup only when sender is unknown
+            for inp in tx.get("inputs", []):
+                if inp.get("txid") == "0" * 64:  # Coinbase
+                    continue
+                utxo_key = f"utxo:{inp['txid']}:{inp.get('utxo_index', 0)}".encode()
+                utxo_data = db.get(utxo_key)
+                if utxo_data:
+                    utxo = json.loads(utxo_data.decode())
+                    if utxo.get("receiver") == wallet_address:
+                        is_sender = True
+                        break
         
         # Calculate amounts - properly distinguish between sent amounts and change
         total_received = Decimal("0")

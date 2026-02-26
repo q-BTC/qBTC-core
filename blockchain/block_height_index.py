@@ -74,13 +74,7 @@ class BlockHeightIndex:
         if height > self._highest_height:
             self._highest_height = height
 
-        # Update Redis cache incrementally
-        if self.redis_cache:
-            try:
-                self.redis_cache.update_height_index_entry(height, block_hash)
-            except Exception as e:
-                logger.debug(f"Failed to update Redis height index: {e}")
-        
+        # Redis cache update handled by chain_manager (async)
         logger.debug(f"Added block {block_hash} at height {height} to index")
     
     def remove_block_from_index(self, height: int):
@@ -99,13 +93,7 @@ class BlockHeightIndex:
         if height == self._highest_height:
             self._highest_height = height - 1
 
-        # Update Redis cache incrementally
-        if self.redis_cache:
-            try:
-                self.redis_cache.remove_height_index_entry(height)
-            except Exception as e:
-                logger.debug(f"Failed to update Redis height index: {e}")
-            
+        # Redis cache update handled by chain_manager (async)
         logger.debug(f"Removed block at height {height} from index")
     
     def _add_to_cache(self, height: int, block_hash: str):
@@ -127,7 +115,7 @@ class BlockHeightIndex:
         # Try to load from Redis cache first
         if self.redis_cache:
             try:
-                cached_index = self.redis_cache.get_height_index()
+                cached_index = await self.redis_cache.get_height_index()
                 if cached_index:
                     from rocksdict import WriteBatch
 
@@ -185,7 +173,7 @@ class BlockHeightIndex:
         # Cache the height index to Redis
         if self.redis_cache and height_index:
             try:
-                self.redis_cache.set_height_index(height_index)
+                await self.redis_cache.set_height_index(height_index)
                 logger.info("Height index cached to Redis")
             except Exception as e:
                 logger.warning(f"Failed to cache height index: {e}")
@@ -202,7 +190,7 @@ class BlockHeightIndex:
         # Try Redis cache (O(n) over cached index, but avoids DB scan)
         if self.redis_cache:
             try:
-                height_index = self.redis_cache.get_height_index()
+                height_index = await self.redis_cache.get_height_index()
                 if height_index:
                     self._highest_height = max(height_index.keys())
                     return self._highest_height

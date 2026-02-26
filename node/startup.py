@@ -66,16 +66,11 @@ async def startup(args=None):
             from blockchain.wallet_index import get_wallet_index
             wallet_index = get_wallet_index()
             
-            # Quick check: see if we have any wallet indexes at all
-            stats = wallet_index.get_statistics()
-
-            # DO NOT count all transactions - this is O(N)!
-            # The wallet index will be built incrementally as needed
-            if stats["wallet_tx_lists"] == 0:
-                logger.info("No wallet indexes found. Will be built incrementally as transactions arrive.")
-                # DO NOT rebuild! Indexes will be created incrementally
+            # Quick bounded check: see if we have any wallet indexes at all
+            if wallet_index.has_any_indexes():
+                logger.info("Wallet indexes present")
             else:
-                logger.info(f"Wallet indexes present: {stats['wallet_tx_lists']} wallets indexed")
+                logger.info("No wallet indexes found. Will be built incrementally as transactions arrive.")
         
         # Check if database is truly empty (no blocks at all)
         has_any_blocks = False
