@@ -1,7 +1,8 @@
 import logging
 import json
+import os
 import rocksdict
-from rocksdict import Rdict, Options, BlockBasedOptions, Cache, DBCompressionType, SliceTransform
+from rocksdict import Rdict, Options, BlockBasedOptions, Cache, DBCompressionType, SliceTransform, AccessType
 import time
 import threading
 import asyncio
@@ -12,6 +13,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
 db = None
 GENESIS_PREVHASH = "00" * 32
+_is_secondary = False  # True when running as secondary (read-only) DB in web process
 
 # Height cache with thread safety
 class HeightCache:
@@ -63,43 +65,44 @@ async def get_current_height(db, max_retries: int = 3) -> Tuple[int, str]:
 
     # Try multiple times to get the height
     last_error = None
-    
+
     for retry in range(max_retries):
         if retry > 0:
             # Brief delay between retries with exponential backoff
             await asyncio.sleep(0.1 * (2 ** (retry - 1)))
-            
+
         try:
-            # Method 1: Try ChainManager (preferred)
-            try:
-                from blockchain.chain_singleton import get_chain_manager
-                cm = await get_chain_manager()
-                # Use the async get_best_chain_tip method
-                # Get the best chain tip using async method
-                tip_info = await cm.get_best_chain_tip()
-                if tip_info:
-                    # get_best_chain_tip returns a tuple (block_hash, height)
-                    best_hash, best_height = tip_info
-                else:
-                    best_hash = "00" * 32
-                    best_height = -1
-                
-                # Validate the result
-                if best_hash and best_hash != "00" * 32 and best_height >= 0:
-                    logging.debug(f"ChainManager returned: hash={best_hash}, height={best_height}")
-                    height_cache.set(best_height, best_hash)
-                    return best_height, best_hash
-                elif best_height == -1 and best_hash == "00" * 32:
-                    # This is a valid "no blocks" response, not an error
-                    logging.info("ChainManager indicates empty blockchain")
-                    return -1, GENESIS_PREVHASH
-                    
-            except ImportError:
-                # ChainManager module not available, this is ok
-                logging.debug("ChainManager not available, trying height index")
-            except Exception as e:
-                last_error = e
-                logging.debug(f"ChainManager attempt {retry + 1} failed: {e}")
+            # Method 1: Try ChainManager (preferred) — skip in secondary mode
+            if not _is_secondary:
+                try:
+                    from blockchain.chain_singleton import get_chain_manager
+                    cm = await get_chain_manager()
+                    # Use the async get_best_chain_tip method
+                    # Get the best chain tip using async method
+                    tip_info = await cm.get_best_chain_tip()
+                    if tip_info:
+                        # get_best_chain_tip returns a tuple (block_hash, height)
+                        best_hash, best_height = tip_info
+                    else:
+                        best_hash = "00" * 32
+                        best_height = -1
+
+                    # Validate the result
+                    if best_hash and best_hash != "00" * 32 and best_height >= 0:
+                        logging.debug(f"ChainManager returned: hash={best_hash}, height={best_height}")
+                        height_cache.set(best_height, best_hash)
+                        return best_height, best_hash
+                    elif best_height == -1 and best_hash == "00" * 32:
+                        # This is a valid "no blocks" response, not an error
+                        logging.info("ChainManager indicates empty blockchain")
+                        return -1, GENESIS_PREVHASH
+
+                except ImportError:
+                    # ChainManager module not available, this is ok
+                    logging.debug("ChainManager not available, trying height index")
+                except Exception as e:
+                    last_error = e
+                    logging.debug(f"ChainManager attempt {retry + 1} failed: {e}")
             
             # Method 2: Try height index
             try:
@@ -245,6 +248,33 @@ def invalidate_height_cache():
     """Invalidate the height cache. Should be called when new blocks are added."""
     height_cache.invalidate()
     logging.debug("Height cache invalidated")
+
+def set_db_secondary(db_path):
+    """Open database in secondary (read-only) mode for the web process."""
+    global db, _is_secondary
+    if db is None:
+        secondary_path = db_path + "_secondary"
+        os.makedirs(secondary_path, exist_ok=True)
+        db = Rdict(db_path, access_type=AccessType.secondary(secondary_path))
+        _is_secondary = True
+        logging.info(f"Secondary database opened at {db_path} (secondary path: {secondary_path})")
+    return db
+
+
+def try_catch_up():
+    """Call try_catch_up_with_primary() on secondary DB to tail the WAL."""
+    global db
+    if db is not None and _is_secondary:
+        try:
+            db.try_catch_up_with_primary()
+        except Exception as e:
+            logging.warning(f"Catch-up with primary failed: {e}")
+
+
+def is_secondary():
+    """Return True if running as secondary (read-only) database."""
+    return _is_secondary
+
 
 def close_db():
     global db

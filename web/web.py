@@ -14,7 +14,6 @@ from database.database import get_db, get_current_height
 from wallet.wallet import verify_transaction
 from pydantic import BaseModel
 from blockchain.blockchain import sha256d, serialize_transaction, derive_qsafe_address
-from state.state import mempool_manager
 from config.config import CHAIN_ID
 
 # Import security components
@@ -38,6 +37,30 @@ from web.websocket_handlers import WebSocketEventHandlers
 
 # Import Bitcoin utilities
 from utils.bitcoin_utils import verify_bitcoin_signature
+
+# ---- Web-process detection & Redis bridge reference ----
+# These are set by web_main.py when running as a separate web process.
+_is_web_process = False
+_web_bridge = None  # WebEventBridge instance (set by web_main.py)
+
+# Lightweight in-memory mempool cache for the web process.
+# Populated via TRANSACTION_PENDING events from Redis, cleared by TRANSACTION_CONFIRMED.
+_mempool_cache: dict = {}  # txid -> transaction dict
+
+
+class _GossipStateProxy:
+    """Lightweight proxy that mimics GossipNode attributes from a Redis-cached dict."""
+    def __init__(self, state: dict):
+        self._state = state
+        gossip = state.get("gossip", {})
+        self.node_id = gossip.get("node_id", "unknown")
+        self.gossip_port = gossip.get("port", 0)
+        self.is_bootstrap = gossip.get("is_bootstrap", False)
+        self.dht_peers = [tuple(p) for p in gossip.get("dht_peer_list", [])]
+        self.client_peers = [tuple(p) for p in gossip.get("client_peer_list", [])]
+        self.synced_peers = set(gossip.get("synced_peers_list", []))
+        self.failed_peers = gossip.get("failed_peers", {})
+        self.peer_info = gossip.get("peer_info", {})
 
 # Import OpenTimestamps
 try:
@@ -99,18 +122,54 @@ websocket_clients: Set[WebSocket] = set()
 async def startup_event():
     """Initialize event system on startup"""
     try:
-        # Start event bus
-        await event_bus.start()
-        logger.info("Event bus started")
-        
+        # Start event bus (may already be started by web_main.py in web process)
+        if not event_bus.running:
+            await event_bus.start()
+            logger.info("Event bus started")
+        else:
+            logger.info("Event bus already running")
+
         # Register WebSocket event handlers
         ws_handlers = WebSocketEventHandlers(websocket_manager)
         ws_handlers.register_handlers(event_bus)
         logger.info("WebSocket event handlers registered")
-        
+
+        # In web process, register mempool cache handlers to track pending/confirmed txs
+        if _is_web_process:
+            async def _cache_pending_tx(event):
+                txid = event.data.get("txid")
+                tx = event.data.get("transaction")
+                if txid and tx:
+                    _mempool_cache[txid] = tx
+                    logger.debug(f"Mempool cache: added pending tx {txid} (size={len(_mempool_cache)})")
+                elif txid:
+                    # Minimal entry from event data
+                    _mempool_cache[txid] = {
+                        "txid": txid,
+                        "sender": event.data.get("sender"),
+                        "receiver": event.data.get("receiver"),
+                        "amount": event.data.get("amount"),
+                        "inputs": event.data.get("inputs", []),
+                        "outputs": event.data.get("outputs", []),
+                        "body": event.data.get("body", {}),
+                        "timestamp": event.data.get("timestamp"),
+                    }
+
+            async def _remove_confirmed_tx(event):
+                txid = event.data.get("txid")
+                if txid and txid in _mempool_cache:
+                    del _mempool_cache[txid]
+                    logger.debug(f"Mempool cache: removed confirmed tx {txid} (size={len(_mempool_cache)})")
+
+            _cache_pending_tx.__name__ = "_cache_pending_tx"
+            _remove_confirmed_tx.__name__ = "_remove_confirmed_tx"
+            event_bus.subscribe(EventTypes.TRANSACTION_PENDING, _cache_pending_tx)
+            event_bus.subscribe(EventTypes.TRANSACTION_CONFIRMED, _remove_confirmed_tx)
+            logger.info("Mempool cache event handlers registered (web process)")
+
         # Store handlers reference
         app.state.ws_handlers = ws_handlers
-        
+
     except Exception as e:
         logger.error(f"Failed to start event system: {e}")
         raise
@@ -445,8 +504,18 @@ def get_transactions(wallet_address: str, limit: int = 50, include_coinbase: boo
         })
     
     # Add mempool transactions for this wallet — O(k) where k = address's pending txs
-    if mempool_manager:
+    # In web process, use local mempool cache; in node process, use mempool_manager directly
+    if _is_web_process:
+        address_mempool_txs = [
+            tx for tx in _mempool_cache.values()
+            if tx.get("sender") == wallet_address or tx.get("receiver") == wallet_address
+        ]
+    elif mempool_manager:
         address_mempool_txs = mempool_manager.get_transactions_for_address(wallet_address)
+    else:
+        address_mempool_txs = []
+
+    if address_mempool_txs:
         for tx in address_mempool_txs:
             txid = tx.get("txid")
             if not txid:
@@ -851,36 +920,40 @@ async def debug_genesis(localhost_only: bool = Depends(require_localhost)):
 async def health_check(request: Request):
     """Prometheus metrics endpoint"""
     try:
-        # Get gossip node from global reference
-        gossip_client = get_gossip_node()
-        
-        # If not found there, try sys.modules as fallback
-        if not gossip_client:
-            import sys
-            gossip_client = getattr(sys.modules.get('__main__', None), 'gossip_node', None)
-        
-        # If not found there, try app.state as final fallback
-        if not gossip_client:
-            gossip_client = getattr(request.app.state, 'gossip_client', None)
-        
-        # Log for debugging
+        gossip_client = None
+
+        if _is_web_process:
+            # Web process: use gossip state from Redis (lightweight proxy object)
+            if _web_bridge:
+                gossip_state = await _web_bridge.get_gossip_state()
+                if gossip_state:
+                    gossip_client = _GossipStateProxy(gossip_state)
+        else:
+            # Node process: use real gossip node
+            gossip_client = get_gossip_node()
+            if not gossip_client:
+                import sys
+                gossip_client = getattr(sys.modules.get('__main__', None), 'gossip_node', None)
+            if not gossip_client:
+                gossip_client = getattr(request.app.state, 'gossip_client', None)
+
         if gossip_client:
-            logger.debug(f"Found gossip_client: {type(gossip_client)}, has dht_peers: {hasattr(gossip_client, 'dht_peers')}")
+            logger.debug(f"Found gossip_client: {type(gossip_client)}")
         else:
             logger.warning("No gossip_client found for health check")
-        
+
         # Run health checks to update metrics
         await health_monitor.run_health_checks(gossip_client)
-        
+
         # Generate Prometheus metrics
         metrics, content_type = health_monitor.generate_metrics()
-        
+
         from fastapi.responses import Response
         return Response(
             content=metrics,
             media_type=content_type
         )
-        
+
     except Exception as e:
         logger.error(f"Health check failed: {str(e)}")
         from fastapi.responses import JSONResponse
@@ -897,14 +970,24 @@ async def health_check(request: Request):
 async def debug_mempool(localhost_only: bool = Depends(require_localhost)):
     """Debug endpoint to check mempool status"""
     try:
-        stats = mempool_manager.get_stats()
-        all_txs = mempool_manager.get_all_transactions()
-        return {
-            "mempool_size": len(all_txs),
-            "transactions": list(all_txs.keys()),
-            "timestamp": datetime.utcnow().isoformat(),
-            "stats": stats
-        }
+        if _is_web_process:
+            # Web process: use local mempool cache
+            return {
+                "mempool_size": len(_mempool_cache),
+                "transactions": list(_mempool_cache.keys()),
+                "timestamp": datetime.utcnow().isoformat(),
+                "stats": {"source": "web_process_cache", "count": len(_mempool_cache)},
+            }
+        else:
+            from state.state import mempool_manager
+            stats = mempool_manager.get_stats()
+            all_txs = mempool_manager.get_all_transactions()
+            return {
+                "mempool_size": len(all_txs),
+                "transactions": list(all_txs.keys()),
+                "timestamp": datetime.utcnow().isoformat(),
+                "stats": stats
+            }
     except Exception as e:
         logger.error(f"Error getting mempool status: {str(e)}")
         raise HTTPException(status_code=500, detail="Error retrieving mempool")
@@ -919,38 +1002,49 @@ async def debug_network(localhost_only: bool = Depends(require_localhost)):
             "timestamp": datetime.utcnow().isoformat(),
             "validator_id": VALIDATOR_ID
         }
-        
-        # Check gossip node
-        if hasattr(sys.modules.get('__main__'), 'gossip_node'):
-            gossip_node = sys.modules['__main__'].gossip_node
-            status["gossip"] = {
-                "running": True,
-                "node_id": gossip_node.node_id,
-                "port": gossip_node.gossip_port,
-                "is_bootstrap": gossip_node.is_bootstrap,
-                "dht_peers": len(gossip_node.dht_peers),
-                "client_peers": len(gossip_node.client_peers),
-                "total_peers": len(gossip_node.dht_peers) + len(gossip_node.client_peers),
-                "dht_peer_list": [list(peer) if isinstance(peer, tuple) else peer for peer in gossip_node.dht_peers],
-                "client_peer_list": [list(peer) if isinstance(peer, tuple) else peer for peer in gossip_node.client_peers],
-                "synced_peers": len(gossip_node.synced_peers),
-                "failed_peers": {str(k): v for k, v in gossip_node.failed_peers.items()}
-            }
+
+        if _is_web_process and _web_bridge:
+            # Web process: read gossip state from Redis
+            gossip_state = await _web_bridge.get_gossip_state()
+            if gossip_state:
+                status["gossip"] = gossip_state.get("gossip", {"running": False})
+                status["dht"] = gossip_state.get("dht", {"running": False})
+                status["source"] = "redis"
+            else:
+                status["gossip"] = {"running": False}
+                status["dht"] = {"running": False}
+                status["source"] = "redis_unavailable"
         else:
-            status["gossip"] = {"running": False}
-            
-        # Check DHT
-        if hasattr(sys.modules.get('__main__'), 'dht_task'):
-            dht_task = sys.modules['__main__'].dht_task
-            status["dht"] = {
-                "running": not dht_task.done(),
-                "task_state": "done" if dht_task.done() else "running"
-            }
-            if dht_task.done() and dht_task.exception():
-                status["dht"]["error"] = str(dht_task.exception())
-        else:
-            status["dht"] = {"running": False}
-            
+            # Node process: direct access
+            if hasattr(sys.modules.get('__main__'), 'gossip_node'):
+                gossip_node = sys.modules['__main__'].gossip_node
+                status["gossip"] = {
+                    "running": True,
+                    "node_id": gossip_node.node_id,
+                    "port": gossip_node.gossip_port,
+                    "is_bootstrap": gossip_node.is_bootstrap,
+                    "dht_peers": len(gossip_node.dht_peers),
+                    "client_peers": len(gossip_node.client_peers),
+                    "total_peers": len(gossip_node.dht_peers) + len(gossip_node.client_peers),
+                    "dht_peer_list": [list(peer) if isinstance(peer, tuple) else peer for peer in gossip_node.dht_peers],
+                    "client_peer_list": [list(peer) if isinstance(peer, tuple) else peer for peer in gossip_node.client_peers],
+                    "synced_peers": len(gossip_node.synced_peers),
+                    "failed_peers": {str(k): v for k, v in gossip_node.failed_peers.items()}
+                }
+            else:
+                status["gossip"] = {"running": False}
+
+            if hasattr(sys.modules.get('__main__'), 'dht_task'):
+                dht_task = sys.modules['__main__'].dht_task
+                status["dht"] = {
+                    "running": not dht_task.done(),
+                    "task_state": "done" if dht_task.done() else "running"
+                }
+                if dht_task.done() and dht_task.exception():
+                    status["dht"]["error"] = str(dht_task.exception())
+            else:
+                status["dht"] = {"running": False}
+
         return status
     except Exception as e:
         logger.error(f"Error getting network status: {e}")
@@ -961,14 +1055,23 @@ async def debug_peers(localhost_only: bool = Depends(require_localhost)):
     """Debug endpoint to see detailed peer information"""
     import sys
     try:
-        # Get gossip node
+        if _is_web_process and _web_bridge:
+            # Web process: read gossip state from Redis
+            gossip_state = await _web_bridge.get_gossip_state()
+            if gossip_state and "peers" in gossip_state:
+                return gossip_state["peers"]
+            elif gossip_state and "gossip" in gossip_state:
+                return gossip_state["gossip"]
+            return {"error": "Gossip state not available from Redis"}
+
+        # Node process: direct access
         gossip_node = get_gossip_node()
         if not gossip_node:
             gossip_node = getattr(sys.modules.get('__main__', None), 'gossip_node', None)
-        
+
         if not gossip_node:
             return {"error": "Gossip node not available"}
-        
+
         return {
             "node_id": gossip_node.node_id,
             "is_bootstrap": gossip_node.is_bootstrap,
@@ -1075,10 +1178,18 @@ async def worker_endpoint(request: Request):
 
         inputs = []
         total_available = Decimal("0")
-        
+
         # Get UTXOs already being used in mempool to avoid double-spending — O(1)
-        mempool_used_utxos = mempool_manager.get_in_use_utxo_keys()
-        
+        if _is_web_process:
+            # Web process: derive used UTXOs from local mempool cache
+            mempool_used_utxos = set()
+            for cached_tx in _mempool_cache.values():
+                for inp in cached_tx.get("inputs", []):
+                    mempool_used_utxos.add(f"{inp.get('txid')}:{inp.get('utxo_index', 0)}")
+        else:
+            from state.state import mempool_manager
+            mempool_used_utxos = mempool_manager.get_in_use_utxo_keys()
+
         # Use new wallet index for fast lookup
         from blockchain.wallet_index import get_wallet_index
         wallet_index = get_wallet_index()
@@ -1149,33 +1260,41 @@ async def worker_endpoint(request: Request):
         logger.info(f"[WEB] Calculated txid for new transaction: {txid}")
         logger.info(f"[WEB] Transaction details: sender={sender_}, receiver={receiver_}, amount={send_amount}")
         
-        # Don't add txid to outputs - this contaminates the transaction structure
-        success, error = mempool_manager.add_transaction(transaction)
-        if not success:
-            # This means the transaction conflicts with existing mempool transactions
-            logger.warning(f"[MEMPOOL] Rejected transaction {txid}: {error}")
-            raise ValidationError(f"Transaction rejected: {error}")
-        logger.info(f"[MEMPOOL] Added transaction {txid} to mempool. Current size: {mempool_manager.size()}")
-        #db.put(b"tx:" + txid.encode(), json.dumps(transaction).encode())
-
-        # Emit mempool transaction event
-        await event_bus.emit(EventTypes.TRANSACTION_PENDING, {
-            'txid': txid,
-            'transaction': transaction,
-            'sender': sender_,
-            'receiver': receiver_,
-            'amount': send_amount
-        }, source='web')
-        logger.info(f"[EVENT] Emitted TRANSACTION_PENDING event for {txid}")
-
-        # Broadcast to network if gossip client is available
-        if gossip_client:
-            await gossip_client.randomized_broadcast(transaction)
-            logger.info(f"Transaction {txid} broadcast to network")
+        # ---- Submit transaction via Redis (web process) or direct mempool (node) ----
+        if _is_web_process and _web_bridge:
+            # Web process: submit via Redis queue to node process
+            result = await _web_bridge.submit_transaction(transaction)
+            if result.get("status") != "success":
+                raise ValidationError(result.get("error", "Transaction submission failed"))
+            logger.info(f"[WEB] Transaction {txid} submitted to node via Redis")
+            return {"status": "success", "message": "Transaction broadcast successfully", "txid": result.get("txid", txid)}
         else:
-            logger.warning(f"No gossip client available - transaction {txid} added to mempool but not broadcast")
+            # Node process (legacy single-process path)
+            from state.state import mempool_manager
+            success, error = mempool_manager.add_transaction(transaction)
+            if not success:
+                logger.warning(f"[MEMPOOL] Rejected transaction {txid}: {error}")
+                raise ValidationError(f"Transaction rejected: {error}")
+            logger.info(f"[MEMPOOL] Added transaction {txid} to mempool. Current size: {mempool_manager.size()}")
 
-        return {"status": "success", "message": "Transaction broadcast successfully", "txid": txid}
+            # Emit mempool transaction event
+            await event_bus.emit(EventTypes.TRANSACTION_PENDING, {
+                'txid': txid,
+                'transaction': transaction,
+                'sender': sender_,
+                'receiver': receiver_,
+                'amount': send_amount
+            }, source='web')
+            logger.info(f"[EVENT] Emitted TRANSACTION_PENDING event for {txid}")
+
+            # Broadcast to network if gossip client is available
+            if gossip_client:
+                await gossip_client.randomized_broadcast(transaction)
+                logger.info(f"Transaction {txid} broadcast to network")
+            else:
+                logger.warning(f"No gossip client available - transaction {txid} added to mempool but not broadcast")
+
+            return {"status": "success", "message": "Transaction broadcast successfully", "txid": txid}
     
     else:
         raise ValidationError(f"Unsupported request type: {payload.get('request_type')}")
@@ -1491,17 +1610,30 @@ async def commit_btc_to_qbtc(request: CommitRequest):
             "ots_proof": ots_proof
         }
         
-        # Store commitment in database atomically
-        from rocksdict import WriteBatch
-        batch = WriteBatch()
-        batch.put(commitment_key, json.dumps(commitment_data).encode())
+        if _is_web_process and _web_bridge:
+            # Web process: forward commitment write to node via Redis
+            import redis.asyncio as aioredis
+            client = await _web_bridge._get_client()
+            await client.lpush("qbtc:commit_submit", json.dumps(commitment_data))
+            # Wait for acknowledgement (best-effort, 3s timeout)
+            result = await client.brpop(f"qbtc:commit_result:{commitment_hash.hex()}", timeout=3)
+            if result:
+                _key, raw = result
+                reply = json.loads(raw)
+                if reply.get("status") != "success":
+                    raise HTTPException(status_code=500, detail=reply.get("error", "Commitment write failed"))
+        else:
+            # Node process: write directly
+            from rocksdict import WriteBatch
+            batch = WriteBatch()
+            batch.put(commitment_key, json.dumps(commitment_data).encode())
 
-        # Also store reverse lookup (qBTC -> BTC)
-        reverse_key = f"commitment_reverse:{qbtc_address}".encode()
-        batch.put(reverse_key, btc_address.encode())
+            # Also store reverse lookup (qBTC -> BTC)
+            reverse_key = f"commitment_reverse:{qbtc_address}".encode()
+            batch.put(reverse_key, btc_address.encode())
 
-        # Write atomically
-        db.write(batch)
+            # Write atomically
+            db.write(batch)
         
         # Log the commitment
         logger.info(f"BTC commitment created: {btc_address} -> {qbtc_address}")

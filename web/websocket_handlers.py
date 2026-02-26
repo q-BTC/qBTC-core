@@ -209,8 +209,7 @@ class WebSocketEventHandlers:
     async def _broadcast_wallet_update(self, wallet_address: str):
         """Broadcast update for specific wallet"""
         try:
-            from web.web import get_balance, get_transactions, get_broadcast_transactions
-            from state.state import mempool_manager
+            from web.web import get_balance, get_transactions, get_broadcast_transactions, _is_web_process
 
             # Check if transaction broadcasting is enabled
             if not get_broadcast_transactions():
@@ -219,15 +218,17 @@ class WebSocketEventHandlers:
 
             logger.info(f"Broadcasting wallet update for: {wallet_address}")
 
-            # Safely log mempool state
-            if mempool_manager is not None:
-                mempool_txs = mempool_manager.get_all_transactions()
-                if mempool_txs is not None:
-                    logger.info(f"Current mempool before update: {list(mempool_txs.keys())}")
+            # Safely log mempool state (skip in web process — no direct mempool_manager)
+            if not _is_web_process:
+                from state.state import mempool_manager
+                if mempool_manager is not None:
+                    mempool_txs = mempool_manager.get_all_transactions()
+                    if mempool_txs is not None:
+                        logger.info(f"Current mempool before update: {list(mempool_txs.keys())}")
+                    else:
+                        logger.warning("Mempool manager returned None for get_all_transactions()")
                 else:
-                    logger.warning("Mempool manager returned None for get_all_transactions()")
-            else:
-                logger.warning("Mempool manager is None")
+                    logger.warning("Mempool manager is None")
 
             # Bundle all blocking DB reads into a single sync function for the thread pool
             def _fetch_wallet_data():

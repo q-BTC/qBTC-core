@@ -13,35 +13,61 @@ from events.event_bus import event_bus, EventTypes
 logger = logging.getLogger(__name__)
 
 
+async def _publish_to_redis(event_type: str, data: Dict[str, Any]):
+    """Publish an event to Redis for the web process (no-op if bridge not initialised)."""
+    try:
+        from events.redis_event_bridge import node_bridge
+        if node_bridge:
+            await node_bridge.publish_event(event_type, data)
+    except Exception as e:
+        logger.debug(f"Redis publish skipped: {e}")
+
+
+async def _notify_db_updated():
+    """Notify web process that the DB has been updated."""
+    try:
+        from events.redis_event_bridge import node_bridge
+        if node_bridge:
+            await node_bridge.notify_db_updated()
+    except Exception as e:
+        logger.debug(f"Redis db_updated notify skipped: {e}")
+
+
 async def emit_transaction_event(txid: str, transaction: Dict[str, Any], confirmed: bool = False):
     """Emit transaction-related events"""
     try:
         # Emit transaction event
         event_type = EventTypes.TRANSACTION_CONFIRMED if confirmed else EventTypes.TRANSACTION_PENDING
-        
-        await event_bus.emit(event_type, {
+
+        event_data = {
             'txid': txid,
             'inputs': transaction.get('inputs', []),
             'outputs': transaction.get('outputs', []),
             'timestamp': transaction.get('timestamp'),
-            'body': transaction.get('body', {})
-        }, source='blockchain')
-        
+            'body': transaction.get('body', {}),
+            'transaction': transaction,
+            'sender': transaction.get('sender'),
+            'receiver': transaction.get('receiver'),
+            'amount': transaction.get('amount'),
+        }
+
+        await event_bus.emit(event_type, event_data, source='blockchain')
+
         # Collect affected wallets
         affected_wallets = set()
-        
+
         # From inputs (spending wallets)
         for inp in transaction.get('inputs', []):
             if inp.get('receiver'):  # The receiver of the UTXO is spending it
                 affected_wallets.add(inp['receiver'])
-        
+
         # From outputs (receiving wallets)
         for output in transaction.get('outputs', []):
             if output.get('receiver'):
                 affected_wallets.add(output['receiver'])
             if output.get('sender'):
                 affected_wallets.add(output['sender'])
-        
+
         # Emit wallet balance change events
         for wallet in affected_wallets:
             await event_bus.emit(EventTypes.WALLET_BALANCE_CHANGED, {
@@ -49,9 +75,16 @@ async def emit_transaction_event(txid: str, transaction: Dict[str, Any], confirm
                 'txid': txid,
                 'reason': 'transaction'
             }, source='blockchain')
-        
+
         logger.info(f"Emitted events for transaction {txid}, affected wallets: {affected_wallets}")
-        
+
+        # Publish to Redis for the web process
+        await _publish_to_redis(event_type, event_data)
+        for wallet in affected_wallets:
+            await _publish_to_redis(EventTypes.WALLET_BALANCE_CHANGED, {
+                'wallet_address': wallet, 'txid': txid, 'reason': 'transaction'
+            })
+
     except Exception as e:
         logger.error(f"Error emitting transaction event: {e}")
 
@@ -59,16 +92,21 @@ async def emit_transaction_event(txid: str, transaction: Dict[str, Any], confirm
 async def emit_block_event(block_height: int, block_data: Dict[str, Any]):
     """Emit block-related events"""
     try:
-        await event_bus.emit(EventTypes.BLOCK_ADDED, {
+        event_data = {
             'height': block_height,
             'block_hash': block_data.get('block_hash'),
             'timestamp': block_data.get('timestamp'),
             'tx_ids': block_data.get('tx_ids', []),
             'miner': block_data.get('miner')
-        }, source='blockchain')
-        
+        }
+        await event_bus.emit(EventTypes.BLOCK_ADDED, event_data, source='blockchain')
+
         logger.info(f"Emitted block event for height {block_height}")
-        
+
+        # Publish to Redis for the web process + notify DB updated
+        await _publish_to_redis(EventTypes.BLOCK_ADDED, event_data)
+        await _notify_db_updated()
+
     except Exception as e:
         logger.error(f"Error emitting block event: {e}")
 
@@ -77,8 +115,8 @@ async def emit_utxo_event(utxo_key: str, utxo_data: Dict[str, Any], spent: bool 
     """Emit UTXO-related events"""
     try:
         event_type = EventTypes.UTXO_SPENT if spent else EventTypes.UTXO_CREATED
-        
-        await event_bus.emit(event_type, {
+
+        event_data = {
             'utxo_key': utxo_key,
             'txid': utxo_data.get('txid'),
             'utxo_index': utxo_data.get('utxo_index'),
@@ -86,8 +124,9 @@ async def emit_utxo_event(utxo_key: str, utxo_data: Dict[str, Any], spent: bool 
             'receiver': utxo_data.get('receiver'),
             'amount': utxo_data.get('amount'),
             'spent': spent
-        }, source='blockchain')
-        
+        }
+        await event_bus.emit(event_type, event_data, source='blockchain')
+
         # Emit wallet balance change
         wallet = utxo_data.get('receiver')
         if wallet:
@@ -96,9 +135,12 @@ async def emit_utxo_event(utxo_key: str, utxo_data: Dict[str, Any], spent: bool 
                 'utxo_key': utxo_key,
                 'reason': 'utxo_spent' if spent else 'utxo_created'
             }, source='blockchain')
-        
+
         logger.debug(f"Emitted UTXO event for {utxo_key}, spent={spent}")
-        
+
+        # Publish to Redis for the web process
+        await _publish_to_redis(event_type, event_data)
+
     except Exception as e:
         logger.error(f"Error emitting UTXO event: {e}")
 
