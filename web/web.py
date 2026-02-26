@@ -56,9 +56,11 @@ class _GossipStateProxy:
         self.node_id = gossip.get("node_id", "unknown")
         self.gossip_port = gossip.get("port", 0)
         self.is_bootstrap = gossip.get("is_bootstrap", False)
-        self.dht_peers = [tuple(p) for p in gossip.get("dht_peer_list", [])]
-        self.client_peers = [tuple(p) for p in gossip.get("client_peer_list", [])]
-        self.synced_peers = set(gossip.get("synced_peers_list", []))
+        # JSON deserializes tuples as lists — convert back
+        self.dht_peers = [tuple(p) if isinstance(p, list) else p for p in gossip.get("dht_peer_list", [])]
+        self.client_peers = [tuple(p) if isinstance(p, list) else p for p in gossip.get("client_peer_list", [])]
+        # synced_peers must be a set of strings (peer IDs) — filter out any unhashable items
+        self.synced_peers = set(str(p) for p in gossip.get("synced_peers_list", []))
         self.failed_peers = gossip.get("failed_peers", {})
         self.peer_info = gossip.get("peer_info", {})
 

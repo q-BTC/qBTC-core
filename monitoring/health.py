@@ -12,7 +12,6 @@ from enum import Enum
 from prometheus_client import Gauge, Histogram, Info, generate_latest, CONTENT_TYPE_LATEST
 
 from database.database import get_db, get_current_height
-from state.state import mempool_manager
 from utils.executors import run_in_general_executor
 from log_utils import get_logger
 
@@ -234,6 +233,7 @@ class HealthMonitor:
     async def check_mempool_health(self) -> ComponentHealth:
         """Check transaction mempool status"""
         try:
+            from state.state import mempool_manager
             pending_count = mempool_manager.size()
             stats = mempool_manager.get_stats()
             
