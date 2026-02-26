@@ -48,11 +48,11 @@
       deploy:
         resources:
           limits:
-            cpus: '0.8'
-            memory: 2G
+            cpus: '2.0'
+            memory: 3G
           reservations:
-            cpus: '0.5'
-            memory: 512M
+            cpus: '1.0'
+            memory: 1G
       healthcheck:
         test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
         interval: 30s
