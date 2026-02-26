@@ -248,7 +248,12 @@ class WebSocketManager:
             return False
 
         # H6: Enforce per-IP WebSocket connection limit
-        client_ip = websocket.client.host if websocket.client else "unknown"
+        # Use X-Real-IP/X-Forwarded-For from reverse proxy, fall back to socket IP
+        client_ip = (
+            websocket.headers.get("x-real-ip")
+            or websocket.headers.get("x-forwarded-for", "").split(",")[0].strip()
+            or (websocket.client.host if websocket.client else "unknown")
+        )
         current_ip_count = self._ws_ip_counts.get(client_ip, 0)
         if current_ip_count >= MAX_WS_PER_IP:
             logger.warning(f"WebSocket connection rejected for {client_ip} — at per-IP limit ({MAX_WS_PER_IP})")
@@ -264,7 +269,11 @@ class WebSocketManager:
         if websocket in self.active_connections:
             self.active_connections.pop(websocket)
             # H6: Decrement per-IP WebSocket count
-            client_ip = websocket.client.host if websocket.client else "unknown"
+            client_ip = (
+                websocket.headers.get("x-real-ip")
+                or websocket.headers.get("x-forwarded-for", "").split(",")[0].strip()
+                or (websocket.client.host if websocket.client else "unknown")
+            )
             ip_count = self._ws_ip_counts.get(client_ip, 1)
             if ip_count <= 1:
                 self._ws_ip_counts.pop(client_ip, None)
