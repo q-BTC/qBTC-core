@@ -68,12 +68,10 @@ async def main(args):
         await asyncio.sleep(0.5)
         logger.info("RPC server initialized, proceeding with node startup")
 
-        # Run full node startup (DB, blockchain, gossip, DHT, etc.)
-        startup_task = asyncio.create_task(startup(args))
-        await startup_task
-        logger.info("Node startup completed successfully")
-
-        # ---- 4. Start node-side Redis event bridge ----
+        # ---- 4. Start node-side Redis event bridge BEFORE startup ----
+        # (startup can take a long time for index rebuilds, syncing, etc.
+        #  but the bridge should be ready immediately so the web process
+        #  can submit transactions and receive db_updated notifications)
         redis_url = os.environ.get("REDIS_URL")
         if redis_url:
             import events.redis_event_bridge as bridge_module
@@ -94,6 +92,11 @@ async def main(args):
             logger.info("Node-side Redis event bridge started")
         else:
             logger.warning("REDIS_URL not set — cross-process event bridge disabled")
+
+        # Run full node startup (DB, blockchain, gossip, DHT, etc.)
+        startup_task = asyncio.create_task(startup(args))
+        await startup_task
+        logger.info("Node startup completed successfully")
 
         # ---- 5. Run until shutdown ----
         await rpc_task
