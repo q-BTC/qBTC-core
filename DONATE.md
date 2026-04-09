@@ -14,4 +14,10 @@ bc1qjjc9yf54fqc50ph8yfvzlra92xda4n84g6rlxs
 0x89B0E0B07A24E48ecA9b016557EC3CfA457E415e
 ```
 
+## Solana (SOL)
+
+```
+VXAq19xKWByNuh8rRqoWJqjeNGA39RhEHRZzTYJrzRT
+```
+
 Thank you for supporting open-source post-quantum Bitcoin research.
